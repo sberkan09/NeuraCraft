@@ -2,11 +2,17 @@ cmake_minimum_required(VERSION 3.10)
 
 project(NeuraCraft)
 
-include_directories(.)
+include_directories(./Includes)
 
-# add_library(NeuraCraft SHARED Layer.cpp Matrix.cpp)
+set(SOURCE_FILES
+    Main.cpp
+    Matrix.cpp
+    Layer.cpp
+)
 
-add_executable(NeuraCraft Main.cpp Matrix.cpp Layer.cpp)
+# add_library(NeuraCraft SHARED ${SOURCE_FILES})
+
+add_executable(NeuraCraft ${SOURCE_FILES})
 
 set_target_properties(NeuraCraft PROPERTIES
     CXX_STANDARD 17

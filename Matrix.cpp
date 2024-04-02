@@ -1,9 +1,7 @@
 #include "Matrix.h"
 
-// Constructor
 Matrix::Matrix(int rows, int cols) : rows(rows), cols(cols), mat(rows, std::vector<int>(cols, 0)) {}
 
-// Set the value of an element
 void Matrix::setElement(int row, int col, int value) {
     if (row >= 0 && row < this->rows && col >= 0 && col < this->cols) {
         mat[row][col] = value;
@@ -12,17 +10,15 @@ void Matrix::setElement(int row, int col, int value) {
     }
 }
 
-// Get the value of an element
 int Matrix::getElement(int row, int col) const {
     if (row >= 0 && row < this->rows && col >= 0 && col < this->cols) {
         return mat[row][col];
     } else {
         std::cerr << "Error: Index out of bounds" << std::endl;
-        return -1; // Return an invalid value indicating error
+        return -1;
     }
 }
 
-// Print the matrix
 void Matrix::print() const {
     for (int i = 0; i < rows; i++) {
         for (int j = 0; j < cols; j++) {
@@ -51,6 +47,5 @@ Matrix Matrix::operator*(const Matrix& rhs) const {
     return result;
 }
 
-// Accessor functions
 int Matrix::getRows() const { return rows; }
 int Matrix::getCols() const { return cols; }

@@ -1,4 +1,4 @@
-#include "Matrix.h"
+#include "Includes/Matrix.h"
 
 Matrix::Matrix(int rows, int cols) : rows(rows), cols(cols), mat(rows, std::vector<int>(cols, 0)) {}
 

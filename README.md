@@ -1,14 +1,5 @@
-## To Build
+## To Build and Run
 
 ```
-$ mkdir build
-$ cd build
-$ cmake ..
-$ make
-```
-
-## To Run
-
-```
-$ ./NeuraCraft
+$ ./build_and_run.sh
 ```

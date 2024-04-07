@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 
-project(NeuraCraft)
+set(PROJECT_NAME NeuraCraft)
+
+project(${PROJECT_NAME})
 
 include_directories(./Includes)
 
@@ -12,9 +14,10 @@ set(SOURCE_FILES
 
 # add_library(NeuraCraft SHARED ${SOURCE_FILES})
 
-add_executable(NeuraCraft ${SOURCE_FILES})
+add_executable(${PROJECT_NAME} ${SOURCE_FILES})
 
-set_target_properties(NeuraCraft PROPERTIES
+set_target_properties(${PROJECT_NAME} PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin
 )

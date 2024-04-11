@@ -6,13 +6,9 @@ project(${PROJECT_NAME})
 
 include_directories(./Includes)
 
-set(SOURCE_FILES
-    Main.cpp
-    Matrix.cpp
-    Layer.cpp
-)
+file(GLOB SOURCE_FILES "${CMAKE_SOURCE_DIR}/src/*.cpp")
 
-# add_library(NeuraCraft SHARED ${SOURCE_FILES})
+# add_library(${PROJECT_NAME} SHARED ${SOURCE_FILES})
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
 

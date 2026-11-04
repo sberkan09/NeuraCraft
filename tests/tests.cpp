@@ -2276,7 +2276,7 @@ void addTensor(std::map<std::string, Matrix>& w, const std::string& name, std::s
 }
 
 // A tiny diffusers UNet2DConditionModel: two levels, cross-attention in the first.
-std::map<std::string, Matrix> tinyUNetWeights(const std::vector<std::size_t>& ch, std::size_t L, std::size_t ctx) {
+std::map<std::string, Matrix> tinyUNetWeights(const std::vector<std::size_t>& ch, std::size_t L, std::size_t ctx, std::size_t inChannels = 4) {
     std::map<std::string, Matrix> w;
     const std::size_t temb = 4 * ch[0];
     auto conv = [&](const std::string& n, std::size_t o, std::size_t i, std::size_t k) {
@@ -2315,7 +2315,7 @@ std::map<std::string, Matrix> tinyUNetWeights(const std::vector<std::size_t>& ch
     };
     lin("time_embedding.linear_1", temb, ch[0], true);
     lin("time_embedding.linear_2", temb, temb, true);
-    conv("conv_in", ch[0], 4, 3);
+    conv("conv_in", ch[0], inChannels, 3);
     std::vector<std::size_t> skips{ch[0]};
     std::size_t c = ch[0];
     for (std::size_t i = 0; i < ch.size(); ++i) {
@@ -2354,15 +2354,15 @@ void saveAll(const std::string& file, const std::map<std::string, Matrix>& w) {
     saveSafeTensors(file, refs);
 }
 
-void writeTinyUNet(const std::string& dir, std::size_t ctx) {
+void writeTinyUNet(const std::string& dir, std::size_t ctx, std::size_t inChannels = 4) {
     std::filesystem::create_directories(dir + "/unet");
     std::ofstream(dir + "/unet/config.json")
         << R"({"_class_name":"UNet2DConditionModel","act_fn":"silu","attention_head_dim":[2,2],"block_out_channels":[8,16],)"
         << R"("cross_attention_dim":)" << ctx << R"(,"down_block_types":["CrossAttnDownBlock2D","DownBlock2D"],"flip_sin_to_cos":true,)"
-        << R"("freq_shift":0,"in_channels":4,"layers_per_block":1,"mid_block_type":"UNetMidBlock2DCrossAttn","norm_eps":1e-5,)"
+        << R"("freq_shift":0,"in_channels":)" << inChannels << R"(,"layers_per_block":1,"mid_block_type":"UNetMidBlock2DCrossAttn","norm_eps":1e-5,)"
         << R"("norm_num_groups":4,"out_channels":4,"up_block_types":["UpBlock2D","CrossAttnUpBlock2D"],"use_linear_projection":true,)"
         << R"("time_embedding_type":"positional","resnet_time_scale_shift":"default","transformer_layers_per_block":1})";
-    saveAll(dir + "/unet/diffusion_pytorch_model.safetensors", tinyUNetWeights({8, 16}, 1, ctx));
+    saveAll(dir + "/unet/diffusion_pytorch_model.safetensors", tinyUNetWeights({8, 16}, 1, ctx, inChannels));
 }
 } // namespace
 
@@ -3229,6 +3229,65 @@ TEST(lora_merging_and_lcm_sampler) {
     std::filesystem::remove_all(dir);
     std::filesystem::remove_all(tok);
     for (const std::string& f : {file, peft, tempPath("lora_bad.safetensors")}) std::filesystem::remove(f);
+}
+
+TEST(inpainting_and_outpaint_zoom) {
+    std::string tok;
+    const std::string dir = writeTinyStableDiffusion("sd_inpaint", tok);
+    writeTinyUNet(dir, 6, 9);  // an inpainting UNet: latent + mask + masked-image latent
+    TextToImageOptions o;
+    o.width = o.height = 64;
+    StableDiffusion sd(dir, o);
+    CHECK(sd.isInpainting());
+    Image input, mask;
+    input.width = mask.width = 64;
+    input.height = mask.height = 64;
+    for (std::size_t i = 0; i < 64 * 64 * 3; ++i) input.pixels.push_back(static_cast<std::uint8_t>(i * 29 % 256));
+    mask.pixels.assign(64 * 64 * 3, 0);
+    for (std::size_t y = 16; y < 40; ++y)
+        for (std::size_t x = 20; x < 44; ++x) std::fill_n(mask.pixels.data() + (y * 64 + x) * 3, 3, 255);
+    const Image out = sd.inpaint(input, mask, "hello", 1, 2, 1.0f, 2.0f);
+    CHECK(out.width == 64 && out.height == 64);
+    // Far from the mask the input is kept exactly; inside it is redrawn.
+    bool keptOutside = true, changedInside = false;
+    for (std::size_t y = 0; y < 64; ++y)
+        for (std::size_t x = 0; x < 64; ++x) {
+            const bool far = y + 4 < 16 || y >= 44 || x + 4 < 20 || x >= 48, inside = y >= 18 && y < 38 && x >= 22 && x < 42;
+            for (std::size_t c = 0; c < 3; ++c) {
+                const std::size_t k = (y * 64 + x) * 3 + c;
+                if (far && out.pixels[k] != input.pixels[k]) keptOutside = false;
+                if (inside && out.pixels[k] != input.pixels[k]) changedInside = true;
+            }
+        }
+    CHECK(keptOutside && changedInside);
+    CHECK(sd.inpaint(input, mask, "hello", 1, 2, 1.0f, 2.0f).pixels == out.pixels);  // deterministic
+    CHECK(sd.inpaint(input, mask, "hello", 1, 4, 0.5f, 2.0f).width == 64);            // from the noised input
+    CHECK(sd.generate("hello", 3, 2).width == 64);                                     // whole picture via an all-white mask
+    CHECK_THROWS(sd.inpaint(input, mask, "hello", 1, 2, 0.0f), std::invalid_argument);
+    o.steps = 2;
+    CHECK(inpaint(dir, input, mask, "hello", o).width == 64);
+
+    // Outpaint zoom: nested keyframes, framesPerKey rendered frames per pair, the start picture at the end it belongs.
+    OutpaintZoomOptions z;
+    z.keyframes = 3;
+    z.framesPerKey = 2;
+    z.steps = 2;
+    const auto outward = outpaintZoom(sd, {"hello", "he"}, z, &input);
+    CHECK(outward.size() == 5 && outward.front().pixels == input.pixels);
+    for (const Image& f : outward) CHECK(f.width == 64 && f.height == 64);
+    z.zoomIn = true;
+    const auto inward = outpaintZoom(sd, {"hello", "he"}, z, &input);
+    CHECK(inward.size() == 5 && inward.back().pixels == input.pixels && inward.front().pixels == outward.back().pixels);
+    z.shrink = 0.2f;
+    CHECK_THROWS(outpaintZoom(sd, {"hello"}, z), std::invalid_argument);
+
+    // A text-to-image UNet cannot inpaint.
+    std::string tok2;
+    const std::string plainDir = writeTinyStableDiffusion("sd_plain", tok2);
+    StableDiffusion plain(plainDir, o);
+    CHECK(!plain.isInpainting());
+    CHECK_THROWS(plain.inpaint(input, mask, "hello", 1, 2), std::logic_error);
+    for (const std::string& d : {dir, tok, plainDir, tok2}) std::filesystem::remove_all(d);
 }
 
 // ---- Training robustness ------------------------------------------------------------------

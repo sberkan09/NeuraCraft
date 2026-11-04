@@ -99,7 +99,8 @@ public:
     Matrix forwardFrames(const Matrix& latents, float timestep, const Matrix& context);
     // ... with one text condition per frame (prompt travel), or a single one for all.
     Matrix forwardFrames(const Matrix& latents, float timestep, const std::vector<Matrix>& contexts);
-    ImageShape latentShape() const;
+    ImageShape latentShape() const;  // the UNet's input (9 channels for inpainting models)
+    std::size_t outputChannels() const;  // the predicted noise's channels (4)
     std::size_t contextDim() const;
     std::size_t parameterCount() const;
     bool hasMotionModules() const;
@@ -213,6 +214,14 @@ public:
     Image generate(const std::string& prompt, unsigned seed, std::size_t steps = 1);
     // ... or from an image and a prompt (image to image, as imageToImage).
     Image transform(const Image& input, const std::string& prompt, unsigned seed, std::size_t steps = 2, float strength = 0.5f);
+    // Inpainting (needs an inpainting UNet: 4 latent + 1 mask + 4 masked-image
+    // channels): redraws the white part of `mask` (grey, same picture area as
+    // `input`) from the prompt and keeps the rest; the result is blended back
+    // into the input with a mask feathered by `feather` pixels. Uses the
+    // session's guidance / negative prompt (classifier-free guidance when > 1).
+    Image inpaint(const Image& input, const Image& mask, const std::string& prompt, unsigned seed, std::size_t steps,
+                  float strength = 1.0f, float feather = 4.0f);
+    bool isInpainting() const;
 
     const TextToImageOptions& impl_options() const;  // the options it was built with
     struct Impl;
@@ -220,6 +229,31 @@ public:
 private:
     std::unique_ptr<Impl> impl_;
 };
+
+// Inpainting with an SD inpainting model directory (as diffusers'
+// StableDiffusionInpaintPipeline): `mask` white = redraw. Steps, seed,
+// sampler, LoRAs, tinyVae and int8 come from the options; strength 1 starts
+// the masked area from pure noise.
+Image inpaint(const std::string& directory, const Image& input, const Image& mask, const std::string& prompt,
+              const TextToImageOptions& options = {});
+
+struct OutpaintZoomOptions {
+    std::size_t keyframes = 6;        // generated pictures, each outpainted around the previous one
+    float shrink = 0.75f;             // the previous picture's size inside the next (0.4 .. 0.9)
+    std::size_t framesPerKey = 12;    // rendered frames between two keyframes (no UNet work)
+    bool zoomIn = false;              // play from the outermost picture inwards
+    std::size_t steps = 4;
+    unsigned seed = 0;
+};
+
+// The classic infinite zoom: a first picture (or `start`), then each next
+// keyframe is the previous one shrunk into the middle and its new border
+// inpainted from the prompts (spread over the keyframes). The frames in
+// between are rendered by zooming through the nested keyframes (geometric
+// zoom, the inner picture drawn over the outer one), so a long smooth zoom
+// costs one inpainting per keyframe. Needs an inpainting model.
+std::vector<Image> outpaintZoom(StableDiffusion& sd, const std::vector<std::string>& prompts, const OutpaintZoomOptions& options = {},
+                                const Image* start = nullptr);
 
 struct MorphOptions {
     std::size_t framesPerSegment = 12;  // frames from one keyframe to the next

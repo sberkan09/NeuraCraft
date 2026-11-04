@@ -455,6 +455,7 @@ UNet2DCondition& UNet2DCondition::operator=(UNet2DCondition&&) noexcept = defaul
 
 ImageShape UNet2DCondition::latentShape() const { return impl_->latent; }
 std::size_t UNet2DCondition::contextDim() const { return impl_->contextDim; }
+std::size_t UNet2DCondition::outputChannels() const { return impl_->convOut->outputShape().channels; }
 std::size_t UNet2DCondition::parameterCount() const { return impl_->params; }
 bool UNet2DCondition::hasMotionModules() const { return impl_->midMotion != nullptr; }
 
@@ -1220,7 +1221,92 @@ Matrix StableDiffusion::encodePrompt(const std::string& prompt) {
 
 Matrix StableDiffusion::noise(unsigned seed) const {
     setSeed(seed);
-    return Matrix::normal(1, impl_->unet.latentShape().size(), 0.0f, 1.0f);
+    const ImageShape s = impl_->unet.latentShape();
+    return Matrix::normal(1, impl_->unet.outputChannels() * s.height * s.width, 0.0f, 1.0f);
+}
+
+bool StableDiffusion::isInpainting() const {
+    return impl_->unet.latentShape().channels == 2 * impl_->unet.outputChannels() + 1;
+}
+
+Image StableDiffusion::inpaint(const Image& input, const Image& mask, const std::string& prompt, unsigned seed, std::size_t steps,
+                               float strength, float feather) {
+    if (!isInpainting()) throw std::logic_error("StableDiffusion::inpaint: the UNet is not an inpainting model (9 input channels)");
+    if (!impl_->encoder) throw std::logic_error("StableDiffusion: loaded without an image encoder");
+    if (strength <= 0.0f || strength > 1.0f) throw std::invalid_argument("StableDiffusion::inpaint: strength must be in (0, 1]");
+    const std::size_t W = width(), H = height(), w = W / 8, h = H / 8, C = impl_->unet.outputChannels();
+    const Image image = fitImage(toRgb(input), W, H);
+    Image m = fitImage(toRgb(mask), W, H);
+    std::vector<float> keep(W * H);  // 1 where the input stays
+    for (std::size_t i = 0; i < W * H; ++i) keep[i] = m.pixels[i * 3] < 128 ? 1.0f : 0.0f;
+    // The masked image (redrawn area set to 0 = mid grey in [-1, 1]) and the latent-size mask (nearest, as diffusers).
+    Matrix masked = imageToTensor(image);
+    for (std::size_t c = 0; c < 3; ++c)
+        for (std::size_t i = 0; i < W * H; ++i) masked.data()[c * W * H + i] *= keep[i];
+    const Matrix maskedLatent = impl_->tiny ? impl_->tiny->encode(masked) : impl_->vae->encode(masked);
+    std::vector<float> latentMask(w * h);
+    for (std::size_t y = 0; y < h; ++y)
+        for (std::size_t x = 0; x < w; ++x) latentMask[y * w + x] = 1.0f - keep[(8 * y) * W + 8 * x];
+    const EulerScheduler sched = scheduler(steps);
+    const std::size_t run = std::max<std::size_t>(1, std::min(steps, static_cast<std::size_t>(static_cast<float>(steps) * strength + 1e-4f)));
+    const std::size_t first = steps - run;
+    const Matrix n = noise(seed);
+    Matrix latent;
+    if (first == 0) {
+        latent = n;
+        for (float& v : latent.values()) v *= static_cast<float>(sched.initNoiseSigma);
+    } else {  // start from the encoded input noised to the first sigma
+        latent = encodeImage(image);
+        const float sigma = static_cast<float>(sched.sigmas[first]);
+        for (std::size_t k = 0; k < latent.size(); ++k) latent.data()[k] += sigma * n.data()[k];
+    }
+    const Matrix context = encodePrompt(prompt);
+    const float guidance = impl_->options.guidance;
+    const Matrix negative = guidance > 1.0f ? encodePrompt(impl_->options.negativePrompt) : Matrix();
+    const std::size_t plane = w * h;
+    for (std::size_t i = first; i < sched.timesteps.size(); ++i) {
+        Matrix in(1, (2 * C + 1) * plane);
+        const float scale = static_cast<float>(sched.inputScale(i));
+        for (std::size_t k = 0; k < C * plane; ++k) in.data()[k] = latent.data()[k] * scale;
+        std::copy(latentMask.begin(), latentMask.end(), in.data() + C * plane);
+        std::copy(maskedLatent.data(), maskedLatent.data() + C * plane, in.data() + (C + 1) * plane);
+        Matrix eps = impl_->unet.forward(in, static_cast<float>(sched.timesteps[i]), context);
+        if (guidance > 1.0f) {
+            const Matrix un = impl_->unet.forward(in, static_cast<float>(sched.timesteps[i]), negative);
+            for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = un.data()[k] + guidance * (eps.data()[k] - un.data()[k]);
+        }
+        sched.step(i, eps, latent);
+    }
+    Image out = decode(latent);
+    // Paste the kept pixels back through a feathered mask (box blur of the keep mask).
+    std::vector<float> soft = keep;
+    const int r = static_cast<int>(std::lround(feather));
+    if (r > 0) {
+        std::vector<float> tmp(W * H);
+        for (int pass = 0; pass < 2; ++pass) {  // horizontal then vertical
+            const std::vector<float>& src = pass == 0 ? keep : tmp;
+            std::vector<float>& dst = pass == 0 ? tmp : soft;
+            for (std::size_t y = 0; y < H; ++y)
+                for (std::size_t x = 0; x < W; ++x) {
+                    float s = 0;
+                    int cnt = 0;
+                    for (int d = -r; d <= r; ++d) {
+                        const long xx = static_cast<long>(x) + (pass == 0 ? d : 0), yy = static_cast<long>(y) + (pass == 1 ? d : 0);
+                        if (xx < 0 || yy < 0 || xx >= static_cast<long>(W) || yy >= static_cast<long>(H)) continue;
+                        s += src[static_cast<std::size_t>(yy) * W + static_cast<std::size_t>(xx)];
+                        ++cnt;
+                    }
+                    dst[y * W + x] = s / static_cast<float>(cnt);
+                }
+        }
+        for (std::size_t i = 0; i < W * H; ++i) soft[i] = std::min(soft[i], keep[i]);  // never keep inside the mask
+    }
+    for (std::size_t i = 0; i < W * H; ++i)
+        for (std::size_t c = 0; c < 3; ++c) {
+            const float v = soft[i] * image.pixels[i * 3 + c] + (1.0f - soft[i]) * out.pixels[i * 3 + c];
+            out.pixels[i * 3 + c] = static_cast<std::uint8_t>(std::lround(v));
+        }
+    return out;
 }
 
 EulerScheduler StableDiffusion::scheduler(std::size_t steps) const { return schedulerFor(impl_->dir, steps, impl_->options.sampler); }
@@ -1252,6 +1338,14 @@ Image StableDiffusion::decode(const Matrix& latent) {
 }
 
 Image StableDiffusion::generate(const std::string& prompt, unsigned seed, std::size_t steps) {
+    if (isInpainting()) {  // an inpainting model draws a whole picture as inpainting with an all-white mask
+        Image blank, white;
+        blank.width = white.width = width();
+        blank.height = white.height = height();
+        blank.pixels.assign(width() * height() * 3, 127);
+        white.pixels.assign(width() * height() * 3, 255);
+        return inpaint(blank, white, prompt, seed, steps, 1.0f, 0.0f);
+    }
     const EulerScheduler sched = scheduler(steps);
     Matrix latent = noise(seed);
     for (float& v : latent.values()) v *= static_cast<float>(sched.initNoiseSigma);
@@ -1400,6 +1494,94 @@ std::vector<Image> zoomAnimation(StableDiffusion& sd, const std::vector<std::str
         frames.push_back(std::move(next));
         frameDone(opts, f, o.frames, t);
     }
+    return frames;
+}
+
+// ---- Inpainting and outpaint zoom ------------------------------------------------------------------
+
+Image inpaint(const std::string& dir, const Image& input, const Image& mask, const std::string& prompt, const TextToImageOptions& o) {
+    StableDiffusion sd(dir, o, true);
+    return sd.inpaint(input, mask, prompt, o.seed, o.steps, o.strength >= 1.0f || o.strength <= 0.0f ? 1.0f : o.strength);
+}
+
+std::vector<Image> outpaintZoom(StableDiffusion& sd, const std::vector<std::string>& prompts, const OutpaintZoomOptions& z,
+                                const Image* start) {
+    if (prompts.empty()) throw std::invalid_argument("outpaintZoom: no prompts");
+    if (z.keyframes < 2 || z.framesPerKey == 0) throw std::invalid_argument("outpaintZoom: need 2+ keyframes and 1+ frames per key");
+    if (z.shrink < 0.4f || z.shrink > 0.9f) throw std::invalid_argument("outpaintZoom: shrink must be in [0.4, 0.9]");
+    const std::size_t W = sd.width(), H = sd.height();
+    const TextToImageOptions& opts = sd.impl_options();
+    // keys[0] is the innermost picture; keys[k + 1] holds keys[k] shrunk in its middle.
+    std::vector<Image> keys;
+    auto t = PipelineClock::now();
+    keys.push_back(start ? fitImage(toRgb(*start), W, H) : sd.generate(prompts[0], z.seed, z.steps));
+    reportStage(opts, "keyframe 1/" + std::to_string(z.keyframes), t);
+    const std::size_t iw = static_cast<std::size_t>(std::lround(W * z.shrink)), ih = static_cast<std::size_t>(std::lround(H * z.shrink));
+    const std::size_t ox = (W - iw) / 2, oy = (H - ih) / 2;
+    for (std::size_t k = 1; k < z.keyframes; ++k) {
+        t = PipelineClock::now();
+        const Image inner = resizeImage(keys.back(), iw, ih);
+        Image canvas, mask;
+        canvas.width = mask.width = W;
+        canvas.height = mask.height = H;
+        canvas.pixels.assign(W * H * 3, 0);
+        mask.pixels.assign(W * H * 3, 255);
+        // Border: the inner picture's edge pixels stretched outwards (a neutral start for the redraw).
+        for (std::size_t y = 0; y < H; ++y)
+            for (std::size_t x = 0; x < W; ++x) {
+                const std::size_t sx = std::min(iw - 1, x < ox ? 0 : x - ox), sy = std::min(ih - 1, y < oy ? 0 : y - oy);
+                std::copy_n(inner.pixels.data() + (sy * iw + sx) * 3, 3, canvas.pixels.data() + (y * W + x) * 3);
+            }
+        // Keep the inner picture except a thin rim (redrawn too, so the seam disappears).
+        const std::size_t rim = std::max<std::size_t>(2, std::min(iw, ih) / 32);
+        for (std::size_t y = oy + rim; y + rim < oy + ih; ++y)
+            for (std::size_t x = ox + rim; x + rim < ox + iw; ++x) std::fill_n(mask.pixels.data() + (y * W + x) * 3, 3, 0);
+        const std::string& prompt = prompts[std::min(prompts.size() - 1, k * prompts.size() / z.keyframes)];
+        keys.push_back(sd.inpaint(canvas, mask, prompt, z.seed + static_cast<unsigned>(k), z.steps, 1.0f, static_cast<float>(rim)));
+        reportStage(opts, "keyframe " + std::to_string(k + 1) + "/" + std::to_string(z.keyframes), t);
+    }
+    // Render: between keys[k + 1] (outer) and keys[k] (inner) the view shrinks geometrically from
+    // the whole outer picture to the inner one's area; the inner picture is drawn over it.
+    auto sample = [](const Image& im, double fx, double fy, std::uint8_t* out) {  // bilinear, fx / fy in pixels
+        fx = std::min(std::max(fx, 0.0), im.width - 1.0);
+        fy = std::min(std::max(fy, 0.0), im.height - 1.0);
+        const std::size_t x0 = static_cast<std::size_t>(fx), y0 = static_cast<std::size_t>(fy);
+        const std::size_t x1 = std::min(x0 + 1, im.width - 1), y1 = std::min(y0 + 1, im.height - 1);
+        const double ax = fx - x0, ay = fy - y0;
+        for (std::size_t c = 0; c < 3; ++c) {
+            const double v = (im.pixels[(y0 * im.width + x0) * 3 + c] * (1 - ax) + im.pixels[(y0 * im.width + x1) * 3 + c] * ax) * (1 - ay) +
+                             (im.pixels[(y1 * im.width + x0) * 3 + c] * (1 - ax) + im.pixels[(y1 * im.width + x1) * 3 + c] * ax) * ay;
+            out[c] = static_cast<std::uint8_t>(std::lround(v));
+        }
+    };
+    std::vector<Image> frames;
+    for (std::size_t k = z.keyframes - 1; k-- > 0;) {  // outermost segment first (zoom in order)
+        const Image& outer = keys[k + 1];
+        const Image& inner = keys[k];
+        for (std::size_t f = 0; f < z.framesPerKey; ++f) {
+            const double u = static_cast<double>(f) / static_cast<double>(z.framesPerKey);
+            const double view = std::pow(static_cast<double>(z.shrink), u);  // view size as a fraction of the outer picture
+            Image frame;
+            frame.width = W;
+            frame.height = H;
+            frame.pixels.resize(W * H * 3);
+            parallelFor(0, H, 8, [&](std::size_t y0, std::size_t y1) {
+                for (std::size_t y = y0; y < y1; ++y)
+                    for (std::size_t x = 0; x < W; ++x) {
+                        // Position in the outer picture's normalized coordinates (centre 0.5).
+                        const double nx = 0.5 + ((x + 0.5) / W - 0.5) * view, ny = 0.5 + ((y + 0.5) / H - 0.5) * view;
+                        // Inside the inner picture's area?
+                        const double ix = (nx - 0.5) / z.shrink + 0.5, iy = (ny - 0.5) / z.shrink + 0.5;
+                        std::uint8_t* px = frame.pixels.data() + (y * W + x) * 3;
+                        if (ix >= 0.0 && ix < 1.0 && iy >= 0.0 && iy < 1.0) sample(inner, ix * W - 0.5, iy * H - 0.5, px);
+                        else sample(outer, nx * W - 0.5, ny * H - 0.5, px);
+                    }
+            });
+            frames.push_back(std::move(frame));
+        }
+    }
+    frames.push_back(keys[0]);
+    if (!z.zoomIn) std::reverse(frames.begin(), frames.end());
     return frames;
 }
 

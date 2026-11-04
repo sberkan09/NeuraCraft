@@ -248,7 +248,16 @@ std::vector<Image> zoomAnimation(StableDiffusion& sd, const std::vector<std::str
 
 struct TextToVideoOptions {
     std::size_t width = 512, height = 512;  // multiples of 64
-    std::size_t frames = 16;                // 1 .. 32 (AnimateDiff was trained on 16)
+    std::size_t frames = 16;                // any count: more than `context` uses sliding windows
+    // The motion module sees `context` frames at a time (AnimateDiff was
+    // trained on 16, at most 32); longer clips are denoised in windows that
+    // overlap by `overlap` frames, blended with pyramid weights.
+    std::size_t context = 16, overlap = 4;
+    // Image / video to video: one image animates (every frame starts from it),
+    // or one image per frame restyles a clip. Each starts from the encoded
+    // frame noised to the sigma of step steps - steps * strength.
+    std::vector<Image> init;
+    float strength = 0.75f;
     std::size_t steps = 4;                  // AnimateDiff-Lightning: the step count the module was distilled for
     unsigned seed = 0;
     float guidance = 1.0f;                  // <= 1: off (Lightning); else classifier-free guidance
@@ -264,7 +273,8 @@ struct TextToVideoOptions {
 
 // AnimateDiff text to video on an SD 1.x diffusers directory plus a motion
 // adapter: CLIP encodes the prompt, the UNet with motion modules denoises all
-// frames' latents together, each frame is decoded. Returns the frames.
+// frames' latents together, each frame is decoded. Returns the frames. With
+// options.init it is image to video or video to video instead.
 std::vector<Image> textToVideo(const std::string& directory, const std::string& prompt, const TextToVideoOptions& options = {});
 
 } // namespace nc

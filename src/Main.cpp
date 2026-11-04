@@ -957,6 +957,7 @@ void usage() {
               << "  NeuraCraft video <dir> morph \"prompt\" \"prompt\" ... [-o out.gif] [--seeds A,B,..] [--frames N] [--fps F] [--no-loop]\n"
               << "  NeuraCraft video <dir> zoom \"prompt\" ... [-o out.gif] [--frames N] [--zoom Z] [--pan DX,DY] [--rotate DEG]\n"
               << "  NeuraCraft video <dir> t2v \"prompt\" [-o out.gif] [--frames 16] [--steps 4] [--seed S] [--motion file] [--guidance G]\n"
+              << "        [--context 16 --overlap 4] [--init image.png | --init-dir frames/] [--strength 0.75]\n"
               << "        [--strength S] [--steps N] [--start in.png] [--seed S] [--size N] [--frames-dir DIR] [--full-vae]\n"
               << "        [--sharpen A] [--noise N] [--no-color-match]\n"
               << "                               image to image (input: PNG or PPM, cropped to the size)\n"
@@ -1190,7 +1191,20 @@ int main(int argc, char** argv) {
                     zo.dx = std::stof(parts[0]);
                     zo.dy = std::stof(parts[1]);
                 } else if (a == "--rotate") zo.rotate = std::stof(value());
-                else if (a == "--strength") zo.strength = std::stof(value());
+                else if (a == "--strength") zo.strength = vo.strength = std::stof(value());
+                else if (a == "--context") vo.context = std::stoul(value());
+                else if (a == "--overlap") vo.overlap = std::stoul(value());
+                else if (a == "--init") vo.init.push_back(loadImage(value()));
+                else if (a == "--init-dir") {
+                    std::vector<std::string> files;
+                    for (const auto& e : std::filesystem::directory_iterator(value())) {
+                        const std::string ext = e.path().extension().string();
+                        if (ext == ".png" || ext == ".ppm") files.push_back(e.path().string());
+                    }
+                    std::sort(files.begin(), files.end());
+                    for (const std::string& f : files) vo.init.push_back(loadImage(f));
+                    if (!framesSet) frames = files.size(), framesSet = true;
+                }
                 else if (a == "--no-color-match") zo.colorCoherence = false;
                 else if (a == "--sharpen") zo.sharpen = std::stof(value());
                 else if (a == "--noise") zo.noise = std::stof(value());

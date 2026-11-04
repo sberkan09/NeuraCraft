@@ -2986,8 +2986,35 @@ TEST(animatediff_motion_modules_and_text_to_video) {
     CHECK(textToVideo(dir, "hello he", o)[2].pixels == video[2].pixels);
     o.seed = 9;
     CHECK(textToVideo(dir, "hello he", o)[0].pixels != video[0].pixels);
-    o.frames = 40;
+    // Longer than the context: overlapping windows, same frame count and size.
+    o.frames = 5;
+    o.context = 3;
+    o.overlap = 1;
+    const auto windows = textToVideo(dir, "hello he", o);
+    CHECK(windows.size() == 5 && windows[4].width == 64);
+    o.context = 3;
+    o.overlap = 3;
     CHECK_THROWS(textToVideo(dir, "hello", o), std::invalid_argument);
+    o.context = 16;
+    o.overlap = 4;
+    // Image to video: one picture for all frames; strength 0.5 runs 1 of 2 steps.
+    Image still;
+    still.width = 70;
+    still.height = 60;
+    for (std::size_t i = 0; i < 70 * 60 * 3; ++i) still.pixels.push_back(static_cast<std::uint8_t>(i * 11 % 256));
+    o.frames = 3;
+    o.init = {still};
+    o.strength = 0.5f;
+    stages.clear();
+    o.progress = [&](const std::string& s, double) { stages.push_back(s); };
+    CHECK(textToVideo(dir, "hello", o).size() == 3);
+    CHECK(stages == std::vector<std::string>({"text encoder", "load unet + motion", "vae encode", "step 2/2", "vae decode"}));
+    o.progress = nullptr;
+    o.init = {still, still, still};  // video to video
+    CHECK(textToVideo(dir, "hello", o).size() == 3);
+    o.init = {still, still};
+    CHECK_THROWS(textToVideo(dir, "hello", o), std::invalid_argument);
+    o.init.clear();
     o.frames = 2;
     o.motion = dir + "/missing.safetensors";
     CHECK_THROWS(textToVideo(dir, "hello", o), std::exception);

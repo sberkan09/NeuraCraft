@@ -355,7 +355,7 @@ Pieces, each checked against an independent NumPy implementation (`scripts/`):
   works in row strips written straight into channel-major output (memory
   stays bounded at 512 x 512; 1x1 convolutions are one GEMM). It agrees with
   `vae_reference.py` within 5.4e-6; an encode/decode round trip keeps a
-  picture at 29-32 dB PSNR. PNG output and PPM input are built in.
+  picture at 29-32 dB PSNR. PNG and JPEG output, PNG and PPM input are built in.
 - **Preview decoder:** `loadTinyVae()` builds TAESD (diffusers
   `AutoencoderTiny`, madebyollin/taesd, ~1 M parameters: 3x3 convolutions,
   ReLU residual blocks); decoding a 512 x 512 latent takes 4.8 s instead of
@@ -437,6 +437,32 @@ On the 2-core test machine the clip above (16 frames, 512 x 512, 4 steps,
 int8) took 20 minutes: 4.4 minutes per denoising step over all 16 frames,
 87 s of TAESD decoding, 2.2 GB peak memory. AnimateDiff v1 modules (no mid block module)
 are refused; any SD 1.5 model in diffusers layout can replace epiCRealism.
+
+**Longer clips, image to video, video to video.** More frames than the
+motion module's context (`--context 16 --overlap 4`) are denoised in
+overlapping windows whose predictions are blended with pyramid weights, so a
+48-frame clip costs about four 16-frame windows per step. `--init still.png`
+animates a picture (every frame starts from it, noised to the sigma of step
+`steps - steps * strength`, default 0.75 = 3 of Lightning's 4 steps), and
+`--init-dir frames/` restyles a clip frame by frame with motion kept
+consistent:
+
+```
+$ ./build_and_run.sh video data/animatediff t2v "a cozy log cabin in a snowy forest at night, heavy snow falling" \
+      --init cabin.png -o cabin.mov          # image to video, QuickTime output
+$ ./build_and_run.sh video data/animatediff t2v "a corgi on the beach" --frames 48 -o long.png   # 4 windows, animated PNG
+```
+
+I2V_SAMPLE
+
+**Output formats**, all written by the library itself: `.gif` (`saveGif`,
+256 colours, plays everywhere), `.png` (`saveApng`, animated PNG, full
+colour and lossless, plays in browsers), `.mov` (`saveMjpegMov`, a QuickTime
+movie of JPEG frames that QuickTime, Finder previews, VLC and ffmpeg play),
+plus `--frames-dir` for PNG frames. `savePng` filters each row and
+compresses with its own deflate (LZ77 + dynamic Huffman; a 512 x 512 frame
+goes from 787 KB to ~400 KB), and `saveJpeg` is a baseline encoder (4:2:0,
+standard tables; 39.6 dB at quality 90); `txt2img out.jpg` uses it.
 
 ## Performance and devices
 

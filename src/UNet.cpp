@@ -1509,6 +1509,7 @@ std::vector<Image> outpaintZoom(StableDiffusion& sd, const std::vector<std::stri
     if (prompts.empty()) throw std::invalid_argument("outpaintZoom: no prompts");
     if (z.keyframes < 2 || z.framesPerKey == 0) throw std::invalid_argument("outpaintZoom: need 2+ keyframes and 1+ frames per key");
     if (z.shrink < 0.4f || z.shrink > 0.9f) throw std::invalid_argument("outpaintZoom: shrink must be in [0.4, 0.9]");
+    if (z.strength <= 0.0f || z.strength > 1.0f) throw std::invalid_argument("outpaintZoom: strength must be in (0, 1]");
     const std::size_t W = sd.width(), H = sd.height();
     const TextToImageOptions& opts = sd.impl_options();
     // keys[0] is the innermost picture; keys[k + 1] holds keys[k] shrunk in its middle.
@@ -1526,10 +1527,15 @@ std::vector<Image> outpaintZoom(StableDiffusion& sd, const std::vector<std::stri
         canvas.height = mask.height = H;
         canvas.pixels.assign(W * H * 3, 0);
         mask.pixels.assign(W * H * 3, 255);
-        // Border: the inner picture's edge pixels stretched outwards (a neutral start for the redraw).
+        // Border: the inner picture mirrored outwards, a plausible start for the redraw.
+        auto mirror = [](long v, long n) {
+            while (v < 0 || v >= n) v = v < 0 ? -v - 1 : 2 * n - v - 1;
+            return static_cast<std::size_t>(v);
+        };
         for (std::size_t y = 0; y < H; ++y)
             for (std::size_t x = 0; x < W; ++x) {
-                const std::size_t sx = std::min(iw - 1, x < ox ? 0 : x - ox), sy = std::min(ih - 1, y < oy ? 0 : y - oy);
+                const std::size_t sx = mirror(static_cast<long>(x) - static_cast<long>(ox), static_cast<long>(iw));
+                const std::size_t sy = mirror(static_cast<long>(y) - static_cast<long>(oy), static_cast<long>(ih));
                 std::copy_n(inner.pixels.data() + (sy * iw + sx) * 3, 3, canvas.pixels.data() + (y * W + x) * 3);
             }
         // Keep the inner picture except a thin rim (redrawn too, so the seam disappears).
@@ -1537,7 +1543,7 @@ std::vector<Image> outpaintZoom(StableDiffusion& sd, const std::vector<std::stri
         for (std::size_t y = oy + rim; y + rim < oy + ih; ++y)
             for (std::size_t x = ox + rim; x + rim < ox + iw; ++x) std::fill_n(mask.pixels.data() + (y * W + x) * 3, 3, 0);
         const std::string& prompt = prompts[std::min(prompts.size() - 1, k * prompts.size() / z.keyframes)];
-        keys.push_back(sd.inpaint(canvas, mask, prompt, z.seed + static_cast<unsigned>(k), z.steps, 1.0f, static_cast<float>(rim)));
+        keys.push_back(sd.inpaint(canvas, mask, prompt, z.seed + static_cast<unsigned>(k), z.steps, z.strength, static_cast<float>(rim)));
         reportStage(opts, "keyframe " + std::to_string(k + 1) + "/" + std::to_string(z.keyframes), t);
     }
     // Render: between keys[k + 1] (outer) and keys[k] (inner) the view shrinks geometrically from

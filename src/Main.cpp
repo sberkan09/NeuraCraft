@@ -1182,7 +1182,7 @@ int main(int argc, char** argv) {
             std::vector<unsigned> seeds;
             std::string output = morph ? "morph.gif" : t2v ? "t2v.gif" : outpaint ? "outpaint.gif" : "zoom.gif", framesDir, start;
             float fps = morph ? 10.0f : 8.0f;
-            bool fullVae = false, framesSet = false;
+            bool fullVae = false, framesSet = false, strengthSet = false;
             std::size_t frames = 0;
             auto split = [](const std::string& s) {
                 std::vector<std::string> parts;
@@ -1216,7 +1216,7 @@ int main(int argc, char** argv) {
                     zo.dx = std::stof(parts[0]);
                     zo.dy = std::stof(parts[1]);
                 } else if (a == "--rotate") zo.rotate = std::stof(value());
-                else if (a == "--strength") zo.strength = vo.strength = std::stof(value());
+                else if (a == "--strength") zo.strength = vo.strength = std::stof(value()), strengthSet = true;
                 else if (a == "--prompt-at") {  // FRAME:prompt
                     const std::string s = value();
                     const std::size_t colon = s.find(':');
@@ -1276,6 +1276,7 @@ int main(int argc, char** argv) {
                 oz.seed = seeds[0];
                 if (framesSet) oz.framesPerKey = frames;
                 oz.steps = mo.steps == 1 ? 25 : mo.steps;  // --steps (default 25; 4-6 with --sampler lcm and LCM-LoRA)
+                if (strengthSet) oz.strength = zo.strength;
             } else if (morph) {
                 if (seeds.size() == 1 && prompts.size() == 1) throw std::invalid_argument("video morph: give two prompts or several --seeds");
                 if (seeds.size() > 1 && prompts.size() == 1) prompts.resize(seeds.size(), prompts[0]);

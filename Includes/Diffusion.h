@@ -243,6 +243,10 @@ struct OutpaintZoomOptions {
     std::size_t framesPerKey = 12;    // rendered frames between two keyframes (no UNet work)
     bool zoomIn = false;              // play from the outermost picture inwards
     std::size_t steps = 4;
+    // Below 1 the new border starts from the shrunk picture mirrored outwards
+    // (noised), which continues the scene instead of letting the model frame
+    // the old picture; 1 starts the border from pure noise.
+    float strength = 0.9f;
     unsigned seed = 0;
 };
 

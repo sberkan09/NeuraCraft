@@ -209,7 +209,7 @@ std::string cpuBackendName() {
 
 std::string gpuName() {
 #ifdef NEURACRAFT_HAS_METAL
-    return metal::available() ? metal::deviceName() : std::string();
+    return metal::available() ? metal::deviceName() + ", " + metal::kernelName() + " kernel" : std::string();
 #else
     return std::string();
 #endif

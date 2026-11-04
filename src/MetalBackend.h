@@ -10,6 +10,7 @@ namespace metal {
 
 bool available();
 std::string deviceName();
+std::string kernelName();  // "simdgroup" or "tiled"
 void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
           const float* A, std::size_t lda, const float* B, std::size_t ldb,
           float* C, std::size_t ldc, bool accumulate);

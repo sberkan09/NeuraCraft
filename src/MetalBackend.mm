@@ -7,6 +7,7 @@
 #include "MetalBackend.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -92,6 +93,87 @@ kernel void gemm_tiled(device const float* A [[buffer(0)]],
 }
 )METAL";
 
+const char* const kSimdShaderSource = R"METAL(
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+struct GemmParams {
+    uint M; uint N; uint K;
+    uint lda; uint ldb; uint ldc;
+    uint transA; uint transB; uint accumulate;
+};
+
+// 64x64 output tile per threadgroup, 4 simdgroups (128 threads), each owning a
+// 32x32 block = 4x4 hardware 8x8 matrices. Needs Apple7+ (M1 and later).
+#define BM 64
+#define BN 64
+#define BK 16
+
+kernel void gemm_simd(device const float* A [[buffer(0)]],
+                      device const float* B [[buffer(1)]],
+                      device float* C [[buffer(2)]],
+                      constant GemmParams& p [[buffer(3)]],
+                      uint2 group [[threadgroup_position_in_grid]],
+                      uint tidx [[thread_index_in_threadgroup]],
+                      uint sgid [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float As[BM * BK];
+    threadgroup float Bs[BK * BN];
+    threadgroup float Cs[BM * BN];
+
+    const uint row0 = group.y * BM;
+    const uint col0 = group.x * BN;
+    const uint sgRow = (sgid / 2) * 32;
+    const uint sgCol = (sgid % 2) * 32;
+
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 4; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+        for (uint e = tidx; e < BM * BK; e += 128) {
+            uint r, k;
+            if (p.transA) { r = e % BM; k = e / BM; } else { r = e / BK; k = e % BK; }
+            const uint gr = row0 + r, gk = k0 + k;
+            float v = 0.0f;
+            if (gr < p.M && gk < p.K) v = p.transA ? A[gk * p.lda + gr] : A[gr * p.lda + gk];
+            As[r * BK + k] = v;
+        }
+        for (uint e = tidx; e < BK * BN; e += 128) {
+            uint k, c;
+            if (p.transB) { c = e / BK; k = e % BK; } else { k = e / BN; c = e % BN; }
+            const uint gc = col0 + c, gk = k0 + k;
+            float v = 0.0f;
+            if (gc < p.N && gk < p.K) v = p.transB ? B[gc * p.ldb + gk] : B[gk * p.ldb + gc];
+            Bs[k * BN + c] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < BK; kk += 8) {
+            simdgroup_float8x8 a[4], b[4];
+            for (uint i = 0; i < 4; ++i) simdgroup_load(a[i], As + (sgRow + i * 8) * BK + kk, BK);
+            for (uint j = 0; j < 4; ++j) simdgroup_load(b[j], Bs + kk * BN + sgCol + j * 8, BN);
+            for (uint i = 0; i < 4; ++i)
+                for (uint j = 0; j < 4; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 4; ++j)
+            simdgroup_store(acc[i][j], Cs + (sgRow + i * 8) * BN + sgCol + j * 8, BN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint e = tidx; e < BM * BN; e += 128) {
+        const uint r = row0 + e / BN, c = col0 + e % BN;
+        if (r < p.M && c < p.N) {
+            const uint idx = r * p.ldc + c;
+            C[idx] = p.accumulate ? C[idx] + Cs[e] : Cs[e];
+        }
+    }
+}
+)METAL";
+
 struct GemmParams {
     std::uint32_t M, N, K, lda, ldb, ldc, transA, transB, accumulate;
 };
@@ -99,7 +181,9 @@ struct GemmParams {
 struct Context {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
-    id<MTLComputePipelineState> gemm = nil;
+    id<MTLComputePipelineState> gemm = nil;       // portable tiled kernel
+    id<MTLComputePipelineState> gemmSimd = nil;   // simdgroup-matrix kernel (Apple7+)
+    bool useSimd = false;
     std::string name;
     std::string error;
     bool ok = false;
@@ -137,7 +221,28 @@ Context& context() {
                 return;
             }
             ctx.ok = ctx.queue != nil;
-            if (!ctx.ok) ctx.error = "could not create a command queue";
+            if (!ctx.ok) {
+                ctx.error = "could not create a command queue";
+                return;
+            }
+
+            // Faster kernel on M1 and later; any failure just keeps the tiled one.
+            bool wantSimd = true;
+            if (@available(macOS 11.0, iOS 14.0, *)) {
+                wantSimd = [ctx.device supportsFamily:MTLGPUFamilyApple7];
+            } else {
+                wantSimd = false;
+            }
+            const char* forced = std::getenv("NEURACRAFT_METAL_KERNEL");
+            if (forced && std::string(forced) == "tiled") wantSimd = false;
+            if (wantSimd) {
+                NSError* simdErr = nil;
+                NSString* simdSrc = [NSString stringWithUTF8String:kSimdShaderSource];
+                id<MTLLibrary> simdLib = [ctx.device newLibraryWithSource:simdSrc options:nil error:&simdErr];
+                id<MTLFunction> simdFn = simdLib ? [simdLib newFunctionWithName:@"gemm_simd"] : nil;
+                if (simdFn) ctx.gemmSimd = [ctx.device newComputePipelineStateWithFunction:simdFn error:&simdErr];
+                ctx.useSimd = ctx.gemmSimd != nil && [ctx.gemmSimd maxTotalThreadsPerThreadgroup] >= 128;
+            }
         }
     });
     return ctx;
@@ -153,6 +258,8 @@ std::uint32_t to32(std::size_t v) {
 bool available() { return context().ok; }
 
 std::string deviceName() { return context().name; }
+
+std::string kernelName() { return context().useSimd ? "simdgroup" : "tiled"; }
 
 void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
           const float* A, std::size_t lda, const float* B, std::size_t ldb,
@@ -189,14 +296,18 @@ void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
 
             id<MTLCommandBuffer> cb = [ctx.queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:ctx.gemm];
+            [enc setComputePipelineState:(ctx.useSimd ? ctx.gemmSimd : ctx.gemm)];
             [enc setBuffer:bufA offset:0 atIndex:0];
             [enc setBuffer:bufB offset:0 atIndex:1];
             [enc setBuffer:bufC offset:0 atIndex:2];
             [enc setBytes:&params length:sizeof(params) atIndex:3];
-            const MTLSize groups = MTLSizeMake((N + 31) / 32, (M + 31) / 32, 1);
-            const MTLSize threads = MTLSizeMake(8, 8, 1);
-            [enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+            if (ctx.useSimd) {
+                [enc dispatchThreadgroups:MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake((N + 31) / 32, (M + 31) / 32, 1)
+                    threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            }
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];

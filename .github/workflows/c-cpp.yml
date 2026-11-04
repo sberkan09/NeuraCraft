@@ -29,6 +29,10 @@ jobs:
     - name: Unit test details
       run: ./build/neuracraft_tests
 
+    - name: Unit tests with the portable Metal kernel
+      if: runner.os == 'macOS'
+      run: NEURACRAFT_METAL_KERNEL=tiled ./build/neuracraft_tests
+
     - name: Benchmark
       run: ./bin/NeuraCraft bench
 

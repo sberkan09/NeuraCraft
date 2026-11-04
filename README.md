@@ -549,6 +549,31 @@ machine. `--zoom-in` plays it the other way.) Starting the border from pure
 noise (`--strength 1`) tends to make the model paint a frame around the old
 picture; the mirrored start avoids that.
 
+### ControlNet
+
+```
+$ scripts/download_controlnet.sh data/controlnet-canny canny     # ControlNet 1.1 canny for SD 1.5 (~720 MB)
+$ ./build_and_run.sh txt2img data/animatediff "a wooden cabin in a sunny green summer meadow, photo" out.png \
+      --controlnet data/controlnet-canny --control cabin.png --canny \
+      --steps 4 --sampler lcm --lora data/loras/lcm-lora-sdv1-5.safetensors
+```
+
+<p><img src="docs/images/inpaint_input.jpg" width="200"> <img src="docs/images/controlnet_edges.jpg" width="200"> <img src="docs/images/controlnet_result.jpg" width="200"></p>
+
+A diffusers `ControlNetModel` directory loads with `loadUNet()` as a UNet
+without up blocks: the conditioning embedding turns the control picture into
+latent-size features, the copied down / mid blocks run on the noisy latent,
+and zero convolutions produce residuals that `forward(..., residuals)` adds
+to the UNet's skips and mid block (`controlScale` weights them).
+`scripts/controlnet_reference.py` agrees with it within 2.5e-6.
+`cannyEdges()` follows OpenCV's `cv2.Canny` (the ControlNet canny
+preprocessor; IoU 0.99 with OpenCV's edges). Above: the snowy cabin's edges
+(middle) redrawn as a summer scene, 4 LCM steps, 92 s. ControlNet works for
+text to image, image to image and text / video to video (`--control-dir`, or
+`--canny` alone with `--init-dir` to take the edges of the input clip).
+
+V2V_SAMPLE
+
 **Output formats**, all written by the library itself: `.gif` (`saveGif`,
 256 colours, plays everywhere), `.png` (`saveApng`, animated PNG, full
 colour and lossless, plays in browsers), `.mov` (`saveMjpegMov`, a QuickTime

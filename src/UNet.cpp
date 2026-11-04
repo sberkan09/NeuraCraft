@@ -104,6 +104,7 @@ struct Weights {
     explicit Weights(const std::string& file) : file(file), st(file) {}
     Matrix take(const std::string& name, std::size_t rows, std::size_t cols) {
         Matrix m = st.load(name);
+        if (lora) lora->apply(name, m);
         if (m.size() != rows * cols)
             throw std::runtime_error("loadUNet: " + name + " in " + file + " has " + std::to_string(m.size()) + " values, expected " +
                                      std::to_string(rows * cols));
@@ -133,6 +134,7 @@ struct Weights {
     std::string file;
     SafeTensors st;
     bool int8 = false;
+    LoraMerger* lora = nullptr;
 };
 
 struct TimeResnet {
@@ -457,18 +459,26 @@ std::size_t UNet2DCondition::parameterCount() const { return impl_->params; }
 bool UNet2DCondition::hasMotionModules() const { return impl_->midMotion != nullptr; }
 
 Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, const Matrix& context) {
+    return forwardFrames(latents, timestep, std::vector<Matrix>{context});
+}
+
+Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, const std::vector<Matrix>& contexts) {
     Impl& m = *impl_;
     const std::size_t F = latents.rows();
     if (F == 0 || latents.cols() != m.latent.size())
         throw std::invalid_argument("UNet2DCondition::forwardFrames: expected F x " + std::to_string(m.latent.size()) + " latents");
-    if (context.cols() != m.contextDim)
-        throw std::invalid_argument("UNet2DCondition::forwardFrames: context must have " + std::to_string(m.contextDim) + " columns");
+    if (contexts.size() != 1 && contexts.size() != F)
+        throw std::invalid_argument("UNet2DCondition::forwardFrames: give one context or one per frame");
+    for (const Matrix& c : contexts)
+        if (c.cols() != m.contextDim)
+            throw std::invalid_argument("UNet2DCondition::forwardFrames: context must have " + std::to_string(m.contextDim) + " columns");
+    auto ctx = [&](std::size_t f) -> const Matrix& { return contexts[contexts.size() == 1 ? 0 : f]; };
     Matrix out(F, m.latent.size());
     if (!hasMotionModules()) {
         for (std::size_t f = 0; f < F; ++f) {
             Matrix one(1, m.latent.size());
             std::copy(latents.data() + f * one.size(), latents.data() + (f + 1) * one.size(), one.data());
-            const Matrix eps = forward(one, timestep, context);
+            const Matrix eps = forward(one, timestep, ctx(f));
             std::copy(eps.data(), eps.data() + eps.size(), out.data() + f * eps.size());
         }
         return out;
@@ -488,10 +498,13 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
     auto each = [&](auto&& fn) {
         for (Matrix& x : h) x = fn(x);
     };
+    auto attend = [&](CrossTransformer& a) {
+        for (std::size_t f = 0; f < F; ++f) h[f] = a.forward(h[f], ctx(f));
+    };
     for (auto& d : m.downs) {
         for (std::size_t j = 0; j < d.resnets.size(); ++j) {
             each([&](const Matrix& x) { return d.resnets[j]->forward(x, temb); });
-            if (!d.attentions.empty()) each([&](const Matrix& x) { return d.attentions[j]->forward(x, context); });
+            if (!d.attentions.empty()) attend(*d.attentions[j]);
             d.motions[j]->forward(h);
             skips.push_back(h);
         }
@@ -501,7 +514,7 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
         }
     }
     each([&](const Matrix& x) { return m.mid1->forward(x, temb); });
-    each([&](const Matrix& x) { return m.midAttention->forward(x, context); });
+    attend(*m.midAttention);
     m.midMotion->forward(h);
     each([&](const Matrix& x) { return m.mid2->forward(x, temb); });
     for (auto& u : m.ups) {
@@ -509,7 +522,7 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
             std::vector<Matrix>& s = skips.back();
             for (std::size_t f = 0; f < F; ++f) h[f] = u.resnets[j]->forward(concatChannels(h[f], s[f]), temb);
             skips.pop_back();
-            if (!u.attentions.empty()) each([&](const Matrix& x) { return u.attentions[j]->forward(x, context); });
+            if (!u.attentions.empty()) attend(*u.attentions[j]);
             u.motions[j]->forward(h);
         }
         if (u.upsample) each([&](const Matrix& x) { return u.upConv->forward(u.upsample->forward(x, false), false); });
@@ -588,7 +601,8 @@ Matrix UNet2DCondition::forward(const Matrix& latent, float timestep, const Matr
     return m.convOut->forward(h, false);
 }
 
-UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, std::size_t latentHeight, bool int8) {
+UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, std::size_t latentHeight, bool int8,
+                         const std::vector<Lora>& loras) {
     const std::string dir = exists(directory + "/config.json") ? directory : directory + "/unet";
     const json::Value c = json::parse(readFile(dir + "/config.json"));
     std::string file = dir + "/diffusion_pytorch_model.safetensors";
@@ -650,6 +664,8 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
     const std::size_t tembDim = 4 * ch[0];
     Weights w(file);
     w.int8 = int8;
+    LoraMerger merger(loras, "unet");
+    if (!merger.empty()) w.lora = &merger;
     SkipParameterInit skip;
 
     m.t1 = std::make_unique<Dense>(m.timeDim, tembDim);
@@ -724,6 +740,8 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
     w.norm(*m.normOut, "conv_norm_out", s.channels);
     m.convOut = std::make_unique<Conv2D>(s, static_cast<std::size_t>(c.numberOr("out_channels", 4)), 3, 1, 1);
     w.conv(*m.convOut, "conv_out");
+    if (merger.layers() && !merger.merged())
+        throw std::runtime_error("loadUNet: the LoRA matches no layer of this UNet (made for another model?)");
     for (const auto& name : w.st.names()) m.params += w.st.info(name).elements();
     return unet;
 }
@@ -795,10 +813,64 @@ EulerScheduler EulerScheduler::fromConfig(const std::string& path, std::size_t s
                      static_cast<std::size_t>(c.numberOr("steps_offset", 0)));
 }
 
+EulerScheduler EulerScheduler::lcm(std::size_t steps, const std::string& schedule, double betaStart, double betaEnd,
+                                   std::size_t originalSteps, std::size_t trainSteps) {
+    if (steps == 0 || steps > originalSteps || originalSteps == 0 || originalSteps > trainSteps)
+        throw std::invalid_argument("EulerScheduler::lcm: need 1 <= steps <= original steps <= train steps");
+    std::vector<double> sigmasAll(trainSteps);
+    double cumprod = 1.0;
+    for (std::size_t i = 0; i < trainSteps; ++i) {
+        const double f = trainSteps > 1 ? static_cast<double>(i) / static_cast<double>(trainSteps - 1) : 0.0;
+        double beta;
+        if (schedule == "scaled_linear") {
+            const double r = std::sqrt(betaStart) + f * (std::sqrt(betaEnd) - std::sqrt(betaStart));
+            beta = r * r;
+        } else if (schedule == "linear") beta = betaStart + f * (betaEnd - betaStart);
+        else throw std::runtime_error("EulerScheduler: beta_schedule '" + schedule + "' is not supported");
+        cumprod *= 1.0 - beta;
+        sigmasAll[i] = std::sqrt((1.0 - cumprod) / cumprod);
+    }
+    // LCM's original timesteps (k, 2k, ..., trainSteps) - 1, reversed, every (originalSteps / steps)-th.
+    const std::size_t k = trainSteps / originalSteps, skip = originalSteps / steps;
+    EulerScheduler s;
+    s.consistency = true;
+    for (std::size_t i = 0; i < steps; ++i) {
+        const std::size_t t = (originalSteps - i * skip) * k - 1;
+        s.timesteps.push_back(static_cast<double>(t));
+        s.sigmas.push_back(sigmasAll[t]);
+    }
+    s.sigmas.push_back(0.0);
+    s.initNoiseSigma = std::sqrt(s.sigmas[0] * s.sigmas[0] + 1.0);  // unit noise in the model's (VP) space
+    return s;
+}
+
+EulerScheduler EulerScheduler::lcmFromConfig(const std::string& path, std::size_t steps) {
+    const json::Value c = json::parse(readFile(path));
+    if (const json::Value* p = c.find("prediction_type"); p && p->string != "epsilon")
+        throw std::runtime_error("EulerScheduler: prediction_type '" + p->string + "' is not supported");
+    return lcm(steps, c.find("beta_schedule") ? c.at("beta_schedule").string : "scaled_linear", c.numberOr("beta_start", 0.00085),
+               c.numberOr("beta_end", 0.012), static_cast<std::size_t>(c.numberOr("original_inference_steps", 50)),
+               static_cast<std::size_t>(c.numberOr("num_train_timesteps", 1000)));
+}
+
 double EulerScheduler::inputScale(std::size_t i) const { return 1.0 / std::sqrt(sigmas.at(i) * sigmas.at(i) + 1.0); }
 
 void EulerScheduler::step(std::size_t i, const Matrix& noise, Matrix& latent) const {
     if (!noise.sameShape(latent)) throw std::invalid_argument("EulerScheduler::step: shapes differ");
+    if (consistency) {
+        // The latent is kept in the sigma (VE) form x = x0 + sigma n, as for Euler; the model's
+        // (VP) sample is x / sqrt(sigma^2 + 1). LCM: denoised = c_out x0 + c_skip sample.
+        const double sigma = sigmas.at(i), next = sigmas.at(i + 1), ts = timesteps.at(i) * 10.0;
+        const float cSkip = static_cast<float>(0.25 / (ts * ts + 0.25)), cOut = static_cast<float>(ts / std::sqrt(ts * ts + 0.25));
+        const float s = static_cast<float>(sigma), vp = static_cast<float>(1.0 / std::sqrt(sigma * sigma + 1.0));
+        const Matrix fresh = next > 0.0 ? Matrix::normal(latent.rows(), latent.cols(), 0.0f, 1.0f) : Matrix();
+        for (std::size_t k = 0; k < latent.size(); ++k) {
+            const float x = latent.data()[k];
+            const float denoised = cOut * (x - s * noise.data()[k]) + cSkip * x * vp;
+            latent.data()[k] = next > 0.0 ? denoised + static_cast<float>(next) * fresh.data()[k] : denoised;
+        }
+        return;
+    }
     // x0 = x - sigma eps; d = (x - x0) / sigma = eps; x_next = x + d (sigma_next - sigma)
     const float dt = static_cast<float>(sigmas.at(i + 1) - sigmas.at(i));
     for (std::size_t k = 0; k < latent.size(); ++k) latent.data()[k] += noise.data()[k] * dt;
@@ -822,7 +894,7 @@ void checkSize(const TextToImageOptions& o) {
 std::pair<Matrix, Matrix> encodePrompts(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
     const auto t = PipelineClock::now();
     const ClipTokenizer tok = ClipTokenizer::fromDirectory(dir + "/tokenizer");
-    ClipTextEncoder enc = loadClipTextEncoder(dir, o.int8);
+    ClipTextEncoder enc = loadClipTextEncoder(dir, o.int8, o.loras);
     // SD 2 / Turbo pad with "!" (id 0); SD 1.x pads with <|endoftext|>.
     int pad = tok.endOfText();
     if (std::ifstream(dir + "/tokenizer/tokenizer_config.json")) {
@@ -836,8 +908,10 @@ std::pair<Matrix, Matrix> encodePrompts(const std::string& dir, const std::strin
     return out;
 }
 
-EulerScheduler schedulerFor(const std::string& dir, std::size_t steps) {
+EulerScheduler schedulerFor(const std::string& dir, std::size_t steps, const std::string& sampler = "euler") {
     const std::string config = dir + "/scheduler/scheduler_config.json";
+    if (sampler == "lcm") return exists(config) ? EulerScheduler::lcmFromConfig(config, steps) : EulerScheduler::lcm(steps);
+    if (sampler != "euler") throw std::invalid_argument("unknown sampler '" + sampler + "' (euler, lcm)");
     return exists(config) ? EulerScheduler::fromConfig(config, steps) : EulerScheduler::standard(steps);
 }
 
@@ -845,7 +919,7 @@ EulerScheduler schedulerFor(const std::string& dir, std::size_t steps) {
 void denoise(const std::string& dir, const std::pair<Matrix, Matrix>& context, const EulerScheduler& sched, std::size_t first,
              Matrix& latent, const TextToImageOptions& o) {
     auto t = PipelineClock::now();
-    UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8);
+    UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8, o.loras);
     reportStage(o, "load unet", t);
     if (latent.empty()) {  // text to image: a Gaussian latent at the first sigma
         setSeed(o.seed);
@@ -872,7 +946,7 @@ Matrix textToLatent(const std::string& dir, const std::string& prompt, const Tex
     checkSize(o);
     const auto context = encodePrompts(dir, prompt, o);
     Matrix latent;
-    denoise(dir, context, schedulerFor(dir, o.steps), 0, latent, o);
+    denoise(dir, context, schedulerFor(dir, o.steps, o.sampler), 0, latent, o);
     return latent;
 }
 
@@ -889,7 +963,7 @@ Image imageToImage(const std::string& dir, const Image& input, const std::string
     }
     // As diffusers: the last steps * strength steps of the schedule run, starting from the
     // encoded image with noise at that step's sigma.
-    const EulerScheduler sched = schedulerFor(dir, o.steps);
+    const EulerScheduler sched = schedulerFor(dir, o.steps, o.sampler);
     const std::size_t run = std::min(o.steps, static_cast<std::size_t>(static_cast<float>(o.steps) * o.strength + 1e-4f));
     if (run > 0) {
         const std::size_t first = o.steps - run;
@@ -937,6 +1011,7 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
     o.tinyVae = v.tinyVae;
     o.int8 = v.int8;
     o.progress = v.progress;
+    o.loras = v.loras;
     checkSize(o);
     if (v.frames == 0) throw std::invalid_argument("textToVideo: frames must be > 0");
     if (v.context == 0 || v.context > 32 || v.overlap >= v.context)
@@ -955,13 +1030,53 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
                 }
         if (motion.empty()) throw std::runtime_error("textToVideo: no motion module (.safetensors) in " + md);
     }
-    const auto context = encodePrompts(dir, prompt, o);
+    // Text conditions: one for all frames, or per frame between prompt-travel keyframes.
+    std::vector<Matrix> conds;
+    Matrix uncond;
+    {
+        auto te = PipelineClock::now();
+        const ClipTokenizer tok = ClipTokenizer::fromDirectory(dir + "/tokenizer");
+        ClipTextEncoder enc = loadClipTextEncoder(dir, o.int8, o.loras);
+        int pad = tok.endOfText();
+        if (std::ifstream(dir + "/tokenizer/tokenizer_config.json")) {
+            const json::Value c = json::parse(readFile(dir + "/tokenizer/tokenizer_config.json"));
+            if (const json::Value* p = c.find("pad_token"); p && p->isString() && p->string == "!") pad = 0;
+        }
+        auto encode = [&](const std::string& s) { return enc.encode(tok.encodeForModel(s, enc.length, pad)); };
+        std::vector<std::pair<std::size_t, Matrix>> keys{{0, encode(prompt)}};
+        std::vector<std::pair<std::size_t, std::string>> at = v.promptAt;
+        std::sort(at.begin(), at.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& [frame, text] : at) {
+            if (frame == 0 || frame >= v.frames) throw std::invalid_argument("textToVideo: prompt keyframes must be in 1..frames-1");
+            if (frame == keys.back().first) throw std::invalid_argument("textToVideo: two prompts at frame " + std::to_string(frame));
+            keys.emplace_back(frame, encode(text));
+        }
+        if (keys.size() == 1) conds.push_back(keys[0].second);
+        else
+            for (std::size_t f = 0; f < v.frames; ++f) {
+                std::size_t k = 0;
+                while (k + 1 < keys.size() && keys[k + 1].first <= f) ++k;
+                if (k + 1 == keys.size()) {
+                    conds.push_back(keys[k].second);
+                    continue;
+                }
+                const float w = static_cast<float>(f - keys[k].first) / static_cast<float>(keys[k + 1].first - keys[k].first);
+                Matrix c = keys[k].second;
+                const Matrix& b = keys[k + 1].second;
+                for (std::size_t i = 0; i < c.size(); ++i) c.data()[i] += w * (b.data()[i] - c.data()[i]);
+                conds.push_back(std::move(c));
+            }
+        if (o.guidance > 1.0f) uncond = encode(o.negativePrompt);
+        reportStage(o, "text encoder", te);
+    }
     auto t = PipelineClock::now();
-    UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8);
+    UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8, o.loras);
     loadMotionModules(unet, motion, o.int8);
     reportStage(o, "load unet + motion", t);
     const EulerScheduler sched =
-        v.betaSchedule == "config" ? schedulerFor(dir, v.steps) : EulerScheduler::make(v.steps, v.betaSchedule, "trailing");
+        v.betaSchedule == "config" ? schedulerFor(dir, v.steps, v.sampler)
+        : v.sampler == "lcm"       ? EulerScheduler::lcm(v.steps, v.betaSchedule)  // AnimateLCM: LCM steps, linear betas
+                                   : EulerScheduler::make(v.steps, v.betaSchedule, "trailing");
     const std::size_t F = v.frames, n = unet.latentShape().size();
     std::size_t first = 0;
     setSeed(v.seed);
@@ -999,14 +1114,15 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
         }
         starts.push_back(s);
     }
-    auto predict = [&](const Matrix& in, float timestep, const Matrix& ctx) {
+    auto predict = [&](const Matrix& in, float timestep, const std::vector<Matrix>& ctx) {
         if (starts.size() == 1) return unet.forwardFrames(in, timestep, ctx);
         Matrix sum(F, n);
         std::vector<float> weight(F, 0.0f);
         for (std::size_t s : starts) {
             Matrix win(ctxLen, n);
             std::copy(in.data() + s * n, in.data() + (s + ctxLen) * n, win.data());
-            const Matrix e = unet.forwardFrames(win, timestep, ctx);
+            const Matrix e = unet.forwardFrames(
+                win, timestep, ctx.size() == 1 ? ctx : std::vector<Matrix>(ctx.begin() + static_cast<long>(s), ctx.begin() + static_cast<long>(s + ctxLen)));
             for (std::size_t f = 0; f < ctxLen; ++f) {
                 // Pyramid weights: frames near a window's middle count most.
                 const float wgt = static_cast<float>(std::min(f + 1, ctxLen - f));
@@ -1027,10 +1143,10 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
         Matrix in = latents;
         const float scale = static_cast<float>(sched.inputScale(i));
         for (float& x : in.values()) x *= scale;
-        Matrix eps = predict(in, static_cast<float>(sched.timesteps[i]), context.first);
+        Matrix eps = predict(in, static_cast<float>(sched.timesteps[i]), conds);
         if (o.guidance > 1.0f) {
-            const Matrix uncond = predict(in, static_cast<float>(sched.timesteps[i]), context.second);
-            for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + o.guidance * (eps.data()[k] - uncond.data()[k]);
+            const Matrix un = predict(in, static_cast<float>(sched.timesteps[i]), std::vector<Matrix>{uncond});
+            for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = un.data()[k] + o.guidance * (eps.data()[k] - un.data()[k]);
         }
         sched.step(i, eps, latents);
         reportStage(o, "step " + std::to_string(i + 1) + "/" + std::to_string(sched.timesteps.size()), t);
@@ -1074,7 +1190,7 @@ StableDiffusion::StableDiffusion(const std::string& dir, const TextToImageOption
     m.encoder = withEncoder;
     auto t = PipelineClock::now();
     m.tokenizer = std::make_unique<ClipTokenizer>(ClipTokenizer::fromDirectory(dir + "/tokenizer"));
-    m.clip = loadClipTextEncoder(dir, o.int8);
+    m.clip = loadClipTextEncoder(dir, o.int8, o.loras);
     m.pad = m.tokenizer->endOfText();
     if (std::ifstream(dir + "/tokenizer/tokenizer_config.json")) {
         const json::Value c = json::parse(readFile(dir + "/tokenizer/tokenizer_config.json"));
@@ -1082,7 +1198,7 @@ StableDiffusion::StableDiffusion(const std::string& dir, const TextToImageOption
     }
     reportStage(o, "load text encoder", t);
     t = PipelineClock::now();
-    m.unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8);
+    m.unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8, o.loras);
     reportStage(o, "load unet", t);
     t = PipelineClock::now();
     if (!o.tinyVae.empty()) m.tiny = std::make_unique<TinyVae>(loadTinyVae(o.tinyVae, o.width, o.height, withEncoder, true));
@@ -1107,7 +1223,7 @@ Matrix StableDiffusion::noise(unsigned seed) const {
     return Matrix::normal(1, impl_->unet.latentShape().size(), 0.0f, 1.0f);
 }
 
-EulerScheduler StableDiffusion::scheduler(std::size_t steps) const { return schedulerFor(impl_->dir, steps); }
+EulerScheduler StableDiffusion::scheduler(std::size_t steps) const { return schedulerFor(impl_->dir, steps, impl_->options.sampler); }
 
 void StableDiffusion::denoise(Matrix& latent, const Matrix& context, const EulerScheduler& sched, std::size_t first, float guidance,
                               const Matrix& negative) {

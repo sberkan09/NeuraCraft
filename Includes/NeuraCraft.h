@@ -11,6 +11,7 @@
 #include "Image.h"
 #include "Json.h"
 #include "Layer.h"
+#include "Lora.h"
 #include "Loss.h"
 #include "Matrix.h"
 #include "Network.h"

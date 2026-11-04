@@ -459,6 +459,56 @@ Above: the snowy cabin from the morph animation (left, saved with
 `saveJpeg`) animated with falling snow at strength 0.75 (right; 16 frames,
 512 x 512, 17 minutes on the 2-core machine).
 
+**Prompt travel.** `--prompt-at FRAME:prompt` (`promptAt`) adds keyframes
+after the main prompt; every frame's text condition is interpolated between
+the keyframes around it, and the motion module keeps the change continuous:
+
+```
+$ ./build_and_run.sh video data/animatediff t2v "a lone oak tree on a green hill, spring, blooming flowers, photo" \
+      --prompt-at "31:a lone oak tree on a hill in winter, covered in snow, photo" --frames 32 --size 384
+```
+
+<p><img src="docs/images/video_travel.gif" width="256"></p>
+
+Inside one 16-frame window the motion module pulls all frames towards one
+scene, so a 16-frame clip shows a blend of both prompts; over a longer clip
+(32 frames above: three overlapping windows, 384 x 384, 29 minutes on the
+2-core machine) the change from spring to winter comes through.
+
+**LoRA and LCM.** `--lora file.safetensors[:scale]` merges LoRA adapters
+(kohya / A1111 `lora_unet_*` / `lora_te_*` and diffusers / PEFT `lora_A` /
+`lora_B` files, linear and convolution layers) into the UNet and text encoder
+while they load, before int8 quantization, for every image and video command
+(`LoraMerger`, `TextToImageOptions::loras`). `--sampler lcm` switches to
+diffusers' `LCMScheduler` (latent consistency: predict the clean latent,
+re-noise to the next timestep), so an ordinary SD 1.5 model with
+[LCM-LoRA](https://huggingface.co/latent-consistency/lcm-lora-sdv1-5) draws in
+4 steps without guidance:
+
+```
+$ scripts/download_lcm_lora.sh data/loras
+$ ./build_and_run.sh txt2img data/animatediff "portrait photo of an old fisherman, golden hour" out.jpg \
+      --steps 4 --sampler lcm --lora data/loras/lcm-lora-sdv1-5.safetensors --tiny-vae data/animatediff/taesd
+```
+
+<p><img src="docs/images/lcm_lora_fisherman.jpg" width="320"></p>
+
+Above: epiCRealism + LCM-LoRA, 4 steps, TAESD, 512 x 512 (shown smaller):
+4 UNet passes, 72 s in all on the 2-core machine including model loading.
+
+The same pieces run [AnimateLCM](https://huggingface.co/wangfuyun/AnimateLCM)
+(its motion module plus its LoRA, LCM sampler with linear betas):
+
+```
+$ ./build_and_run.sh video data/animatediff t2v "a red fox walking through a snowy forest, photo" \
+      --motion animatelcm/diffusion_pytorch_model.fp16.safetensors \
+      --lora animatelcm/AnimateLCM_sd15_t2v_lora.safetensors:0.8 --sampler lcm --steps 4 --size 384
+```
+
+<p><img src="docs/images/video_animatelcm.gif" width="256"></p>
+
+(16 frames at 384 x 384, 4 steps: 10 minutes on the 2-core machine.)
+
 **Output formats**, all written by the library itself: `.gif` (`saveGif`,
 256 colours, plays everywhere), `.png` (`saveApng`, animated PNG, full
 colour and lossless, plays in browsers), `.mov` (`saveMjpegMov`, a QuickTime
@@ -478,6 +528,10 @@ All matrix products in the library go through one `gemm()` dispatcher
 | NeuraCraft blocked kernel | default CPU path on Linux / Windows | packed, register-tiled SIMD kernel (SSE/AVX/NEON via vector extensions), multi-threaded; results don't depend on the thread count |
 | Apple Accelerate | default CPU path on macOS | uses the AMX matrix units on Apple silicon |
 | Metal | `setDevice(Device::GPU)` / `--gpu` on Apple silicon | simdgroup-matrix kernel on M1 and later, tiled fallback elsewhere; shaders compile at runtime (no full Xcode needed) |
+
+`scripts/mac_benchmark.sh` times SD-Turbo on the CPU and the GPU (int8 and
+float32) and a short animation, pausing between runs so a laptop stays
+cool, and writes `benchmark_results.txt`.
 
 ```cpp
 nc::setThreadCount(8);                 // CPU threads (default: all cores)

@@ -955,10 +955,12 @@ void usage() {
               << "  NeuraCraft txt2img <dir> \"prompt\" [out.png] [--steps N] [--seed S] [--size N] [--guidance G --negative N]\n"
               << "                 [--tiny-vae <taesd dir>] [--fp32]\n"
               << "  NeuraCraft img2img <dir> in.png \"prompt\" [out.png] [--strength S] [--steps N] [--seed S] [--size N] ...\n"
+              << "        image commands also take [--lora file.safetensors[:scale]] ... [--sampler euler|lcm]\n"
               << "  NeuraCraft video <dir> morph \"prompt\" \"prompt\" ... [-o out.gif] [--seeds A,B,..] [--frames N] [--fps F] [--no-loop]\n"
               << "  NeuraCraft video <dir> zoom \"prompt\" ... [-o out.gif] [--frames N] [--zoom Z] [--pan DX,DY] [--rotate DEG]\n"
               << "  NeuraCraft video <dir> t2v \"prompt\" [-o out.gif] [--frames 16] [--steps 4] [--seed S] [--motion file] [--guidance G]\n"
               << "        [--context 16 --overlap 4] [--init image.png | --init-dir frames/] [--strength 0.75]\n"
+              << "        [--prompt-at FRAME:prompt ...]   (prompt travel)\n"
               << "  video output: .gif (256 colours), .png (animated PNG, full colour) or .mov (QuickTime Motion-JPEG)\n"
               << "        [--strength S] [--steps N] [--start in.png] [--seed S] [--size N] [--frames-dir DIR] [--full-vae]\n"
               << "        [--sharpen A] [--noise N] [--no-color-match]\n"
@@ -973,6 +975,20 @@ void usage() {
 }
 
 } // namespace
+
+// FILE or FILE:SCALE (the last ':' followed by a number).
+static Lora parseLora(const std::string& s) {
+    const std::size_t colon = s.rfind(':');
+    if (colon != std::string::npos && colon + 1 < s.size()) {
+        try {
+            std::size_t used = 0;
+            const float scale = std::stof(s.substr(colon + 1), &used);
+            if (used == s.size() - colon - 1) return {s.substr(0, colon), scale};
+        } catch (const std::exception&) {
+        }
+    }
+    return {s, 1.0f};
+}
 
 int main(int argc, char** argv) {
     setSeed(42);
@@ -1123,6 +1139,8 @@ int main(int argc, char** argv) {
                 else if (a == "--int8") o.int8 = true;
                 else if (a == "--strength") o.strength = std::stof(value());
                 else if (a == "--fp32") o.int8 = false;
+                else if (a == "--lora") o.loras.push_back(parseLora(value()));
+                else if (a == "--sampler") o.sampler = value();
                 else if (a.rfind("--", 0) != 0) output = a;
                 else {
                     std::cerr << "unknown txt2img option: " << a << "\n";
@@ -1196,7 +1214,15 @@ int main(int argc, char** argv) {
                     zo.dy = std::stof(parts[1]);
                 } else if (a == "--rotate") zo.rotate = std::stof(value());
                 else if (a == "--strength") zo.strength = vo.strength = std::stof(value());
+                else if (a == "--prompt-at") {  // FRAME:prompt
+                    const std::string s = value();
+                    const std::size_t colon = s.find(':');
+                    if (colon == std::string::npos) throw std::invalid_argument("--prompt-at takes FRAME:prompt");
+                    vo.promptAt.emplace_back(std::stoul(s.substr(0, colon)), s.substr(colon + 1));
+                }
                 else if (a == "--context") vo.context = std::stoul(value());
+                else if (a == "--lora") o.loras.push_back(parseLora(value()));
+                else if (a == "--sampler") o.sampler = vo.sampler = value();
                 else if (a == "--overlap") vo.overlap = std::stoul(value());
                 else if (a == "--init") vo.init.push_back(loadImage(value()));
                 else if (a == "--init-dir") {
@@ -1238,6 +1264,7 @@ int main(int argc, char** argv) {
                 vo.seed = seeds[0];
                 vo.int8 = o.int8;
                 vo.tinyVae = o.tinyVae;
+                vo.loras = o.loras;
                 if (framesSet) vo.frames = frames;
             } else if (morph) {
                 if (seeds.size() == 1 && prompts.size() == 1) throw std::invalid_argument("video morph: give two prompts or several --seeds");

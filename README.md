@@ -204,6 +204,45 @@ weights — so a quarter of the bytes is much faster, at almost no cost:
 Loading takes 1.5 s: layers are built without allocating weights or gradient
 buffers (`SkipParameterInit`), and the checkpoint fills them directly.
 
+### Llama family (TinyLlama, Llama 2, Mistral)
+
+```
+$ scripts/download_tinyllama.sh data/tinyllama   # TinyLlama-1.1B-Chat (Apache 2.0, ~2.2 GB bf16)
+$ ./build_and_run.sh llama data/tinyllama "What is the capital of Turkey?" --chat
+$ ./build_and_run.sh llama data/tinyllama "Write a haiku about Istanbul." 64 --chat --system "You are a poet."
+$ ./build_and_run.sh llama data/tinyllama "What is the capital of Turkey?" 20 --chat --check --fp32
+```
+
+`llama` loads a Hugging Face Llama-architecture checkpoint (`config.json`,
+`model.safetensors` or a sharded `model.safetensors.index.json`, and
+`tokenizer.json`) into the same layers as the modern GPT: RMSNorm, rotary
+attention with grouped-query heads (TinyLlama: 32 query heads sharing 4
+key/value heads), SwiGLU and an untied output head. `--chat` wraps the prompt
+in the Zephyr template TinyLlama-Chat was trained with (`<|system|>`,
+`<|user|>`, `<|assistant|>`, ended by `</s>`) and stops at `</s>`.
+`LlamaTokenizer` reads `tokenizer.json` (SentencePiece-style BPE with the
+`▁` normalizer, byte fallback and special tokens) and gives the same ids as
+Hugging Face `tokenizers` on 18 test inputs, including the chat template.
+
+Weights are int8 by default (`--fp32` keeps float32); each tensor is
+quantized as it is read, so the float copy of the whole model never exists.
+`scripts/llama_reference.py` is an independent NumPy Llama: with `--fp32
+--check` both print the same token ids, top-5 logits and greedy answer
+(*"The capital of Turkey is Ankara."*), and over a 54-token prompt all
+54 × 32000 logits agree within 3e-5.
+
+| TinyLlama 1.1B, 2-core x86 | float32 | int8 |
+|---|---:|---:|
+| memory (peak RSS) | 4.8 GB | **1.7 GB** |
+| generation (chat, incl. prompt) | 1.9 tokens/s | **4.1 tokens/s** |
+| loading (bf16 checkpoint) | 41 s | 18 s |
+| perplexity (1024 Shakespeare tokens) | 13.264 | 13.277 (+0.09 %) |
+| greedy answers above | — | identical |
+
+Not supported yet (the loader refuses them with a message): RoPE scaling
+(Llama 3.1+), Llama 3's tiktoken-style tokenizer, attention biases (Qwen) and
+sliding-window attention (Mistral v0.1).
+
 ## Performance and devices
 
 All matrix products in the library go through one `gemm()` dispatcher
@@ -296,7 +335,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
 | Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE, grouped-query attention, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
 | Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales), `Network::quantize()` for Dense, attention and tied outputs |
-| Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `Gpt2Tokenizer` (byte-level BPE, identical ids), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
+| Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama / TinyLlama / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
 | Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k, streaming callback, stop token) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |
 | Network | `Network.h` | `add<Layer>(...)`, `fit` (mini-batches, shuffling, validation, accuracy, LR schedule, gradient clipping, step limits, callbacks), `predict`, `evaluate`, `accuracy`, `summary`, `save` / `load`, `saveCheckpoint` / `loadCheckpoint` (exact resume) |
@@ -337,7 +376,11 @@ RoPE's relative-position invariance, exact sliding-cache generation far past
 the window, exact checkpoint resume, GPTs (both architectures) that memorize
 and regenerate a sequence, the JSON parser, safetensors (incl. F16/BF16),
 GPT-2 pre-tokenization (checked against Hugging Face), the GPT-2 tokenizer and
-the GPT-2 loader on a synthetic checkpoint. CI runs
+the GPT-2 loader on a synthetic checkpoint, int8 quantization error bounds,
+grouped-query attention (gradients and KV cache), the Llama tokenizer, the
+Llama loader against an independent reference forward pass (float32, int8,
+tied output, sharded files), and that inference passes keep no backward
+state. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
 kernels).
 
@@ -347,5 +390,5 @@ kernels).
 Includes/   public headers (NeuraCraft.h includes everything)
 src/        library sources + Main.cpp (demo CLI -> bin/NeuraCraft)
 tests/      unit tests
-scripts/    download_mnist.sh, download_shakespeare.sh, download_gpt2.sh, gpt2_reference.py
+scripts/    download_{mnist,shakespeare,gpt2,tinyllama}.sh, gpt2_reference.py, llama_reference.py
 ```

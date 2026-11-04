@@ -111,9 +111,9 @@ std::size_t TiedOutput::quantize() {
     return 1;
 }
 
-Matrix TiedOutput::forward(const Matrix& input, bool) {
+Matrix TiedOutput::forward(const Matrix& input, bool training) {
     if (!quantized_.empty()) return quantized_.multiply(input);
-    input_ = input;
+    input_ = training ? input : Matrix();
     return input.matmulTranspose(embedding_.tokenTable());  // (N x D) * (V x D)^T
 }
 
@@ -135,12 +135,12 @@ RMSNorm::RMSNorm(std::size_t dim, float epsilon) : dim_(dim), epsilon_(epsilon),
     if (dim == 0) throw std::invalid_argument("RMSNorm: dim must be > 0");
 }
 
-Matrix RMSNorm::forward(const Matrix& input, bool) {
+Matrix RMSNorm::forward(const Matrix& input, bool training) {
     if (input.cols() != dim_)
         throw std::invalid_argument("RMSNorm: expected " + std::to_string(dim_) + " features, got " +
                                     std::to_string(input.cols()));
     const std::size_t n = input.rows();
-    input_ = input;
+    input_ = training ? input : Matrix();
     invRms_.assign(n, 0.0f);
     Matrix out(n, dim_);
     parallelFor(0, n, 64, [&](std::size_t r0, std::size_t r1) {
@@ -190,9 +190,9 @@ std::string RMSNorm::describe() const { return "RMSNorm(" + std::to_string(dim_)
 
 // ---- SwiGLU -------------------------------------------------------------------------------
 
-Matrix SwiGLUGate::forward(const Matrix& input, bool) {
+Matrix SwiGLUGate::forward(const Matrix& input, bool training) {
     if (input.cols() % 2 != 0) throw std::invalid_argument("SwiGLU: input needs an even number of columns");
-    input_ = input;
+    input_ = training ? input : Matrix();
     const std::size_t h = input.cols() / 2;
     Matrix out(input.rows(), h);
     parallelFor(0, input.rows(), 64, [&](std::size_t r0, std::size_t r1) {
@@ -236,7 +236,7 @@ LayerNorm::LayerNorm(std::size_t dim, float epsilon)
     if (dim == 0) throw std::invalid_argument("LayerNorm: dim must be > 0");
 }
 
-Matrix LayerNorm::forward(const Matrix& input, bool) {
+Matrix LayerNorm::forward(const Matrix& input, bool training) {
     if (input.cols() != dim_)
         throw std::invalid_argument("LayerNorm: expected " + std::to_string(dim_) + " features, got " +
                                     std::to_string(input.cols()));
@@ -263,6 +263,7 @@ Matrix LayerNorm::forward(const Matrix& input, bool) {
             }
         }
     });
+    if (!training) normalized_ = Matrix();  // only backward needs it
     return out;
 }
 
@@ -307,7 +308,7 @@ constexpr float kGeluC = 0.7978845608f;  // sqrt(2 / pi)
 constexpr float kGeluA = 0.044715f;
 } // namespace
 
-Matrix GELU::forward(const Matrix& input, bool) {
+Matrix GELU::forward(const Matrix& input, bool training) {
     input_ = input;
     tanh_ = Matrix(input.rows(), input.cols());
     Matrix out(input.rows(), input.cols());
@@ -319,6 +320,10 @@ Matrix GELU::forward(const Matrix& input, bool) {
             out.data()[i] = 0.5f * x * (1.0f + t);
         }
     });
+    if (!training) {
+        input_ = Matrix();
+        tanh_ = Matrix();
+    }
     return out;
 }
 
@@ -430,7 +435,28 @@ std::size_t CausalSelfAttention::quantize() {
     return 2;
 }
 
-Matrix CausalSelfAttention::forward(const Matrix& input, bool) {
+void CausalSelfAttention::setWeights(Matrix qkv, Matrix out) {
+    if (qkv.rows() != dim_ || qkv.cols() != qkvColumns() || out.rows() != dim_ || out.cols() != dim_)
+        throw std::invalid_argument("CausalSelfAttention::setWeights: wrong shapes");
+    wQkv_ = std::move(qkv);
+    wOut_ = std::move(out);
+    bQkv_ = Matrix(1, qkvColumns());
+    bOut_ = Matrix(1, dim_);
+    qQkv_ = QuantizedWeights();
+    qOut_ = QuantizedWeights();
+}
+
+void CausalSelfAttention::setQuantized(QuantizedWeights qkv, QuantizedWeights out) {
+    if (qkv.inputs() != dim_ || qkv.outputs() != qkvColumns() || out.inputs() != dim_ || out.outputs() != dim_)
+        throw std::invalid_argument("CausalSelfAttention::setQuantized: wrong shapes");
+    qQkv_ = std::move(qkv);
+    qOut_ = std::move(out);
+    wQkv_ = wOut_ = wQkvGrad_ = wOutGrad_ = Matrix();
+    bQkv_ = Matrix(1, qkvColumns());
+    bOut_ = Matrix(1, dim_);
+}
+
+Matrix CausalSelfAttention::forward(const Matrix& input, bool training) {
     if (input.cols() != dim_)
         throw std::invalid_argument("CausalSelfAttention: expected " + std::to_string(dim_) + " features, got " +
                                     std::to_string(input.cols()));
@@ -473,7 +499,9 @@ Matrix CausalSelfAttention::forward(const Matrix& input, bool) {
             gemmCpu(false, false, L, hd, L, s, L, v, ld, merged_.data() + b * L * D + h * hd, D);
         }
     });
-    return projectOut(merged_);
+    Matrix out = projectOut(merged_);
+    if (!training) input_ = qkv_ = attention_ = merged_ = Matrix();  // only backward needs them
+    return out;
 }
 
 Matrix CausalSelfAttention::forwardIncremental(const Matrix& input) {

@@ -29,13 +29,14 @@ Dense::Dense(std::size_t inputSize, std::size_t outputSize, Init init)
     }
 }
 
-Matrix Dense::forward(const Matrix& input, bool /*training*/) {
+Matrix Dense::forward(const Matrix& input, bool training) {
     if (input.cols() != inputSize_) {
         throw std::invalid_argument("Dense: expected " + std::to_string(inputSize_) +
                                     " input features, got " + std::to_string(input.cols()));
     }
     if (quantized()) return quantized_.multiply(input).addRowVector(bias_);
-    input_ = input;
+    // Inference keeps nothing for backward (large models would hold every activation).
+    input_ = training ? input : Matrix();
     return (input * weights_).addRowVector(bias_);
 }
 

@@ -153,6 +153,19 @@ struct Image {
 
 // Uncompressed-deflate PNG (any viewer opens it; files are about raw size).
 void savePng(const std::string& path, const Image& image);
+// PNG reader: 8-bit grey, grey + alpha, RGB, RGBA and palette images (also
+// 1/2/4-bit palette and grey, 16-bit by keeping the high byte), all filters,
+// with its own inflate; interlaced files are refused. Returns the stored
+// channels (1, 2 -> grey kept, 3 or 4); use toRgb() for 3 channels.
+Image loadPng(const std::string& path);
+// PNG or PPM/PGM by file contents.
+Image loadImage(const std::string& path);
+// Drops alpha (composited on white) and expands grey to RGB.
+Image toRgb(const Image& image);
+// Bilinear resampling to width x height.
+Image resizeImage(const Image& image, std::size_t width, std::size_t height);
+// The largest centred crop with the aspect ratio of width : height, resized to width x height.
+Image fitImage(const Image& image, std::size_t width, std::size_t height);
 // Binary PPM (P6) / PGM (P5), 8-bit.
 void savePpm(const std::string& path, const Image& image);
 Image loadPpm(const std::string& path);

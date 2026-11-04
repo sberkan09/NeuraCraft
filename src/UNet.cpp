@@ -533,61 +533,101 @@ void EulerScheduler::step(std::size_t i, const Matrix& noise, Matrix& latent) co
 
 // ---- Text to image -------------------------------------------------------------------------
 
-Matrix textToLatent(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
-    using Clock = std::chrono::steady_clock;
-    auto report = [&](const std::string& stage, Clock::time_point start) {
-        if (o.progress) o.progress(stage, std::chrono::duration<double>(Clock::now() - start).count());
-    };
+namespace {
+using PipelineClock = std::chrono::steady_clock;
+
+void reportStage(const TextToImageOptions& o, const std::string& stage, PipelineClock::time_point start) {
+    if (o.progress) o.progress(stage, std::chrono::duration<double>(PipelineClock::now() - start).count());
+}
+
+void checkSize(const TextToImageOptions& o) {
     if (o.width % 64 || o.height % 64 || o.width == 0 || o.height == 0)
         throw std::invalid_argument("textToImage: width and height must be multiples of 64");
-    const bool guided = o.guidance > 1.0f;
+}
 
-    Matrix context, negative;
-    {
-        auto t = Clock::now();
-        const ClipTokenizer tok = ClipTokenizer::fromDirectory(dir + "/tokenizer");
-        ClipTextEncoder enc = loadClipTextEncoder(dir, o.int8);
-        // SD 2 / Turbo pad with "!" (id 0); SD 1.x pads with <|endoftext|>.
-        int pad = tok.endOfText();
-        {
-            std::ifstream cfg(dir + "/tokenizer/tokenizer_config.json");
-            if (cfg) {
-                const json::Value c = json::parse(readFile(dir + "/tokenizer/tokenizer_config.json"));
-                if (const json::Value* p = c.find("pad_token"); p && p->isString() && p->string == "!") pad = 0;
-            }
-        }
-        context = enc.encode(tok.encodeForModel(prompt, enc.length, pad));
-        if (guided) negative = enc.encode(tok.encodeForModel(o.negativePrompt, enc.length, pad));
-        report("text encoder", t);
+// CLIP hidden states of the prompt (and of the negative prompt when guided).
+std::pair<Matrix, Matrix> encodePrompts(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
+    const auto t = PipelineClock::now();
+    const ClipTokenizer tok = ClipTokenizer::fromDirectory(dir + "/tokenizer");
+    ClipTextEncoder enc = loadClipTextEncoder(dir, o.int8);
+    // SD 2 / Turbo pad with "!" (id 0); SD 1.x pads with <|endoftext|>.
+    int pad = tok.endOfText();
+    if (std::ifstream(dir + "/tokenizer/tokenizer_config.json")) {
+        const json::Value c = json::parse(readFile(dir + "/tokenizer/tokenizer_config.json"));
+        if (const json::Value* p = c.find("pad_token"); p && p->isString() && p->string == "!") pad = 0;
     }
+    std::pair<Matrix, Matrix> out;
+    out.first = enc.encode(tok.encodeForModel(prompt, enc.length, pad));
+    if (o.guidance > 1.0f) out.second = enc.encode(tok.encodeForModel(o.negativePrompt, enc.length, pad));
+    reportStage(o, "text encoder", t);
+    return out;
+}
 
-    const std::size_t lw = o.width / 8, lh = o.height / 8;
-    const std::string schedulerConfig = dir + "/scheduler/scheduler_config.json";
-    const EulerScheduler sched = exists(schedulerConfig) ? EulerScheduler::fromConfig(schedulerConfig, o.steps) : EulerScheduler::standard(o.steps);
-    Matrix latent;
-    {
-        auto t = Clock::now();
-        UNet2DCondition unet = loadUNet(dir, lw, lh, o.int8);
-        report("load unet", t);
+EulerScheduler schedulerFor(const std::string& dir, std::size_t steps) {
+    const std::string config = dir + "/scheduler/scheduler_config.json";
+    return exists(config) ? EulerScheduler::fromConfig(config, steps) : EulerScheduler::standard(steps);
+}
+
+// Runs the scheduler's steps [first, end) on `latent` with the UNet.
+void denoise(const std::string& dir, const std::pair<Matrix, Matrix>& context, const EulerScheduler& sched, std::size_t first,
+             Matrix& latent, const TextToImageOptions& o) {
+    auto t = PipelineClock::now();
+    UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8);
+    reportStage(o, "load unet", t);
+    if (latent.empty()) {  // text to image: a Gaussian latent at the first sigma
         setSeed(o.seed);
         latent = Matrix::normal(1, unet.latentShape().size(), 0.0f, 1.0f);
         for (float& v : latent.values()) v *= static_cast<float>(sched.initNoiseSigma);
-        for (std::size_t i = 0; i < sched.timesteps.size(); ++i) {
-            t = Clock::now();
-            Matrix in = latent;
-            const float scale = static_cast<float>(sched.inputScale(i));
-            for (float& v : in.values()) v *= scale;
-            Matrix eps = unet.forward(in, static_cast<float>(sched.timesteps[i]), context);
-            if (guided) {
-                const Matrix uncond = unet.forward(in, static_cast<float>(sched.timesteps[i]), negative);
-                for (std::size_t k = 0; k < eps.size(); ++k)
-                    eps.data()[k] = uncond.data()[k] + o.guidance * (eps.data()[k] - uncond.data()[k]);
-            }
-            sched.step(i, eps, latent);
-            report("step " + std::to_string(i + 1) + "/" + std::to_string(sched.timesteps.size()), t);
-        }
     }
+    for (std::size_t i = first; i < sched.timesteps.size(); ++i) {
+        t = PipelineClock::now();
+        Matrix in = latent;
+        const float scale = static_cast<float>(sched.inputScale(i));
+        for (float& v : in.values()) v *= scale;
+        Matrix eps = unet.forward(in, static_cast<float>(sched.timesteps[i]), context.first);
+        if (o.guidance > 1.0f) {
+            const Matrix uncond = unet.forward(in, static_cast<float>(sched.timesteps[i]), context.second);
+            for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + o.guidance * (eps.data()[k] - uncond.data()[k]);
+        }
+        sched.step(i, eps, latent);
+        reportStage(o, "step " + std::to_string(i - first + 1) + "/" + std::to_string(sched.timesteps.size() - first), t);
+    }
+}
+} // namespace
+
+Matrix textToLatent(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
+    checkSize(o);
+    const auto context = encodePrompts(dir, prompt, o);
+    Matrix latent;
+    denoise(dir, context, schedulerFor(dir, o.steps), 0, latent, o);
     return latent;
+}
+
+Image imageToImage(const std::string& dir, const Image& input, const std::string& prompt, const TextToImageOptions& o) {
+    checkSize(o);
+    if (o.strength < 0.0f || o.strength > 1.0f) throw std::invalid_argument("imageToImage: strength must be in [0, 1]");
+    const Image fitted = fitImage(toRgb(input), o.width, o.height);
+    Matrix latent;
+    {
+        const auto t = PipelineClock::now();
+        if (!o.tinyVae.empty()) latent = loadTinyVae(o.tinyVae, o.width, o.height, true, false).encode(imageToTensor(fitted));
+        else latent = loadVae(dir, o.width, o.height, true, false).encode(imageToTensor(fitted));
+        reportStage(o, o.tinyVae.empty() ? "vae encode" : "taesd encode", t);
+    }
+    // As diffusers: the last steps * strength steps of the schedule run, starting from the
+    // encoded image with noise at that step's sigma.
+    const EulerScheduler sched = schedulerFor(dir, o.steps);
+    const std::size_t run = std::min(o.steps, static_cast<std::size_t>(static_cast<float>(o.steps) * o.strength));
+    if (run > 0) {
+        const std::size_t first = o.steps - run;
+        const auto context = encodePrompts(dir, prompt, o);
+        setSeed(o.seed);
+        const Matrix noise = Matrix::normal(1, latent.size(), 0.0f, 1.0f);
+        const float sigma = static_cast<float>(sched.sigmas[first]);
+        for (std::size_t k = 0; k < latent.size(); ++k) latent.data()[k] += sigma * noise.data()[k];
+        denoise(dir, context, sched, first, latent, o);
+    }
+    return decodeLatent(dir, latent, o);
 }
 
 Image decodeLatent(const std::string& dir, const Matrix& latent, const TextToImageOptions& o) {

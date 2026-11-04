@@ -6,7 +6,9 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -492,6 +494,316 @@ Image loadPpm(const std::string& path) {
     f.read(reinterpret_cast<char*>(image.pixels.data()), static_cast<std::streamsize>(image.pixels.size()));
     if (!f) throw std::runtime_error("loadPpm: truncated " + path);
     return image;
+}
+
+// ---- PNG reading ------------------------------------------------------------------------------
+
+namespace {
+// Minimal inflate (RFC 1951): stored, fixed and dynamic Huffman blocks.
+class Inflater {
+public:
+    Inflater(const std::uint8_t* data, std::size_t size) : d_(data), n_(size) {}
+
+    std::vector<std::uint8_t> run() {
+        std::vector<std::uint8_t> out;
+        for (bool last = false; !last;) {
+            last = bits(1);
+            const unsigned type = bits(2);
+            if (type == 0) {
+                bitPos_ = (bitPos_ + 7) & ~std::size_t(7);
+                const unsigned len = bits(16), nlen = bits(16);
+                if ((len ^ 0xFFFF) != nlen) throw std::runtime_error("loadPng: corrupt stored block");
+                for (unsigned i = 0; i < len; ++i) out.push_back(static_cast<std::uint8_t>(bits(8)));
+            } else if (type == 1) {
+                std::array<unsigned, 288> lit{};
+                for (int i = 0; i < 144; ++i) lit[i] = 8;
+                for (int i = 144; i < 256; ++i) lit[i] = 9;
+                for (int i = 256; i < 280; ++i) lit[i] = 7;
+                for (int i = 280; i < 288; ++i) lit[i] = 8;
+                std::array<unsigned, 30> dist;
+                dist.fill(5);
+                block(Huffman(lit.data(), 288), Huffman(dist.data(), 30), out);
+            } else if (type == 2) {
+                const unsigned hlit = bits(5) + 257, hdist = bits(5) + 1, hclen = bits(4) + 4;
+                static const int order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+                unsigned clen[19] = {};
+                for (unsigned i = 0; i < hclen; ++i) clen[order[i]] = bits(3);
+                const Huffman codeLengths(clen, 19);
+                std::vector<unsigned> lengths;
+                while (lengths.size() < hlit + hdist) {
+                    const unsigned sym = decode(codeLengths);
+                    if (sym < 16) lengths.push_back(sym);
+                    else if (sym == 16) {
+                        if (lengths.empty()) throw std::runtime_error("loadPng: corrupt code lengths");
+                        const unsigned prev = lengths.back();
+                        for (unsigned r = 3 + bits(2); r > 0; --r) lengths.push_back(prev);
+                    } else {
+                        for (unsigned r = sym == 17 ? 3 + bits(3) : 11 + bits(7); r > 0; --r) lengths.push_back(0);
+                    }
+                }
+                if (lengths.size() != hlit + hdist) throw std::runtime_error("loadPng: corrupt code lengths");
+                block(Huffman(lengths.data(), hlit), Huffman(lengths.data() + hlit, hdist), out);
+            } else {
+                throw std::runtime_error("loadPng: invalid deflate block");
+            }
+        }
+        return out;
+    }
+
+private:
+    struct Huffman {
+        std::vector<unsigned> counts, symbols;  // canonical code: counts per length, symbols by code
+        Huffman(const unsigned* lengths, std::size_t n) : counts(16, 0) {
+            for (std::size_t i = 0; i < n; ++i) ++counts[lengths[i]];
+            counts[0] = 0;
+            std::vector<unsigned> offsets(16, 0);
+            for (int l = 1; l < 16; ++l) offsets[l] = offsets[l - 1] + counts[l - 1];
+            symbols.resize(n);
+            for (std::size_t i = 0; i < n; ++i)
+                if (lengths[i]) symbols[offsets[lengths[i]]++] = static_cast<unsigned>(i);
+        }
+    };
+
+    unsigned bits(unsigned count) {
+        unsigned v = 0;
+        for (unsigned i = 0; i < count; ++i, ++bitPos_) {
+            if ((bitPos_ >> 3) >= n_) throw std::runtime_error("loadPng: truncated image data");
+            v |= static_cast<unsigned>((d_[bitPos_ >> 3] >> (bitPos_ & 7)) & 1) << i;
+        }
+        return v;
+    }
+    unsigned decode(const Huffman& h) {
+        int code = 0, first = 0, index = 0;
+        for (int len = 1; len < 16; ++len) {
+            code |= static_cast<int>(bits(1));
+            const int count = static_cast<int>(h.counts[static_cast<std::size_t>(len)]);
+            if (code - count < first) return h.symbols[static_cast<std::size_t>(index + (code - first))];
+            index += count;
+            first += count;
+            first <<= 1;
+            code <<= 1;
+        }
+        throw std::runtime_error("loadPng: invalid Huffman code");
+    }
+    void block(const Huffman& lit, const Huffman& dist, std::vector<std::uint8_t>& out) {
+        static const unsigned lbase[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+        static const unsigned lextra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+        static const unsigned dbase[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+        static const unsigned dextra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+        for (;;) {
+            const unsigned sym = decode(lit);
+            if (sym < 256) {
+                out.push_back(static_cast<std::uint8_t>(sym));
+            } else if (sym == 256) {
+                return;
+            } else {
+                const unsigned li = sym - 257;
+                if (li >= 29) throw std::runtime_error("loadPng: invalid length code");
+                const unsigned len = lbase[li] + bits(lextra[li]);
+                const unsigned di = decode(dist);
+                if (di >= 30) throw std::runtime_error("loadPng: invalid distance code");
+                const std::size_t back = dbase[di] + bits(dextra[di]);
+                if (back > out.size()) throw std::runtime_error("loadPng: distance beyond the output");
+                const std::size_t from = out.size() - back;
+                for (unsigned i = 0; i < len; ++i) out.push_back(out[from + i]);
+            }
+        }
+    }
+
+    const std::uint8_t* d_;
+    std::size_t n_, bitPos_ = 0;
+};
+
+std::uint32_t be32(const std::vector<std::uint8_t>& d, std::size_t at) {
+    return (std::uint32_t(d[at]) << 24) | (std::uint32_t(d[at + 1]) << 16) | (std::uint32_t(d[at + 2]) << 8) | d[at + 3];
+}
+} // namespace
+
+Image loadPng(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("loadPng: cannot open " + path);
+    const std::vector<std::uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    static const std::uint8_t sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    if (d.size() < 8 || !std::equal(sig, sig + 8, d.begin())) throw std::runtime_error("loadPng: " + path + " is not a PNG");
+    std::size_t width = 0, height = 0;
+    unsigned depth = 0, colorType = 0, interlace = 0;
+    std::vector<std::uint8_t> idat, palette, trns;
+    for (std::size_t at = 8; at + 12 <= d.size();) {
+        const std::uint32_t len = be32(d, at);
+        if (at + 12 + len > d.size()) throw std::runtime_error("loadPng: truncated chunk in " + path);
+        const std::string type(d.begin() + static_cast<long>(at + 4), d.begin() + static_cast<long>(at + 8));
+        const std::uint8_t* body = d.data() + at + 8;
+        if (type == "IHDR") {
+            width = be32(d, at + 8);
+            height = be32(d, at + 12);
+            depth = body[8];
+            colorType = body[9];
+            interlace = body[12];
+        } else if (type == "PLTE") {
+            palette.assign(body, body + len);
+        } else if (type == "tRNS") {
+            trns.assign(body, body + len);
+        } else if (type == "IDAT") {
+            idat.insert(idat.end(), body, body + len);
+        } else if (type == "IEND") {
+            break;
+        }
+        at += 12 + len;
+    }
+    if (width == 0 || height == 0) throw std::runtime_error("loadPng: no IHDR in " + path);
+    if (interlace) throw std::runtime_error("loadPng: interlaced PNGs are not supported");
+    const unsigned samples = colorType == 0 ? 1 : colorType == 2 ? 3 : colorType == 3 ? 1 : colorType == 4 ? 2 : colorType == 6 ? 4 : 0;
+    if (!samples || (depth != 8 && depth != 16 && !((colorType == 0 || colorType == 3) && depth < 8)))
+        throw std::runtime_error("loadPng: unsupported colour type / bit depth in " + path);
+    if (idat.size() < 2 || (idat[0] & 0x0F) != 8) throw std::runtime_error("loadPng: bad zlib stream in " + path);
+    const std::vector<std::uint8_t> raw = Inflater(idat.data() + 2, idat.size() - 2).run();
+    const std::size_t bitsPerPixel = samples * depth, stride = (width * bitsPerPixel + 7) / 8, bpp = std::max<std::size_t>(1, bitsPerPixel / 8);
+    if (raw.size() < height * (stride + 1)) throw std::runtime_error("loadPng: image data too short in " + path);
+    // Undo the per-scanline filters.
+    std::vector<std::uint8_t> px(height * stride), prev(stride, 0);
+    for (std::size_t y = 0; y < height; ++y) {
+        const std::uint8_t filter = raw[y * (stride + 1)];
+        const std::uint8_t* in = raw.data() + y * (stride + 1) + 1;
+        std::uint8_t* row = px.data() + y * stride;
+        for (std::size_t x = 0; x < stride; ++x) {
+            const int a = x >= bpp ? row[x - bpp] : 0, b = prev[x], c = x >= bpp ? prev[x - bpp] : 0;
+            int v = in[x];
+            switch (filter) {
+            case 0: break;
+            case 1: v += a; break;
+            case 2: v += b; break;
+            case 3: v += (a + b) / 2; break;
+            case 4: {
+                const int p = a + b - c, pa = std::abs(p - a), pb = std::abs(p - b), pc = std::abs(p - c);
+                v += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+                break;
+            }
+            default: throw std::runtime_error("loadPng: invalid filter in " + path);
+            }
+            row[x] = static_cast<std::uint8_t>(v);
+        }
+        std::copy(row, row + stride, prev.begin());
+    }
+    Image img;
+    img.width = width;
+    img.height = height;
+    auto sample = [&](std::size_t y, std::size_t i) -> unsigned {  // i-th sample of row y, scaled to 8 bits
+        const std::uint8_t* row = px.data() + y * stride;
+        if (depth == 8) return row[i];
+        if (depth == 16) return row[2 * i];
+        const std::size_t bit = i * depth;
+        const unsigned v = (row[bit / 8] >> (8 - depth - bit % 8)) & ((1u << depth) - 1);
+        return colorType == 3 ? v : v * 255 / ((1u << depth) - 1);
+    };
+    if (colorType == 3) {
+        const bool alpha = !trns.empty();
+        img.channels = alpha ? 4 : 3;
+        img.pixels.resize(width * height * img.channels);
+        for (std::size_t y = 0; y < height; ++y)
+            for (std::size_t x = 0; x < width; ++x) {
+                const unsigned idx = sample(y, x);
+                if (3 * idx + 2 >= palette.size()) throw std::runtime_error("loadPng: palette index out of range in " + path);
+                std::uint8_t* o = img.pixels.data() + (y * width + x) * img.channels;
+                o[0] = palette[3 * idx];
+                o[1] = palette[3 * idx + 1];
+                o[2] = palette[3 * idx + 2];
+                if (alpha) o[3] = idx < trns.size() ? trns[idx] : 255;
+            }
+        return img;
+    }
+    img.channels = samples;
+    img.pixels.resize(width * height * samples);
+    for (std::size_t y = 0; y < height; ++y)
+        for (std::size_t i = 0; i < width * samples; ++i) img.pixels[y * width * samples + i] = static_cast<std::uint8_t>(sample(y, i));
+    return img;
+}
+
+Image loadImage(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("loadImage: cannot open " + path);
+    char head[8] = {};
+    f.read(head, 8);
+    if (static_cast<unsigned char>(head[0]) == 0x89 && head[1] == 'P' && head[2] == 'N' && head[3] == 'G') return loadPng(path);
+    if (head[0] == 'P' && (head[1] == '5' || head[1] == '6')) return loadPpm(path);
+    throw std::runtime_error("loadImage: " + path + " is neither PNG nor binary PPM/PGM");
+}
+
+Image toRgb(const Image& image) {
+    checkImage(image, "toRgb");
+    if (image.channels == 3) return image;
+    Image out;
+    out.width = image.width;
+    out.height = image.height;
+    out.channels = 3;
+    out.pixels.resize(image.width * image.height * 3);
+    for (std::size_t p = 0; p < image.width * image.height; ++p) {
+        const std::uint8_t* s = image.pixels.data() + p * image.channels;
+        const bool grey = image.channels <= 2;
+        const unsigned alpha = image.channels == 2 ? s[1] : image.channels == 4 ? s[3] : 255;
+        for (std::size_t c = 0; c < 3; ++c) {
+            const unsigned v = grey ? s[0] : s[c];
+            out.pixels[p * 3 + c] = static_cast<std::uint8_t>((v * alpha + 255 * (255 - alpha) + 127) / 255);  // over white
+        }
+    }
+    return out;
+}
+
+Image resizeImage(const Image& image, std::size_t width, std::size_t height) {
+    checkImage(image, "resizeImage");
+    if (width == 0 || height == 0) throw std::invalid_argument("resizeImage: empty size");
+    Image out;
+    out.width = width;
+    out.height = height;
+    out.channels = image.channels;
+    out.pixels.resize(width * height * image.channels);
+    const double sx = static_cast<double>(image.width) / width, sy = static_cast<double>(image.height) / height;
+    // Bilinear, with a box prefilter when shrinking by more than 2x (average of the covered source pixels).
+    parallelFor(0, height, 4, [&](std::size_t y0, std::size_t y1) {
+        for (std::size_t y = y0; y < y1; ++y)
+            for (std::size_t x = 0; x < width; ++x)
+                for (std::size_t c = 0; c < image.channels; ++c) {
+                    double v;
+                    if (sx > 2.0 || sy > 2.0) {
+                        const std::size_t ax = static_cast<std::size_t>(x * sx), bx = std::max(ax + 1, static_cast<std::size_t>((x + 1) * sx));
+                        const std::size_t ay = static_cast<std::size_t>(y * sy), by = std::max(ay + 1, static_cast<std::size_t>((y + 1) * sy));
+                        double sum = 0;
+                        for (std::size_t yy = ay; yy < std::min(by, image.height); ++yy)
+                            for (std::size_t xx = ax; xx < std::min(bx, image.width); ++xx)
+                                sum += image.pixels[(yy * image.width + xx) * image.channels + c];
+                        v = sum / static_cast<double>((std::min(by, image.height) - ay) * (std::min(bx, image.width) - ax));
+                    } else {
+                        const double fx = std::max(0.0, (x + 0.5) * sx - 0.5), fy = std::max(0.0, (y + 0.5) * sy - 0.5);
+                        const std::size_t x0 = std::min(static_cast<std::size_t>(fx), image.width - 1), y0_ = std::min(static_cast<std::size_t>(fy), image.height - 1);
+                        const std::size_t x1 = std::min(x0 + 1, image.width - 1), y1_ = std::min(y0_ + 1, image.height - 1);
+                        const double ax = fx - x0, ay = fy - y0_;
+                        auto at = [&](std::size_t xx, std::size_t yy) { return static_cast<double>(image.pixels[(yy * image.width + xx) * image.channels + c]); };
+                        v = (at(x0, y0_) * (1 - ax) + at(x1, y0_) * ax) * (1 - ay) + (at(x0, y1_) * (1 - ax) + at(x1, y1_) * ax) * ay;
+                    }
+                    out.pixels[(y * width + x) * image.channels + c] = static_cast<std::uint8_t>(std::lround(std::min(255.0, std::max(0.0, v))));
+                }
+    });
+    return out;
+}
+
+Image fitImage(const Image& image, std::size_t width, std::size_t height) {
+    checkImage(image, "fitImage");
+    // Largest centred crop with the target aspect ratio.
+    std::size_t cw = image.width, ch = image.width * height / width;
+    if (ch > image.height) {
+        ch = image.height;
+        cw = image.height * width / height;
+    }
+    Image crop;
+    crop.width = std::max<std::size_t>(1, cw);
+    crop.height = std::max<std::size_t>(1, ch);
+    crop.channels = image.channels;
+    crop.pixels.resize(crop.width * crop.height * crop.channels);
+    const std::size_t ox = (image.width - crop.width) / 2, oy = (image.height - crop.height) / 2;
+    for (std::size_t y = 0; y < crop.height; ++y)
+        std::copy(image.pixels.begin() + static_cast<long>(((oy + y) * image.width + ox) * image.channels),
+                  image.pixels.begin() + static_cast<long>(((oy + y) * image.width + ox + crop.width) * image.channels),
+                  crop.pixels.begin() + static_cast<long>(y * crop.width * crop.channels));
+    return crop.width == width && crop.height == height ? crop : resizeImage(crop, width, height);
 }
 
 Matrix imageToTensor(const Image& image, float lo, float hi) {

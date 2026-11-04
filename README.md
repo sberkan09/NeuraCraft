@@ -465,10 +465,15 @@ the keyframes around it, and the motion module keeps the change continuous:
 
 ```
 $ ./build_and_run.sh video data/animatediff t2v "a lone oak tree on a green hill, spring, blooming flowers, photo" \
-      --prompt-at "15:a lone oak tree on a hill in autumn, orange leaves falling, photo" --frames 16
+      --prompt-at "31:a lone oak tree on a hill in winter, covered in snow, photo" --frames 32 --size 384
 ```
 
-PT_SAMPLE
+<p><img src="docs/images/video_travel.gif" width="256"></p>
+
+Inside one 16-frame window the motion module pulls all frames towards one
+scene, so a 16-frame clip shows a blend of both prompts; over a longer clip
+(32 frames above: three overlapping windows, 384 x 384, 29 minutes on the
+2-core machine) the change from spring to winter comes through.
 
 **LoRA and LCM.** `--lora file.safetensors[:scale]` merges LoRA adapters
 (kohya / A1111 `lora_unet_*` / `lora_te_*` and diffusers / PEFT `lora_A` /

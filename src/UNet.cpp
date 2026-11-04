@@ -938,7 +938,12 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
     o.int8 = v.int8;
     o.progress = v.progress;
     checkSize(o);
-    if (v.frames == 0 || v.frames > 32) throw std::invalid_argument("textToVideo: frames must be in 1..32");
+    if (v.frames == 0) throw std::invalid_argument("textToVideo: frames must be > 0");
+    if (v.context == 0 || v.context > 32 || v.overlap >= v.context)
+        throw std::invalid_argument("textToVideo: context must be in 1..32 and overlap below it");
+    if (!v.init.empty() && v.init.size() != 1 && v.init.size() != v.frames)
+        throw std::invalid_argument("textToVideo: give one init image or one per frame");
+    if (v.strength < 0.0f || v.strength > 1.0f) throw std::invalid_argument("textToVideo: strength must be in [0, 1]");
     std::string motion = v.motion;
     if (motion.empty()) {
         const std::string md = dir + "/motion";
@@ -958,17 +963,73 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
     const EulerScheduler sched =
         v.betaSchedule == "config" ? schedulerFor(dir, v.steps) : EulerScheduler::make(v.steps, v.betaSchedule, "trailing");
     const std::size_t F = v.frames, n = unet.latentShape().size();
+    std::size_t first = 0;
     setSeed(v.seed);
     Matrix latents = Matrix::normal(F, n, 0.0f, 1.0f);
-    for (float& x : latents.values()) x *= static_cast<float>(sched.initNoiseSigma);
-    for (std::size_t i = 0; i < sched.timesteps.size(); ++i) {
+    if (v.init.empty()) {
+        for (float& x : latents.values()) x *= static_cast<float>(sched.initNoiseSigma);
+    } else {
+        // Encode the init frame(s) and noise them to the starting sigma (as imageToImage).
+        const std::size_t run = std::min(v.steps, static_cast<std::size_t>(static_cast<float>(v.steps) * v.strength + 1e-4f));
+        first = v.steps - run;
+        const float sigma = static_cast<float>(sched.sigmas[first]);
+        const auto te = PipelineClock::now();
+        std::unique_ptr<TinyVae> tiny;
+        std::unique_ptr<Vae> vae;
+        if (!o.tinyVae.empty()) tiny = std::make_unique<TinyVae>(loadTinyVae(o.tinyVae, o.width, o.height, true, false));
+        else vae = std::make_unique<Vae>(loadVae(dir, o.width, o.height, true, false));
+        Matrix z;
+        for (std::size_t f = 0; f < F; ++f) {
+            if (f < v.init.size()) {
+                const Matrix x = imageToTensor(fitImage(toRgb(v.init[f]), o.width, o.height));
+                z = tiny ? tiny->encode(x) : vae->encode(x);
+            }
+            float* row = latents.data() + f * n;
+            for (std::size_t k = 0; k < n; ++k) row[k] = z.data()[k] + sigma * row[k];
+        }
+        reportStage(o, o.tinyVae.empty() ? "vae encode" : "taesd encode", te);
+    }
+    // Sliding windows over the frames (one window when they fit).
+    std::vector<std::size_t> starts;
+    const std::size_t ctxLen = std::min(v.context, F), stride = std::max<std::size_t>(1, ctxLen - std::min(v.overlap, ctxLen - 1));
+    for (std::size_t s = 0;; s += stride) {
+        if (s + ctxLen >= F) {
+            starts.push_back(F - ctxLen);
+            break;
+        }
+        starts.push_back(s);
+    }
+    auto predict = [&](const Matrix& in, float timestep, const Matrix& ctx) {
+        if (starts.size() == 1) return unet.forwardFrames(in, timestep, ctx);
+        Matrix sum(F, n);
+        std::vector<float> weight(F, 0.0f);
+        for (std::size_t s : starts) {
+            Matrix win(ctxLen, n);
+            std::copy(in.data() + s * n, in.data() + (s + ctxLen) * n, win.data());
+            const Matrix e = unet.forwardFrames(win, timestep, ctx);
+            for (std::size_t f = 0; f < ctxLen; ++f) {
+                // Pyramid weights: frames near a window's middle count most.
+                const float wgt = static_cast<float>(std::min(f + 1, ctxLen - f));
+                weight[s + f] += wgt;
+                const float* src = e.data() + f * n;
+                float* dst = sum.data() + (s + f) * n;
+                for (std::size_t k = 0; k < n; ++k) dst[k] += wgt * src[k];
+            }
+        }
+        for (std::size_t f = 0; f < F; ++f) {
+            float* row = sum.data() + f * n;
+            for (std::size_t k = 0; k < n; ++k) row[k] /= weight[f];
+        }
+        return sum;
+    };
+    for (std::size_t i = first; i < sched.timesteps.size(); ++i) {
         t = PipelineClock::now();
         Matrix in = latents;
         const float scale = static_cast<float>(sched.inputScale(i));
         for (float& x : in.values()) x *= scale;
-        Matrix eps = unet.forwardFrames(in, static_cast<float>(sched.timesteps[i]), context.first);
+        Matrix eps = predict(in, static_cast<float>(sched.timesteps[i]), context.first);
         if (o.guidance > 1.0f) {
-            const Matrix uncond = unet.forwardFrames(in, static_cast<float>(sched.timesteps[i]), context.second);
+            const Matrix uncond = predict(in, static_cast<float>(sched.timesteps[i]), context.second);
             for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + o.guidance * (eps.data()[k] - uncond.data()[k]);
         }
         sched.step(i, eps, latents);

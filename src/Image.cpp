@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -400,17 +401,338 @@ void checkImage(const Image& image, const char* who) {
 }
 } // namespace
 
-void savePng(const std::string& path, const Image& image) {
-    checkImage(image, "savePng");
-    std::uint8_t colorType = 0;
-    switch (image.channels) {
-    case 1: colorType = 0; break;
-    case 3: colorType = 2; break;
-    case 4: colorType = 6; break;
-    default: throw std::invalid_argument("savePng: 1, 3 or 4 channels");
+namespace {
+// ---- Deflate compressor (LZ77 + dynamic Huffman blocks) -----------------------------------------
+
+struct BitWriter {
+    std::vector<std::uint8_t>& out;
+    std::uint32_t acc = 0;
+    int n = 0;
+    void put(std::uint32_t bits, int count) {  // LSB first
+        acc |= bits << n;
+        n += count;
+        while (n >= 8) {
+            out.push_back(static_cast<std::uint8_t>(acc & 0xFF));
+            acc >>= 8;
+            n -= 8;
+        }
     }
-    std::ofstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("savePng: cannot open " + path);
+    void flush() {
+        if (n > 0) out.push_back(static_cast<std::uint8_t>(acc & 0xFF));
+        acc = 0;
+        n = 0;
+    }
+};
+
+// Code lengths (at most maxLen bits) for the given frequencies by package-merge;
+// unused symbols get 0. At least two symbols get a code, as decoders expect.
+std::vector<int> limitedLengths(std::vector<std::uint32_t> freq, int maxLen) {
+    std::vector<int> used;
+    for (std::size_t i = 0; i < freq.size(); ++i)
+        if (freq[i]) used.push_back(static_cast<int>(i));
+    for (std::size_t i = 0; used.size() < 2 && i < freq.size(); ++i)
+        if (!freq[i]) {
+            freq[i] = 1;
+            used.push_back(static_cast<int>(i));
+        }
+    struct Item {
+        std::uint64_t weight;
+        std::vector<int> symbols;
+    };
+    std::vector<Item> leaves;
+    for (int s : used) leaves.push_back({freq[static_cast<std::size_t>(s)], {s}});
+    std::sort(leaves.begin(), leaves.end(), [](const Item& a, const Item& b) { return a.weight < b.weight; });
+    std::vector<Item> current = leaves;
+    for (int level = 1; level < maxLen; ++level) {
+        std::vector<Item> packages;
+        for (std::size_t i = 0; i + 1 < current.size(); i += 2) {
+            Item p{current[i].weight + current[i + 1].weight, current[i].symbols};
+            p.symbols.insert(p.symbols.end(), current[i + 1].symbols.begin(), current[i + 1].symbols.end());
+            packages.push_back(std::move(p));
+        }
+        std::vector<Item> merged;
+        std::merge(leaves.begin(), leaves.end(), packages.begin(), packages.end(), std::back_inserter(merged),
+                   [](const Item& a, const Item& b) { return a.weight < b.weight; });
+        current = std::move(merged);
+    }
+    std::vector<int> len(freq.size(), 0);
+    for (std::size_t i = 0; i < 2 * used.size() - 2; ++i)
+        for (int s : current[i].symbols) ++len[static_cast<std::size_t>(s)];
+    return len;
+}
+
+// Canonical codes, bit-reversed for LSB-first output.
+std::vector<std::uint32_t> canonicalCodes(const std::vector<int>& len) {
+    int maxLen = 0;
+    for (int l : len) maxLen = std::max(maxLen, l);
+    std::vector<int> count(static_cast<std::size_t>(maxLen) + 1, 0);
+    for (int l : len)
+        if (l) ++count[static_cast<std::size_t>(l)];
+    std::vector<std::uint32_t> next(static_cast<std::size_t>(maxLen) + 2, 0);
+    std::uint32_t code = 0;
+    for (int b = 1; b <= maxLen; ++b) {
+        code = (code + static_cast<std::uint32_t>(count[static_cast<std::size_t>(b) - 1])) << 1;
+        next[static_cast<std::size_t>(b)] = code;
+    }
+    std::vector<std::uint32_t> codes(len.size(), 0);
+    for (std::size_t s = 0; s < len.size(); ++s) {
+        const int l = len[s];
+        if (!l) continue;
+        std::uint32_t c = next[static_cast<std::size_t>(l)]++, r = 0;
+        for (int i = 0; i < l; ++i) r |= ((c >> i) & 1u) << (l - 1 - i);
+        codes[s] = r;
+    }
+    return codes;
+}
+
+const std::uint16_t kLenBase[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+const std::uint8_t kLenExtra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+const std::uint16_t kDistBase[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+const std::uint8_t kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+
+struct Token {
+    std::uint16_t lenOrLiteral;  // < 256 literal, else match length (3..258) + 256
+    std::uint16_t distance;
+};
+
+int lengthCode(int len) {
+    int c = 0;
+    while (c < 28 && kLenBase[c + 1] <= len) ++c;
+    return c;
+}
+int distanceCode(int d) {
+    int c = 0;
+    while (c < 29 && kDistBase[c + 1] <= d) ++c;
+    return c;
+}
+
+void writeBlock(BitWriter& bw, const std::vector<Token>& tokens, bool last) {
+    std::vector<std::uint32_t> lf(286, 0), df(30, 0);
+    for (const Token& t : tokens) {
+        if (t.lenOrLiteral < 256) ++lf[t.lenOrLiteral];
+        else {
+            ++lf[257 + static_cast<std::size_t>(lengthCode(t.lenOrLiteral - 256))];
+            ++df[static_cast<std::size_t>(distanceCode(t.distance))];
+        }
+    }
+    lf[256] = 1;
+    const std::vector<int> ll = limitedLengths(lf, 15), dl = limitedLengths(df, 15);
+    std::size_t hlit = 286, hdist = 30;
+    while (hlit > 257 && ll[hlit - 1] == 0) --hlit;
+    while (hdist > 1 && dl[hdist - 1] == 0) --hdist;
+    std::vector<int> all(ll.begin(), ll.begin() + static_cast<long>(hlit));
+    all.insert(all.end(), dl.begin(), dl.begin() + static_cast<long>(hdist));
+    // Run-length encode the code lengths (16: repeat previous, 17 / 18: zeros).
+    std::vector<std::pair<int, int>> rle;  // (symbol, extra value)
+    for (std::size_t i = 0; i < all.size();) {
+        std::size_t run = 1;
+        while (i + run < all.size() && all[i + run] == all[i]) ++run;
+        if (all[i] == 0 && run >= 3) {
+            const std::size_t r = std::min<std::size_t>(run, 138);
+            rle.push_back(r >= 11 ? std::make_pair(18, static_cast<int>(r - 11)) : std::make_pair(17, static_cast<int>(r - 3)));
+            i += r;
+        } else if (all[i] != 0 && run >= 4) {
+            rle.push_back({all[i], 0});
+            const std::size_t r = std::min<std::size_t>(run - 1, 6);
+            rle.push_back({16, static_cast<int>(r - 3)});
+            i += 1 + r;
+        } else {
+            rle.push_back({all[i], 0});
+            ++i;
+        }
+    }
+    std::vector<std::uint32_t> cf(19, 0);
+    for (const auto& r : rle) ++cf[static_cast<std::size_t>(r.first)];
+    const std::vector<int> cl = limitedLengths(cf, 7);
+    static const int order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+    std::size_t hclen = 19;
+    while (hclen > 4 && cl[static_cast<std::size_t>(order[hclen - 1])] == 0) --hclen;
+    const std::vector<std::uint32_t> lc = canonicalCodes(ll), dc = canonicalCodes(dl), cc = canonicalCodes(cl);
+    bw.put(last ? 1 : 0, 1);
+    bw.put(2, 2);
+    bw.put(static_cast<std::uint32_t>(hlit - 257), 5);
+    bw.put(static_cast<std::uint32_t>(hdist - 1), 5);
+    bw.put(static_cast<std::uint32_t>(hclen - 4), 4);
+    for (std::size_t i = 0; i < hclen; ++i) bw.put(static_cast<std::uint32_t>(cl[static_cast<std::size_t>(order[i])]), 3);
+    for (const auto& r : rle) {
+        bw.put(cc[static_cast<std::size_t>(r.first)], cl[static_cast<std::size_t>(r.first)]);
+        if (r.first == 16) bw.put(static_cast<std::uint32_t>(r.second), 2);
+        else if (r.first == 17) bw.put(static_cast<std::uint32_t>(r.second), 3);
+        else if (r.first == 18) bw.put(static_cast<std::uint32_t>(r.second), 7);
+    }
+    for (const Token& t : tokens) {
+        if (t.lenOrLiteral < 256) {
+            bw.put(lc[t.lenOrLiteral], ll[t.lenOrLiteral]);
+            continue;
+        }
+        const int len = t.lenOrLiteral - 256, c = lengthCode(len), d = distanceCode(t.distance);
+        bw.put(lc[257 + static_cast<std::size_t>(c)], ll[257 + static_cast<std::size_t>(c)]);
+        if (kLenExtra[c]) bw.put(static_cast<std::uint32_t>(len - kLenBase[c]), kLenExtra[c]);
+        bw.put(dc[static_cast<std::size_t>(d)], dl[static_cast<std::size_t>(d)]);
+        if (kDistExtra[d]) bw.put(static_cast<std::uint32_t>(t.distance - kDistBase[d]), kDistExtra[d]);
+    }
+    bw.put(lc[256], ll[256]);
+}
+
+// zlib stream: LZ77 with hash chains and one-step lazy matching, dynamic Huffman blocks.
+std::vector<std::uint8_t> zlibCompress(const std::vector<std::uint8_t>& data) {
+    std::vector<std::uint8_t> out{0x78, 0x9C};
+    BitWriter bw{out};
+    constexpr std::size_t kWindow = 32768, kMaxChain = 48, kNice = 128, kBlock = 1 << 16;
+    std::vector<std::int32_t> head(1 << 15, -1), prev(kWindow, -1);
+    const std::size_t n = data.size();
+    auto hash = [&](std::size_t i) {
+        return ((static_cast<std::uint32_t>(data[i]) << 10) ^ (static_cast<std::uint32_t>(data[i + 1]) << 5) ^ data[i + 2]) & 0x7FFF;
+    };
+    auto insert = [&](std::size_t i) {
+        if (i + 2 >= n) return;
+        const std::uint32_t h = hash(i);
+        prev[i % kWindow] = head[h];
+        head[h] = static_cast<std::int32_t>(i);
+    };
+    auto longest = [&](std::size_t i, std::size_t& dist) {
+        std::size_t best = 0;
+        if (i + 2 >= n) return best;
+        std::int32_t cand = head[hash(i)];
+        const std::size_t maxLen = std::min<std::size_t>(258, n - i);
+        for (std::size_t chain = 0; cand >= 0 && chain < kMaxChain; ++chain) {
+            const std::size_t c = static_cast<std::size_t>(cand);
+            if (i - c > kWindow - 1 || c >= i) break;
+            if (data[c + best] == data[i + best]) {
+                std::size_t l = 0;
+                while (l < maxLen && data[c + l] == data[i + l]) ++l;
+                if (l > best) {
+                    best = l;
+                    dist = i - c;
+                    if (l >= kNice) break;
+                }
+            }
+            const std::int32_t p = prev[c % kWindow];
+            if (p >= cand) break;  // stale entry from an older window
+            cand = p;
+        }
+        return best >= 3 ? best : 0;
+    };
+    std::vector<Token> tokens;
+    std::size_t i = 0;
+    while (i < n) {
+        std::size_t dist = 0, len = longest(i, dist);
+        if (len && len < kNice && i + 1 < n) {  // lazy: a longer match one byte later wins
+            std::size_t d2 = 0;
+            insert(i);
+            const std::size_t l2 = longest(i + 1, d2);
+            if (l2 > len) {
+                tokens.push_back({data[i], 0});
+                ++i;
+                len = l2;
+                dist = d2;
+            } else {
+                for (std::size_t k = 1; k < len; ++k) insert(i + k);
+                tokens.push_back({static_cast<std::uint16_t>(256 + len), static_cast<std::uint16_t>(dist)});
+                i += len;
+                len = 0;
+            }
+            if (len) {
+                for (std::size_t k = 0; k < len; ++k) insert(i + k);
+                tokens.push_back({static_cast<std::uint16_t>(256 + len), static_cast<std::uint16_t>(dist)});
+                i += len;
+            }
+        } else if (len) {
+            for (std::size_t k = 0; k < len; ++k) insert(i + k);
+            tokens.push_back({static_cast<std::uint16_t>(256 + len), static_cast<std::uint16_t>(dist)});
+            i += len;
+        } else {
+            insert(i);
+            tokens.push_back({data[i], 0});
+            ++i;
+        }
+        if (tokens.size() >= kBlock) {
+            writeBlock(bw, tokens, false);
+            tokens.clear();
+        }
+    }
+    writeBlock(bw, tokens, true);
+    bw.flush();
+    if (out.size() > n + n / 65535 * 5 + 7) {  // incompressible: stored blocks are smaller
+        out.assign({0x78, 0x01});
+        for (std::size_t pos = 0;;) {
+            const std::size_t len = std::min<std::size_t>(65535, n - pos);
+            const bool last = pos + len == n;
+            out.insert(out.end(), {static_cast<std::uint8_t>(last ? 1 : 0), static_cast<std::uint8_t>(len & 0xFF),
+                                   static_cast<std::uint8_t>(len >> 8), static_cast<std::uint8_t>(~len & 0xFF),
+                                   static_cast<std::uint8_t>((~len >> 8) & 0xFF)});
+            out.insert(out.end(), data.begin() + static_cast<long>(pos), data.begin() + static_cast<long>(pos + len));
+            pos += len;
+            if (last) break;
+        }
+    }
+    std::uint32_t a = 1, b = 0;  // Adler-32
+    for (std::size_t k = 0; k < n;) {
+        const std::size_t end = std::min(n, k + 5552);
+        for (; k < end; ++k) {
+            a += data[k];
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
+    }
+    putBE32(out, (b << 16) | a);
+    return out;
+}
+
+// Scanlines with a per-row filter (the one with the smallest sum of absolute
+// signed bytes, the usual heuristic), compressed.
+std::vector<std::uint8_t> pngImageData(const Image& image) {
+    const std::size_t C = image.channels, stride = image.width * C;
+    std::vector<std::uint8_t> raw;
+    raw.reserve((stride + 1) * image.height);
+    std::vector<std::uint8_t> zero(stride, 0), best(stride), trial(stride);
+    for (std::size_t y = 0; y < image.height; ++y) {
+        const std::uint8_t* row = image.pixels.data() + y * stride;
+        const std::uint8_t* up = y ? row - stride : zero.data();
+        std::uint64_t bestScore = ~std::uint64_t{0};
+        std::uint8_t bestType = 0;
+        for (std::uint8_t type = 0; type < 5; ++type) {
+            std::uint64_t score = 0;
+            for (std::size_t x = 0; x < stride; ++x) {
+                const int a = x >= C ? row[x - C] : 0, b = up[x], c = x >= C ? up[x - C] : 0;
+                int pred = 0;
+                switch (type) {
+                case 1: pred = a; break;
+                case 2: pred = b; break;
+                case 3: pred = (a + b) / 2; break;
+                case 4: {
+                    const int p = a + b - c, pa = std::abs(p - a), pb = std::abs(p - b), pc = std::abs(p - c);
+                    pred = pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+                    break;
+                }
+                default: break;
+                }
+                trial[x] = static_cast<std::uint8_t>(row[x] - pred);
+                score += static_cast<std::uint64_t>(std::abs(static_cast<int>(static_cast<std::int8_t>(trial[x]))));
+            }
+            if (score < bestScore) {
+                bestScore = score;
+                bestType = type;
+                best.swap(trial);
+            }
+        }
+        raw.push_back(bestType);
+        raw.insert(raw.end(), best.begin(), best.end());
+    }
+    return zlibCompress(raw);
+}
+
+std::uint8_t pngColorType(const Image& image, const char* who) {
+    switch (image.channels) {
+    case 1: return 0;
+    case 3: return 2;
+    case 4: return 6;
+    default: throw std::invalid_argument(std::string(who) + ": 1, 3 or 4 channels");
+    }
+}
+
+void writePngHeader(std::ofstream& f, const Image& image, std::uint8_t colorType) {
     const std::uint8_t signature[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
     f.write(reinterpret_cast<const char*>(signature), 8);
     std::vector<std::uint8_t> ihdr;
@@ -418,38 +740,62 @@ void savePng(const std::string& path, const Image& image) {
     putBE32(ihdr, static_cast<std::uint32_t>(image.height));
     ihdr.insert(ihdr.end(), {8, colorType, 0, 0, 0});
     writeChunk(f, "IHDR", ihdr);
+}
+} // namespace
 
-    // Raw scanlines (filter byte 0) in a zlib stream of stored deflate blocks.
-    const std::size_t stride = image.width * image.channels;
-    std::vector<std::uint8_t> raw;
-    raw.reserve((stride + 1) * image.height);
-    for (std::size_t y = 0; y < image.height; ++y) {
-        raw.push_back(0);
-        raw.insert(raw.end(), image.pixels.begin() + static_cast<long>(y * stride),
-                   image.pixels.begin() + static_cast<long>((y + 1) * stride));
-    }
-    std::vector<std::uint8_t> z{0x78, 0x01};
-    for (std::size_t pos = 0; pos < raw.size() || pos == 0;) {
-        const std::size_t len = std::min<std::size_t>(65535, raw.size() - pos);
-        const bool last = pos + len == raw.size();
-        z.push_back(last ? 1 : 0);
-        z.push_back(static_cast<std::uint8_t>(len & 0xFF));
-        z.push_back(static_cast<std::uint8_t>(len >> 8));
-        z.push_back(static_cast<std::uint8_t>(~len & 0xFF));
-        z.push_back(static_cast<std::uint8_t>((~len >> 8) & 0xFF));
-        z.insert(z.end(), raw.begin() + static_cast<long>(pos), raw.begin() + static_cast<long>(pos + len));
-        pos += len;
-        if (last) break;
-    }
-    std::uint32_t a = 1, b = 0;  // Adler-32
-    for (std::uint8_t v : raw) {
-        a = (a + v) % 65521;
-        b = (b + a) % 65521;
-    }
-    putBE32(z, (b << 16) | a);
-    writeChunk(f, "IDAT", z);
+std::vector<std::uint8_t> deflateCompress(const std::vector<std::uint8_t>& data) { return zlibCompress(data); }
+
+void savePng(const std::string& path, const Image& image) {
+    checkImage(image, "savePng");
+    const std::uint8_t colorType = pngColorType(image, "savePng");
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("savePng: cannot open " + path);
+    writePngHeader(f, image, colorType);
+    writeChunk(f, "IDAT", pngImageData(image));
     writeChunk(f, "IEND", {});
     if (!f) throw std::runtime_error("savePng: write failed for " + path);
+}
+
+void saveApng(const std::string& path, const std::vector<Image>& frames, float framesPerSecond, bool loop) {
+    if (frames.empty()) throw std::invalid_argument("saveApng: no frames");
+    if (framesPerSecond <= 0.0f) throw std::invalid_argument("saveApng: frames per second must be > 0");
+    const Image& first = frames.front();
+    checkImage(first, "saveApng");
+    const std::uint8_t colorType = pngColorType(first, "saveApng");
+    for (const Image& im : frames)
+        if (im.width != first.width || im.height != first.height || im.channels != first.channels)
+            throw std::invalid_argument("saveApng: frames must have one size and channel count");
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("saveApng: cannot open " + path);
+    writePngHeader(f, first, colorType);
+    std::vector<std::uint8_t> actl;
+    putBE32(actl, static_cast<std::uint32_t>(frames.size()));
+    putBE32(actl, loop ? 0 : 1);
+    writeChunk(f, "acTL", actl);
+    // Delay as a fraction: round(1000 / fps) / 1000 s.
+    const std::uint16_t delayNum = static_cast<std::uint16_t>(std::max(1L, std::lround(1000.0 / framesPerSecond))), delayDen = 1000;
+    std::uint32_t sequence = 0;
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        std::vector<std::uint8_t> fctl;
+        putBE32(fctl, sequence++);
+        putBE32(fctl, static_cast<std::uint32_t>(first.width));
+        putBE32(fctl, static_cast<std::uint32_t>(first.height));
+        putBE32(fctl, 0);
+        putBE32(fctl, 0);
+        fctl.insert(fctl.end(), {static_cast<std::uint8_t>(delayNum >> 8), static_cast<std::uint8_t>(delayNum & 0xFF),
+                                 static_cast<std::uint8_t>(delayDen >> 8), static_cast<std::uint8_t>(delayDen & 0xFF), 0, 0});
+        writeChunk(f, "fcTL", fctl);
+        const std::vector<std::uint8_t> z = pngImageData(frames[i]);
+        if (i == 0) writeChunk(f, "IDAT", z);  // the first frame is also the still image
+        else {
+            std::vector<std::uint8_t> fdat;
+            putBE32(fdat, sequence++);
+            fdat.insert(fdat.end(), z.begin(), z.end());
+            writeChunk(f, "fdAT", fdat);
+        }
+    }
+    writeChunk(f, "IEND", {});
+    if (!f) throw std::runtime_error("saveApng: write failed for " + path);
 }
 
 void savePpm(const std::string& path, const Image& image) {
@@ -1052,6 +1398,398 @@ Image tensorToImage(const float* chw, ImageShape shape, float lo, float hi) {
             image.pixels[p * shape.channels + c] = static_cast<std::uint8_t>(std::lround(std::min(255.0f, std::max(0.0f, v))));
         }
     return image;
+}
+
+// ---- JPEG (baseline) and Motion-JPEG QuickTime movies ------------------------------------------
+
+namespace {
+const std::uint8_t kZigzag[64] = {0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,  12, 19, 26, 33, 40, 48,
+                                  41, 34, 27, 20, 13, 6,  7,  14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23,
+                                  30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63};
+// ITU T.81 Annex K tables (natural order).
+const std::uint8_t kLumaQ[64] = {16, 11, 10, 16, 24,  40,  51,  61,  12, 12, 14, 19, 26,  58,  60,  55,  14, 13, 16, 24, 40,  57,
+                                 69, 56, 14, 17, 22,  29,  51,  87,  80, 62, 18, 22, 37,  56,  68,  109, 103, 77, 24, 35, 55, 64,
+                                 81, 104, 113, 92, 49, 64, 78, 87,  103, 121, 120, 101, 72, 92, 95,  98,  112, 100, 103, 99};
+const std::uint8_t kChromaQ[64] = {17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99,
+                                   99, 99, 47, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+                                   99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99};
+const std::uint8_t kDcLumaBits[16] = {0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0};
+const std::uint8_t kDcChromaBits[16] = {0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0};
+const std::uint8_t kDcValues[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+const std::uint8_t kAcLumaBits[16] = {0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d};
+const std::uint8_t kAcLumaValues[162] = {
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81,
+    0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18,
+    0x19, 0x1a, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75,
+    0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99,
+    0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3,
+    0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5,
+    0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa};
+const std::uint8_t kAcChromaBits[16] = {0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77};
+const std::uint8_t kAcChromaValues[162] = {
+    0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71, 0x13, 0x22, 0x32, 0x81, 0x08,
+    0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0, 0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25,
+    0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47,
+    0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74,
+    0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+    0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba,
+    0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe2, 0xe3, 0xe4,
+    0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa};
+
+struct HuffTable {
+    std::uint16_t code[256] = {};
+    std::uint8_t size[256] = {};
+    HuffTable(const std::uint8_t* bits, const std::uint8_t* values) {
+        std::uint16_t c = 0;
+        std::size_t k = 0;
+        for (int len = 1; len <= 16; ++len) {
+            for (int i = 0; i < bits[len - 1]; ++i, ++k) {
+                code[values[k]] = c++;
+                size[values[k]] = static_cast<std::uint8_t>(len);
+            }
+            c <<= 1;
+        }
+    }
+};
+
+struct JpegBits {
+    std::vector<std::uint8_t>& out;
+    std::uint32_t acc = 0;
+    int n = 0;
+    void put(std::uint32_t bits, int count) {  // MSB first, with 0xFF stuffing
+        acc = (acc << count) | (bits & ((1u << count) - 1));
+        n += count;
+        while (n >= 8) {
+            const std::uint8_t b = static_cast<std::uint8_t>((acc >> (n - 8)) & 0xFF);
+            out.push_back(b);
+            if (b == 0xFF) out.push_back(0);
+            n -= 8;
+        }
+        acc &= (1u << n) - 1;
+    }
+    void flush() {
+        if (n > 0) put(0x7F, 8 - n);  // pad with ones
+    }
+};
+
+void fdct8x8(float* b) {  // separable float DCT-II, scaled as JPEG expects
+    static const std::array<float, 64> cosTable = [] {
+        std::array<float, 64> c{};
+        for (int u = 0; u < 8; ++u)
+            for (int x = 0; x < 8; ++x)
+                c[static_cast<std::size_t>(u * 8 + x)] = static_cast<float>((u == 0 ? std::sqrt(0.125) : 0.5) * std::cos((2 * x + 1) * u * 3.14159265358979323846 / 16));
+        return c;
+    }();
+    float tmp[64];
+    for (int y = 0; y < 8; ++y)
+        for (int u = 0; u < 8; ++u) {
+            float s = 0;
+            for (int x = 0; x < 8; ++x) s += cosTable[static_cast<std::size_t>(u * 8 + x)] * b[y * 8 + x];
+            tmp[y * 8 + u] = s;
+        }
+    for (int u = 0; u < 8; ++u)
+        for (int v = 0; v < 8; ++v) {
+            float s = 0;
+            for (int y = 0; y < 8; ++y) s += cosTable[static_cast<std::size_t>(v * 8 + y)] * tmp[y * 8 + u];
+            b[v * 8 + u] = s;
+        }
+}
+
+void putMarker(std::vector<std::uint8_t>& o, std::uint8_t m, const std::vector<std::uint8_t>& payload) {
+    o.insert(o.end(), {0xFF, m, static_cast<std::uint8_t>((payload.size() + 2) >> 8), static_cast<std::uint8_t>((payload.size() + 2) & 0xFF)});
+    o.insert(o.end(), payload.begin(), payload.end());
+}
+} // namespace
+
+std::vector<std::uint8_t> encodeJpeg(const Image& input, int quality) {
+    checkImage(input, "encodeJpeg");
+    if (quality < 1 || quality > 100) throw std::invalid_argument("encodeJpeg: quality must be in 1..100");
+    if (input.width > 65535 || input.height > 65535) throw std::invalid_argument("encodeJpeg: image too large");
+    const Image im = input.channels == 3 ? input : toRgb(input);
+    const std::size_t W = im.width, H = im.height;
+    // Quantization tables, scaled as libjpeg does.
+    const int scale = quality < 50 ? 5000 / quality : 200 - 2 * quality;
+    std::uint8_t q[2][64];
+    for (int i = 0; i < 64; ++i) {
+        q[0][i] = static_cast<std::uint8_t>(std::min(255, std::max(1, (kLumaQ[i] * scale + 50) / 100)));
+        q[1][i] = static_cast<std::uint8_t>(std::min(255, std::max(1, (kChromaQ[i] * scale + 50) / 100)));
+    }
+    // Planes: Y full size, Cb / Cr averaged over 2x2 (4:2:0), edges replicated to whole 16x16 MCUs.
+    const std::size_t mw = (W + 15) / 16, mh = (H + 15) / 16, PW = mw * 16, PH = mh * 16;
+    std::vector<float> Y(PW * PH), Cb(PW / 2 * PH / 2), Cr(PW / 2 * PH / 2);
+    for (std::size_t y = 0; y < PH; ++y)
+        for (std::size_t x = 0; x < PW; ++x) {
+            const std::uint8_t* p = im.pixels.data() + (std::min(y, H - 1) * W + std::min(x, W - 1)) * 3;
+            Y[y * PW + x] = 0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2] - 128.0f;
+        }
+    for (std::size_t y = 0; y < PH / 2; ++y)
+        for (std::size_t x = 0; x < PW / 2; ++x) {
+            float cb = 0, cr = 0;
+            for (int dy = 0; dy < 2; ++dy)
+                for (int dx = 0; dx < 2; ++dx) {
+                    const std::uint8_t* p = im.pixels.data() + (std::min(2 * y + dy, H - 1) * W + std::min(2 * x + dx, W - 1)) * 3;
+                    cb += -0.168736f * p[0] - 0.331264f * p[1] + 0.5f * p[2];
+                    cr += 0.5f * p[0] - 0.418688f * p[1] - 0.081312f * p[2];
+                }
+            Cb[y * (PW / 2) + x] = cb / 4;
+            Cr[y * (PW / 2) + x] = cr / 4;
+        }
+    std::vector<std::uint8_t> o{0xFF, 0xD8};
+    putMarker(o, 0xE0, {'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0});
+    for (int t = 0; t < 2; ++t) {
+        std::vector<std::uint8_t> dqt{static_cast<std::uint8_t>(t)};
+        for (int i = 0; i < 64; ++i) dqt.push_back(q[t][kZigzag[i]]);
+        putMarker(o, 0xDB, dqt);
+    }
+    putMarker(o, 0xC0, {8, static_cast<std::uint8_t>(H >> 8), static_cast<std::uint8_t>(H & 0xFF), static_cast<std::uint8_t>(W >> 8),
+                        static_cast<std::uint8_t>(W & 0xFF), 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1});
+    auto dht = [&](std::uint8_t cls, const std::uint8_t* bits, const std::uint8_t* values) {
+        std::vector<std::uint8_t> d{cls};
+        int count = 0;
+        for (int i = 0; i < 16; ++i) {
+            d.push_back(bits[i]);
+            count += bits[i];
+        }
+        d.insert(d.end(), values, values + count);
+        putMarker(o, 0xC4, d);
+    };
+    dht(0x00, kDcLumaBits, kDcValues);
+    dht(0x10, kAcLumaBits, kAcLumaValues);
+    dht(0x01, kDcChromaBits, kDcValues);
+    dht(0x11, kAcChromaBits, kAcChromaValues);
+    putMarker(o, 0xDA, {3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0});
+    static const HuffTable dcL(kDcLumaBits, kDcValues), acL(kAcLumaBits, kAcLumaValues), dcC(kDcChromaBits, kDcValues),
+        acC(kAcChromaBits, kAcChromaValues);
+    JpegBits bits{o};
+    int prevDc[3] = {0, 0, 0};
+    auto block = [&](const std::vector<float>& plane, std::size_t stride, std::size_t bx, std::size_t by, int comp) {
+        float b[64];
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 8; ++x) b[y * 8 + x] = plane[(by + static_cast<std::size_t>(y)) * stride + bx + static_cast<std::size_t>(x)];
+        fdct8x8(b);
+        const std::uint8_t* qt = q[comp == 0 ? 0 : 1];
+        int z[64];
+        for (int i = 0; i < 64; ++i) z[i] = static_cast<int>(std::lround(b[kZigzag[i]] / qt[kZigzag[i]]));
+        const HuffTable& dc = comp == 0 ? dcL : dcC;
+        const HuffTable& ac = comp == 0 ? acL : acC;
+        auto magnitude = [](int v, int& sizeOut) {
+            int a = std::abs(v), s = 0;
+            while (a) {
+                ++s;
+                a >>= 1;
+            }
+            sizeOut = s;
+            return static_cast<std::uint32_t>(v < 0 ? v + (1 << s) - 1 : v);
+        };
+        int s;
+        const int diff = z[0] - prevDc[comp];
+        prevDc[comp] = z[0];
+        std::uint32_t m = magnitude(diff, s);
+        bits.put(dc.code[s], dc.size[s]);
+        if (s) bits.put(m, s);
+        int run = 0;
+        for (int i = 1; i < 64; ++i) {
+            if (z[i] == 0) {
+                ++run;
+                continue;
+            }
+            while (run > 15) {
+                bits.put(ac.code[0xF0], ac.size[0xF0]);
+                run -= 16;
+            }
+            m = magnitude(z[i], s);
+            const int sym = (run << 4) | s;
+            bits.put(ac.code[sym], ac.size[sym]);
+            bits.put(m, s);
+            run = 0;
+        }
+        if (run) bits.put(ac.code[0], ac.size[0]);
+    };
+    for (std::size_t my = 0; my < mh; ++my)
+        for (std::size_t mx = 0; mx < mw; ++mx) {
+            for (int k = 0; k < 4; ++k) block(Y, PW, mx * 16 + static_cast<std::size_t>(k % 2) * 8, my * 16 + static_cast<std::size_t>(k / 2) * 8, 0);
+            block(Cb, PW / 2, mx * 8, my * 8, 1);
+            block(Cr, PW / 2, mx * 8, my * 8, 2);
+        }
+    bits.flush();
+    o.insert(o.end(), {0xFF, 0xD9});
+    return o;
+}
+
+void saveJpeg(const std::string& path, const Image& image, int quality) {
+    const std::vector<std::uint8_t> d = encodeJpeg(image, quality);
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("saveJpeg: cannot open " + path);
+    f.write(reinterpret_cast<const char*>(d.data()), static_cast<std::streamsize>(d.size()));
+    if (!f) throw std::runtime_error("saveJpeg: write failed for " + path);
+}
+
+namespace {
+struct Atom {  // QuickTime / MP4 box writer
+    std::vector<std::uint8_t> d;
+    void u8(std::uint8_t v) { d.push_back(v); }
+    void u16(std::uint32_t v) { d.insert(d.end(), {static_cast<std::uint8_t>(v >> 8), static_cast<std::uint8_t>(v)}); }
+    void u32(std::uint32_t v) { putBE32(d, v); }
+    void tag(const char* s) { d.insert(d.end(), s, s + 4); }
+    void zeros(std::size_t n) { d.insert(d.end(), n, 0); }
+    void add(const Atom& a) { d.insert(d.end(), a.d.begin(), a.d.end()); }
+    static Atom box(const char* type, const std::vector<Atom>& children = {}, const std::vector<std::uint8_t>& body = {}) {
+        Atom a;
+        std::size_t size = 8 + body.size();
+        for (const Atom& c : children) size += c.d.size();
+        a.u32(static_cast<std::uint32_t>(size));
+        a.tag(type);
+        a.d.insert(a.d.end(), body.begin(), body.end());
+        for (const Atom& c : children) a.add(c);
+        return a;
+    }
+};
+void matrixIdentity(Atom& a) {
+    for (std::uint32_t v : {0x00010000u, 0u, 0u, 0u, 0x00010000u, 0u, 0u, 0u, 0x40000000u}) a.u32(v);
+}
+} // namespace
+
+void saveMjpegMov(const std::string& path, const std::vector<Image>& frames, float framesPerSecond, int quality) {
+    if (frames.empty()) throw std::invalid_argument("saveMjpegMov: no frames");
+    if (framesPerSecond <= 0.0f) throw std::invalid_argument("saveMjpegMov: frames per second must be > 0");
+    const std::size_t W = frames[0].width, H = frames[0].height;
+    std::vector<std::vector<std::uint8_t>> jpegs;
+    for (const Image& f : frames) {
+        if (f.width != W || f.height != H) throw std::invalid_argument("saveMjpegMov: frames must have one size");
+        jpegs.push_back(encodeJpeg(f, quality));
+    }
+    // Timescale with whole-number frame durations: 1000 * fps rounded, delta 1000.
+    const std::uint32_t timescale = static_cast<std::uint32_t>(std::lround(framesPerSecond * 1000.0f)), delta = 1000;
+    const std::uint32_t n = static_cast<std::uint32_t>(frames.size()), duration = n * delta;
+    Atom ftyp = Atom::box("ftyp", {}, {'q', 't', ' ', ' ', 0, 0, 2, 0, 'q', 't', ' ', ' '});
+    std::size_t mdatSize = 8;
+    for (const auto& j : jpegs) mdatSize += j.size();
+    std::vector<std::uint32_t> offsets;
+    std::size_t at = ftyp.d.size() + 8;
+    for (const auto& j : jpegs) {
+        offsets.push_back(static_cast<std::uint32_t>(at));
+        at += j.size();
+    }
+    if (at > 0xFFFFFFFFu) throw std::runtime_error("saveMjpegMov: movie larger than 4 GB");
+
+    Atom mvhd;
+    mvhd.u32(0);  // version, flags
+    mvhd.u32(0);
+    mvhd.u32(0);  // creation / modification time
+    mvhd.u32(timescale);
+    mvhd.u32(duration);
+    mvhd.u32(0x00010000);  // rate 1.0
+    mvhd.u16(0x0100);      // volume 1.0
+    mvhd.zeros(10);
+    matrixIdentity(mvhd);
+    mvhd.zeros(24);  // preview, poster, selection, current time
+    mvhd.u32(2);     // next track id
+    Atom tkhd;
+    tkhd.u32(0x0000000F);  // enabled, in movie, in preview, in poster
+    tkhd.u32(0);
+    tkhd.u32(0);
+    tkhd.u32(1);  // track id
+    tkhd.u32(0);
+    tkhd.u32(duration);
+    tkhd.zeros(8);
+    tkhd.u16(0);  // layer
+    tkhd.u16(0);  // alternate group
+    tkhd.u16(0);  // volume (video)
+    tkhd.u16(0);
+    matrixIdentity(tkhd);
+    tkhd.u32(static_cast<std::uint32_t>(W) << 16);
+    tkhd.u32(static_cast<std::uint32_t>(H) << 16);
+    Atom mdhd;
+    mdhd.u32(0);
+    mdhd.u32(0);
+    mdhd.u32(0);
+    mdhd.u32(timescale);
+    mdhd.u32(duration);
+    mdhd.u16(0x7FFF);  // language: unspecified
+    mdhd.u16(0);       // quality
+    auto hdlr = [](const char* kind, const char* sub, const char* name) {
+        Atom h;
+        h.u32(0);
+        h.tag(kind);
+        h.tag(sub);
+        h.zeros(12);
+        const std::size_t len = std::strlen(name);
+        h.u8(static_cast<std::uint8_t>(len));  // Pascal string, as QuickTime writes it
+        h.d.insert(h.d.end(), name, name + len);
+        return h;
+    };
+    Atom vmhd;
+    vmhd.u32(0x00000001);
+    vmhd.u16(0x0040);  // graphics mode: dither copy
+    vmhd.zeros(6);
+    Atom dref;
+    dref.u32(0);
+    dref.u32(1);
+    dref.add(Atom::box("alis", {}, {0, 0, 0, 1}));  // self-contained
+    Atom entry;  // video sample description, 'jpeg' = Photo-JPEG
+    entry.zeros(6);
+    entry.u16(1);  // data reference index
+    entry.u16(0);
+    entry.u16(0);
+    entry.tag("appl");
+    entry.u32(0);    // temporal quality
+    entry.u32(512);  // spatial quality
+    entry.u16(static_cast<std::uint32_t>(W));
+    entry.u16(static_cast<std::uint32_t>(H));
+    entry.u32(0x00480000);  // 72 dpi
+    entry.u32(0x00480000);
+    entry.u32(0);  // data size
+    entry.u16(1);  // frames per sample
+    const char* compressor = "Photo - JPEG";
+    entry.u8(static_cast<std::uint8_t>(std::strlen(compressor)));
+    entry.d.insert(entry.d.end(), compressor, compressor + std::strlen(compressor));
+    entry.zeros(31 - std::strlen(compressor));
+    entry.u16(24);      // depth
+    entry.u16(0xFFFF);  // no colour table
+    Atom stsd;
+    stsd.u32(0);
+    stsd.u32(1);
+    Atom sampleEntry = Atom::box("jpeg", {}, entry.d);
+    stsd.add(sampleEntry);
+    Atom stts;
+    stts.u32(0);
+    stts.u32(1);
+    stts.u32(n);
+    stts.u32(delta);
+    Atom stsc;
+    stsc.u32(0);
+    stsc.u32(1);
+    stsc.u32(1);
+    stsc.u32(1);
+    stsc.u32(1);
+    Atom stsz;
+    stsz.u32(0);
+    stsz.u32(0);  // sizes differ
+    stsz.u32(n);
+    for (const auto& j : jpegs) stsz.u32(static_cast<std::uint32_t>(j.size()));
+    Atom stco;
+    stco.u32(0);
+    stco.u32(n);
+    for (std::uint32_t off : offsets) stco.u32(off);
+    const Atom stbl = Atom::box("stbl", {Atom::box("stsd", {}, stsd.d), Atom::box("stts", {}, stts.d), Atom::box("stsc", {}, stsc.d),
+                                         Atom::box("stsz", {}, stsz.d), Atom::box("stco", {}, stco.d)});
+    const Atom minf = Atom::box("minf", {Atom::box("vmhd", {}, vmhd.d), Atom::box("hdlr", {}, hdlr("dhlr", "alis", "NeuraCraft data").d),
+                                         Atom::box("dinf", {Atom::box("dref", {}, dref.d)}), stbl});
+    const Atom mdia = Atom::box("mdia", {Atom::box("mdhd", {}, mdhd.d), Atom::box("hdlr", {}, hdlr("mhlr", "vide", "NeuraCraft video").d), minf});
+    const Atom trak = Atom::box("trak", {Atom::box("tkhd", {}, tkhd.d), mdia});
+    const Atom moov = Atom::box("moov", {Atom::box("mvhd", {}, mvhd.d), trak});
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("saveMjpegMov: cannot open " + path);
+    f.write(reinterpret_cast<const char*>(ftyp.d.data()), static_cast<std::streamsize>(ftyp.d.size()));
+    std::vector<std::uint8_t> mdatHeader;
+    putBE32(mdatHeader, static_cast<std::uint32_t>(mdatSize));
+    mdatHeader.insert(mdatHeader.end(), {'m', 'd', 'a', 't'});
+    f.write(reinterpret_cast<const char*>(mdatHeader.data()), 8);
+    for (const auto& j : jpegs) f.write(reinterpret_cast<const char*>(j.data()), static_cast<std::streamsize>(j.size()));
+    f.write(reinterpret_cast<const char*>(moov.d.data()), static_cast<std::streamsize>(moov.d.size()));
+    if (!f) throw std::runtime_error("saveMjpegMov: write failed for " + path);
 }
 
 } // namespace nc

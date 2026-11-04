@@ -25,3 +25,21 @@ jobs:
 
     - name: Test
       run: ctest --test-dir build --output-on-failure
+
+    - name: Unit test details
+      run: ./build/neuracraft_tests
+
+    - name: Unit tests with the portable Metal kernel
+      if: runner.os == 'macOS'
+      run: NEURACRAFT_METAL_KERNEL=tiled ./build/neuracraft_tests
+
+    - name: Unit tests with the simdgroup Metal kernel forced
+      if: runner.os == 'macOS'
+      continue-on-error: true
+      run: NEURACRAFT_METAL_KERNEL=simdgroup ./build/neuracraft_tests && NEURACRAFT_METAL_KERNEL=simdgroup ./bin/NeuraCraft bench
+
+    - name: Benchmark
+      run: ./bin/NeuraCraft bench
+
+    - name: Train on the GPU (falls back to CPU without one)
+      run: ./bin/NeuraCraft --gpu spiral

@@ -18,7 +18,8 @@ else
     JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 2)
 fi
 
-cmake -S . -B "$BUILD_DIRECTORY" -DCMAKE_BUILD_TYPE=Release >/dev/null
+# Local builds may use every instruction this CPU has (AVX, NEON, ...).
+cmake -S . -B "$BUILD_DIRECTORY" -DCMAKE_BUILD_TYPE=Release -DNEURACRAFT_NATIVE=ON >/dev/null
 cmake --build "$BUILD_DIRECTORY" --parallel "$JOBS"
 
 if [ "${1:-}" = "--test" ]; then

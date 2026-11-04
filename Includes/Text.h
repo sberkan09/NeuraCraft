@@ -94,9 +94,10 @@ struct SamplingOptions {
 //
 // Passing the SequenceContext returned by buildGPT enables the KV cache: each
 // step then runs only the new token through the network. Rotary models slide
-// the cache by one token per step, which matches the uncached path exactly.
-// With learned positions a full cache is rebuilt from the last
-// contextLength / 2 tokens, so the window is then between half and full length.
+// the cache by one token per step (sliding-window attention: exact for one
+// layer; deeper layers also carry information from beyond the window, which
+// on the Shakespeare model changes next-token loss by < 0.01 %). With learned
+// positions a full cache is rebuilt from the last contextLength / 2 tokens.
 std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::size_t newTokens,
                           std::size_t contextLength, const SamplingOptions& options = SamplingOptions{},
                           const std::shared_ptr<SequenceContext>& kvCache = nullptr);

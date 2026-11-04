@@ -916,43 +916,65 @@ TEST(modern_gpt_gradcheck_and_tied_parameters) {
     CHECK(cfg.mlpHidden() % 8 == 0);
 }
 
-TEST(modern_kv_cache_slides_exactly) {
-    setSeed(64);
-    SequenceContextPtr ctx;
-    Network net = modernGpt(ctx, 8);
+namespace {
+// Largest logit difference between the incremental (sliding KV cache) path
+// and the uncached forward pass over the last `window` tokens, feeding `steps`
+// tokens one at a time after a 3-token prompt.
+float slidingCacheError(Network& net, SequenceContextPtr& ctx, std::size_t window, int steps) {
     auto row = [](const std::vector<int>& toks, std::size_t from) {
         Matrix x(1, toks.size() - from);
         for (std::size_t i = from; i < toks.size(); ++i) x(0, i - from) = static_cast<float>(toks[i]);
         return x;
     };
-    // Feed 40 tokens one at a time far past the 8-token window; every step's
-    // logits must equal the uncached forward pass over the sliding window.
     std::vector<int> toks{1, 2, 3};
     ctx->incremental = true;
     ctx->offset = 0;
-    ctx->window = 8;
+    ctx->window = window;
     net.predict(row(toks, 0));
     ctx->offset = toks.size();
     float worst = 0.0f;
-    for (int step = 0; step < 40; ++step) {
+    for (int step = 0; step < steps; ++step) {
         toks.push_back((step * 7 + 3) % 11);
         const Matrix cached = net.predict(row(toks, toks.size() - 1));
         ctx->offset += 1;
         ctx->incremental = false;  // reference pass leaves the KV caches untouched
-        const Matrix full = net.predict(row(toks, toks.size() - std::min<std::size_t>(8, toks.size())));
+        const Matrix full = net.predict(row(toks, toks.size() - std::min(window, toks.size())));
         ctx->incremental = true;
-        const Matrix last = full.row(full.rows() - 1);
-        for (std::size_t j = 0; j < last.size(); ++j) worst = std::max(worst, std::fabs(last.data()[j] - cached.data()[j]));
+        const float* last = full.data() + (full.rows() - 1) * full.cols();
+        for (std::size_t j = 0; j < full.cols(); ++j) worst = std::max(worst, std::fabs(last[j] - cached.data()[j]));
     }
     ctx->incremental = false;
     ctx->offset = 0;
     ctx->window = 0;
-    CHECK(worst < 1e-3f);
+    return worst;
+}
+} // namespace
 
-    // generate() with the cache uses the same path and restores the context.
+TEST(modern_kv_cache_slides) {
+    // One layer: rotary scores depend only on relative distance, so the sliding
+    // cache equals recomputing the window, even 40 tokens past an 8-token window.
+    setSeed(64);
+    GPTConfig one;
+    one.vocabSize = 11;
+    one.contextLength = 8;
+    one.dim = 16;
+    one.heads = 4;
+    one.layers = 1;
+    one.modern();
+    Network shallow;
+    SequenceContextPtr ctx1 = buildGPT(shallow, one);
+    CHECK(slidingCacheError(shallow, ctx1, 8, 40) < 1e-3f);
+
+    // Deeper models: exact while the text fits the window. Past it, later layers
+    // keep information from beyond the window (sliding-window attention), so
+    // they legitimately differ from a fresh recomputation.
+    SequenceContextPtr ctx;
+    Network net = modernGpt(ctx, 8);
+    CHECK(slidingCacheError(net, ctx, 8, 5) < 1e-3f);
+
     SamplingOptions greedy;
     greedy.temperature = 0.0f;
-    CHECK(generate(net, {1, 2, 3}, 20, 8, greedy, ctx).size() == 20);
+    CHECK(generate(net, {1, 2, 3}, 30, 8, greedy, ctx).size() == 30);
     CHECK(ctx->window == 0 && !ctx->incremental);
 }
 

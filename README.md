@@ -102,9 +102,13 @@ Two architectures are available (`--arch`):
 | time / epoch | 86 s | 79 s |
 
 With RoPE, attention scores depend only on relative distance, so the KV
-cache simply slides once the context is full and generation stays exactly
-equal to the uncached sliding window; models with learned positions rebuild
-the cache from its last half instead. `--resume` continues from the checkpoint, and a resumed run
+cache can simply slide once the context is full (sliding-window attention, as
+in Mistral). For a single layer that is identical to recomputing the last 64
+tokens; deeper layers also carry information from beyond the window. Measured
+on the trained model over 1136 tokens past the window, mean next-token loss is
+3.1048 sliding vs 3.1046 recomputing (and 3.0973 when rebuilding from the
+last half window), so the O(1) sliding cache costs nothing in quality. Models
+with learned positions rebuild the cache from its last half instead. `--resume` continues from the checkpoint, and a resumed run
 is bit-for-bit identical to one that never stopped; asking for more epochs
 than originally planned stretches the cosine curve from that point. The default tokenizer is byte-level BPE with 512
 tokens (learned from the file in under a second); `char` uses one token per

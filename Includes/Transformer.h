@@ -21,7 +21,7 @@ namespace nc {
 // `offset`; each attention layer keeps the keys/values of earlier positions.
 // generate() manages this; offset 0 starts a fresh cache. With `window` > 0
 // attention keeps only the most recent `window` positions (a sliding cache,
-// valid for rotary embeddings, which only depend on relative distance).
+// meaningful for rotary embeddings, which only depend on relative distance).
 struct SequenceContext {
     std::size_t length = 0;
     bool incremental = false;

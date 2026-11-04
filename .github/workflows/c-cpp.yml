@@ -25,3 +25,12 @@ jobs:
 
     - name: Test
       run: ctest --test-dir build --output-on-failure
+
+    - name: Unit test details
+      run: ./build/neuracraft_tests
+
+    - name: Benchmark
+      run: ./bin/NeuraCraft bench
+
+    - name: Train on the GPU (falls back to CPU without one)
+      run: ./bin/NeuraCraft --gpu spiral

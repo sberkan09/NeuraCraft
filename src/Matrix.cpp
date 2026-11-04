@@ -1,4 +1,5 @@
 #include "Matrix.h"
+#include "Backend.h"
 #include "Random.h"
 
 #include <algorithm>
@@ -101,17 +102,8 @@ Matrix Matrix::operator*(const Matrix& rhs) const {
                                     " * " + shapeOf(rhs.rows_, rhs.cols_));
     }
     Matrix result(rows_, rhs.cols_);
-    // i-k-j order keeps the inner loop contiguous for both operands.
-    for (std::size_t i = 0; i < rows_; ++i) {
-        float* out = result.data_.data() + i * rhs.cols_;
-        const float* a = data_.data() + i * cols_;
-        for (std::size_t k = 0; k < cols_; ++k) {
-            const float aik = a[k];
-            if (aik == 0.0f) continue;
-            const float* b = rhs.data_.data() + k * rhs.cols_;
-            for (std::size_t j = 0; j < rhs.cols_; ++j) out[j] += aik * b[j];
-        }
-    }
+    gemm(false, false, rows_, rhs.cols_, cols_, data_.data(), cols_, rhs.data_.data(), rhs.cols_,
+         result.data_.data(), rhs.cols_);
     return result;
 }
 
@@ -122,16 +114,8 @@ Matrix Matrix::transposeMatmul(const Matrix& rhs) const {
                                     "^T * " + shapeOf(rhs.rows_, rhs.cols_));
     }
     Matrix result(cols_, rhs.cols_);
-    for (std::size_t n = 0; n < rows_; ++n) {
-        const float* a = data_.data() + n * cols_;
-        const float* b = rhs.data_.data() + n * rhs.cols_;
-        for (std::size_t i = 0; i < cols_; ++i) {
-            const float ai = a[i];
-            if (ai == 0.0f) continue;
-            float* out = result.data_.data() + i * rhs.cols_;
-            for (std::size_t j = 0; j < rhs.cols_; ++j) out[j] += ai * b[j];
-        }
-    }
+    gemm(true, false, cols_, rhs.cols_, rows_, data_.data(), cols_, rhs.data_.data(), rhs.cols_,
+         result.data_.data(), rhs.cols_);
     return result;
 }
 
@@ -142,15 +126,8 @@ Matrix Matrix::matmulTranspose(const Matrix& rhs) const {
                                     " * " + shapeOf(rhs.rows_, rhs.cols_) + "^T");
     }
     Matrix result(rows_, rhs.rows_);
-    for (std::size_t i = 0; i < rows_; ++i) {
-        const float* a = data_.data() + i * cols_;
-        for (std::size_t j = 0; j < rhs.rows_; ++j) {
-            const float* b = rhs.data_.data() + j * rhs.cols_;
-            float acc = 0.0f;
-            for (std::size_t k = 0; k < cols_; ++k) acc += a[k] * b[k];
-            result.data_[i * rhs.rows_ + j] = acc;
-        }
-    }
+    gemm(false, true, rows_, rhs.rows_, cols_, data_.data(), cols_, rhs.data_.data(), rhs.cols_,
+         result.data_.data(), rhs.rows_);
     return result;
 }
 

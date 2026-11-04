@@ -1,6 +1,7 @@
 // NeuraCraft unit tests. Dependency-free: a tiny TEST/CHECK harness below.
 #include "NeuraCraft.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -500,6 +501,124 @@ TEST(toy_datasets_have_expected_shapes) {
     const Dataset sn = makeSine(5);
     CHECK_NEAR(sn.x(0, 0), -3.14159265, 1e-5);
     CHECK_NEAR(sn.y(2, 0), 0.0, 1e-5);
+}
+
+// ---- Backends & threading -----------------------------------------------------------
+
+namespace {
+// Compares an implementation against the double-precision reference for all
+// transpose combinations, ragged sizes and accumulate mode.
+template <typename Fn>
+void checkGemmImplementation(Fn fn, const char* name) {
+    setSeed(11);
+    const std::size_t shapes[][3] = {{1, 1, 1}, {3, 5, 7}, {17, 33, 9}, {64, 64, 64}, {70, 129, 45}, {5, 300, 260}};
+    for (const auto& s : shapes) {
+        const std::size_t M = s[0], N = s[1], K = s[2];
+        for (int ta = 0; ta < 2; ++ta)
+            for (int tb = 0; tb < 2; ++tb)
+                for (int acc = 0; acc < 2; ++acc) {
+                    const Matrix a = ta ? Matrix::uniform(K, M, -1, 1) : Matrix::uniform(M, K, -1, 1);
+                    const Matrix b = tb ? Matrix::uniform(N, K, -1, 1) : Matrix::uniform(K, N, -1, 1);
+                    const Matrix c0 = Matrix::uniform(M, N, -1, 1);
+                    Matrix expected = c0, got = c0;
+                    gemmReference(ta, tb, M, N, K, a.data(), a.cols(), b.data(), b.cols(), expected.data(), N, acc);
+                    fn(ta, tb, M, N, K, a.data(), a.cols(), b.data(), b.cols(), got.data(), N, acc);
+                    if (!got.approxEquals(expected, 1e-4f * static_cast<float>(K + 1))) {
+                        std::ostringstream os;
+                        os << name << " gemm mismatch for M=" << M << " N=" << N << " K=" << K << " transA=" << ta
+                           << " transB=" << tb << " accumulate=" << acc;
+                        throw Failure(os.str());
+                    }
+                }
+    }
+}
+} // namespace
+
+TEST(gemm_blocked_matches_reference) {
+    checkGemmImplementation(gemmBlocked, "blocked");
+}
+
+TEST(gemm_cpu_backend_matches_reference) {
+    checkGemmImplementation(gemmCpu, cpuBackendName().c_str());
+}
+
+TEST(gemm_gpu_matches_reference_when_available) {
+    if (!gpuAvailable()) {
+        std::cout << "         (no GPU in this build/machine: skipped)\n";
+        CHECK(!setDevice(Device::GPU));
+        CHECK(currentDevice() == Device::CPU);
+        CHECK_THROWS(gemmGpu(false, false, 1, 1, 1, nullptr, 1, nullptr, 1, nullptr, 1), std::runtime_error);
+        return;
+    }
+    std::cout << "         (GPU: " << gpuName() << ")\n";
+    checkGemmImplementation(gemmGpu, "metal");
+}
+
+TEST(gpu_device_trains_same_as_cpu) {
+    auto train = [](Device device) {
+        setDevice(device);
+        const std::size_t saved = gpuMinWork();
+        setGpuMinWork(1);  // force every product onto the selected device
+        setSeed(12);
+        const Dataset d = makeSpiral(40, 3, 0.1f);
+        Network net;
+        net.add<Dense>(2, 32, Init::He);
+        net.add<ReLU>();
+        net.add<Dense>(32, 3);
+        SoftmaxCrossEntropy loss;
+        Adam opt(0.01f);
+        FitOptions opts;
+        opts.epochs = 30;
+        opts.batchSize = 40;
+        opts.verbose = false;
+        const History h = net.fit(d.x, d.y, loss, opt, opts);
+        setGpuMinWork(saved);
+        setDevice(Device::CPU);
+        return h.back().loss;
+    };
+    const float cpu = train(Device::CPU);
+    if (!gpuAvailable()) return;
+    const float gpu = train(Device::GPU);
+    CHECK_NEAR(cpu, gpu, 1e-3);
+}
+
+TEST(matrix_products_independent_of_thread_count) {
+    setSeed(13);
+    const Matrix a = Matrix::uniform(97, 150, -1, 1), b = Matrix::uniform(150, 61, -1, 1);
+    const unsigned saved = threadCount();
+    setThreadCount(1);
+    const Matrix single = a * b;
+    setThreadCount(4);
+    const Matrix multi = a * b;
+    setThreadCount(saved);
+    CHECK(single.approxEquals(multi, 1e-5f));
+}
+
+TEST(parallel_for_covers_range_and_propagates_errors) {
+    const unsigned saved = threadCount();
+    setThreadCount(4);
+    std::vector<int> hits(10007, 0);
+    parallelFor(0, hits.size(), 1, [&](std::size_t b, std::size_t e) {
+        for (std::size_t i = b; i < e; ++i) ++hits[i];
+    });
+    for (int h : hits) CHECK(h == 1);
+
+    std::atomic<int> nestedCalls{0};
+    parallelFor(0, 8, 1, [&](std::size_t, std::size_t) {
+        parallelFor(0, 4, 1, [&](std::size_t b, std::size_t e) { nestedCalls += static_cast<int>(e - b); });
+    });
+    CHECK(nestedCalls.load() == 32);
+
+    CHECK_THROWS(parallelFor(0, 100, 1,
+                             [](std::size_t b, std::size_t) {
+                                 if (b >= 50) throw std::runtime_error("boom");
+                             }),
+                 std::runtime_error);
+    // The pool must still work after an exception.
+    std::atomic<std::size_t> total{0};
+    parallelFor(0, 1000, 10, [&](std::size_t b, std::size_t e) { total += e - b; });
+    CHECK(total.load() == 1000);
+    setThreadCount(saved);
 }
 
 // ---- Runner ------------------------------------------------------------------------------

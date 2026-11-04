@@ -5,14 +5,19 @@
 //   NeuraCraft mnist <dir> [epochs]
 //                              train a digit classifier on MNIST IDX files in <dir>
 //                              (see scripts/download_mnist.sh)
+//   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
+//
+// Global options: --gpu (Metal on Apple silicon), --threads N
 
 #include "NeuraCraft.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <vector>
 
 using namespace nc;
 
@@ -181,20 +186,102 @@ int runMnist(const std::string& dir, std::size_t epochs) {
     return 0;
 }
 
+// Times one backend on an n x n x n product; returns GFLOPS.
+double timeGemm(void (*fn)(bool, bool, std::size_t, std::size_t, std::size_t, const float*, std::size_t,
+                           const float*, std::size_t, float*, std::size_t, bool),
+                const Matrix& a, const Matrix& b, Matrix& c) {
+    const std::size_t n = a.rows();
+    fn(false, false, n, n, n, a.data(), n, b.data(), n, c.data(), n, false);  // warm-up
+    const double flops = 2.0 * static_cast<double>(n) * n * n;
+    int reps = 0;
+    const auto start = std::chrono::steady_clock::now();
+    double elapsed = 0.0;
+    do {
+        fn(false, false, n, n, n, a.data(), n, b.data(), n, c.data(), n, false);
+        ++reps;
+        elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    } while (elapsed < 0.25);
+    return flops * reps / elapsed / 1e9;
+}
+
+int runBench(bool quick) {
+    banner("Matrix multiply benchmark");
+    std::cout << "CPU backend: " << cpuBackendName() << ", " << threadCount() << " threads\n"
+              << "GPU: " << (gpuAvailable() ? gpuName() + " (Metal)" : std::string("not available")) << "\n\n";
+
+    struct Backend {
+        const char* name;
+        void (*fn)(bool, bool, std::size_t, std::size_t, std::size_t, const float*, std::size_t, const float*,
+                   std::size_t, float*, std::size_t, bool);
+    };
+    std::vector<Backend> backends{{"blocked", gemmBlocked}};
+    if (cpuBackendName() != "NeuraCraft blocked kernel") backends.push_back({"accelerate", gemmCpu});
+    if (gpuAvailable()) backends.push_back({"metal", gemmGpu});
+
+    const std::vector<std::size_t> sizes = quick ? std::vector<std::size_t>{64, 129}
+                                                 : std::vector<std::size_t>{128, 256, 512, 1024, 2048};
+    std::cout << "     n";
+    for (const auto& be : backends) std::cout << std::setw(14) << be.name;
+    std::cout << "   (GFLOPS)\n";
+
+    int mismatches = 0;
+    for (std::size_t n : sizes) {
+        const Matrix a = Matrix::uniform(n, n, -1, 1), b = Matrix::uniform(n, n, -1, 1);
+        Matrix expected(n, n);
+        gemmBlocked(false, false, n, n, n, a.data(), n, b.data(), n, expected.data(), n, false);
+        std::cout << std::setw(6) << n;
+        for (const auto& be : backends) {
+            Matrix c(n, n);
+            const double gflops = timeGemm(be.fn, a, b, c);
+            const bool ok = c.approxEquals(expected, 1e-3f * static_cast<float>(n));
+            mismatches += !ok;
+            std::cout << std::setw(13) << std::fixed << std::setprecision(1) << gflops << (ok ? ' ' : '!');
+        }
+        std::cout << std::defaultfloat << '\n';
+    }
+    if (mismatches) std::cout << "\n" << mismatches << " result(s) disagreed with the reference ('!')\n";
+    return mismatches == 0 ? 0 : 1;
+}
+
 void usage() {
     std::cout << "NeuraCraft " << NEURACRAFT_VERSION << " - a small neural network library in C++17\n\n"
               << "usage:\n"
               << "  NeuraCraft                   run the xor, spiral and sine demos\n"
               << "  NeuraCraft xor|spiral|sine   run one demo\n"
               << "  NeuraCraft mnist <dir> [epochs]\n"
-              << "                               train on MNIST IDX files in <dir>\n";
+              << "                               train on MNIST IDX files in <dir>\n"
+              << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
+              << "options:\n"
+              << "  --gpu          run large matrix products on the GPU (Metal)\n"
+              << "  --threads N    number of CPU threads (default: all cores)\n";
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     setSeed(42);
-    const std::string cmd = argc > 1 ? argv[1] : "all";
+    std::vector<std::string> args;
+    bool wantGpu = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--gpu") {
+            wantGpu = true;
+        } else if (a == "--threads") {
+            if (i + 1 >= argc) {
+                std::cerr << "--threads needs a number\n";
+                return 2;
+            }
+            setThreadCount(static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10)));
+        } else {
+            args.push_back(a);
+        }
+    }
+    if (wantGpu && !setDevice(Device::GPU)) {
+        std::cerr << "warning: no GPU available in this build/machine, using the CPU\n";
+    }
+    std::cout << "device: " << deviceDescription() << '\n';
+
+    const std::string cmd = args.empty() ? "all" : args[0];
     try {
         if (cmd == "all") {
             int failed = 0;
@@ -206,13 +293,14 @@ int main(int argc, char** argv) {
         if (cmd == "xor") return runXor();
         if (cmd == "spiral") return runSpiral();
         if (cmd == "sine") return runSine();
+        if (cmd == "bench") return runBench(args.size() > 1 && args[1] == "--quick");
         if (cmd == "mnist") {
-            if (argc < 3) {
+            if (args.size() < 2) {
                 usage();
                 return 2;
             }
-            const std::size_t epochs = argc > 3 ? static_cast<std::size_t>(std::strtoul(argv[3], nullptr, 10)) : 5;
-            return runMnist(argv[2], epochs == 0 ? 5 : epochs);
+            const std::size_t epochs = args.size() > 2 ? static_cast<std::size_t>(std::strtoul(args[2].c_str(), nullptr, 10)) : 5;
+            return runMnist(args[1], epochs == 0 ? 5 : epochs);
         }
         if (cmd == "-h" || cmd == "--help" || cmd == "help") {
             usage();

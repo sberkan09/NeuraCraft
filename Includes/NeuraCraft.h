@@ -15,6 +15,7 @@
 #include "Optimizer.h"
 #include "Parallel.h"
 #include "Pretrained.h"
+#include "Quantized.h"
 #include "Random.h"
 #include "SafeTensors.h"
 #include "Text.h"

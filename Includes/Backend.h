@@ -40,6 +40,9 @@ void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
 // matrices (Matrix::pageBacked) are mapped in place instead of copied.
 void matmul(const Matrix& a, bool transA, const Matrix& b, bool transB, Matrix& c);
 
+// Vectorized dot product of two float arrays.
+float dot(const float* a, const float* b, std::size_t n);
+
 // Direct access to each implementation (used by tests and benchmarks).
 void gemmCpu(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
              const float* A, std::size_t lda, const float* B, std::size_t ldb,

@@ -2,6 +2,7 @@
 #define NEURACRAFT_TRANSFORMER_H
 
 #include "Layer.h"
+#include "Quantized.h"
 #include "Network.h"
 
 #include <memory>
@@ -143,8 +144,10 @@ private:
 // relative distance.
 class CausalSelfAttention : public Layer {
 public:
+    // kvHeads < heads gives grouped-query attention (Llama 2/3, TinyLlama):
+    // each key/value head is shared by heads / kvHeads query heads.
     CausalSelfAttention(std::size_t dim, std::size_t heads, SequenceContextPtr context, bool rotary = false,
-                        float ropeBase = 10000.0f);
+                        float ropeBase = 10000.0f, std::size_t kvHeads = 0);
 
     Matrix forward(const Matrix& input, bool training) override;
     Matrix backward(const Matrix& gradOutput) override;
@@ -152,15 +155,19 @@ public:
     std::string name() const override { return "CausalSelfAttention"; }
     std::string describe() const override;
 
-    // Fused [Q | K | V] projection (dim x 3*dim, heads contiguous within each
-    // block) and the output projection (dim x dim), as in GPT-2's c_attn / c_proj.
+    std::size_t quantize() override;  // int8 projections; inference-only afterwards
+    std::size_t keyValueHeads() const { return kvHeads_; }
+
+    // Fused [Q | K | V] projection (dim x (dim + 2 * kvHeads * headDim), heads
+    // contiguous within each block) and the output projection (dim x dim), as in
+    // GPT-2's c_attn / c_proj.
     Matrix& qkvWeight() { return wQkv_; }
     Matrix& qkvBias() { return bQkv_; }
     Matrix& outWeight() { return wOut_; }
     Matrix& outBias() { return bOut_; }
 
 private:
-    std::size_t dim_, heads_, headDim_;
+    std::size_t dim_, heads_, kvHeads_, headDim_, kvDim_ = 0;
     SequenceContextPtr context_;
     Matrix wQkv_, bQkv_, wOut_, bOut_;
     Matrix wQkvGrad_, bQkvGrad_, wOutGrad_, bOutGrad_;
@@ -168,6 +175,9 @@ private:
     std::size_t batch_ = 0, length_ = 0;
 
     Matrix forwardIncremental(const Matrix& input);
+    Matrix projectQkv(const Matrix& input) const;
+    Matrix projectOut(const Matrix& merged) const;
+    QuantizedWeights qQkv_, qOut_;
     std::vector<float> cacheK_, cacheV_;  // (positions x dim) keys / values for incremental inference
     std::size_t cacheStart_ = 0;          // absolute position of the first cached row
 
@@ -191,10 +201,13 @@ public:
     Matrix backward(const Matrix& gradOutput) override;
     std::string name() const override { return "TiedOutput"; }
     std::string describe() const override;
+    // Keeps an int8 copy of the table for the output product (lookups stay float).
+    std::size_t quantize() override;
 
 private:
     TokenEmbedding& embedding_;
     Matrix input_;
+    QuantizedWeights quantized_;
 };
 
 // y = x + f(x), where f is a stack of layers (a pre-norm transformer sub-block).
@@ -210,6 +223,7 @@ public:
     Matrix forward(const Matrix& input, bool training) override;
     Matrix backward(const Matrix& gradOutput) override;
     std::vector<Param> parameters() override { return inner_.parameters(); }
+    std::size_t quantize() override { return inner_.quantize(); }
     std::string name() const override { return "Residual"; }
     std::string describe() const override;
     Network& inner() { return inner_; }
@@ -236,6 +250,9 @@ struct GPTConfig {
     FeedForward mlp = FeedForward::GELU;
     bool tieEmbeddings = false;
     float ropeBase = 10000.0f;
+    std::size_t kvHeads = 0;         // grouped-query attention; 0 = same as heads
+    float normEpsilon = 1e-5f;
+    std::size_t mlpHiddenSize = 0;   // explicit MLP width (e.g. Llama's intermediate_size); 0 = derived
 
     GPTConfig& modern() {
         position = PositionEncoding::Rotary;

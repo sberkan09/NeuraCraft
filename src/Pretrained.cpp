@@ -288,11 +288,13 @@ std::string Gpt2Tokenizer::decode(const std::vector<int>& ids) const {
 // ---- Model -----------------------------------------------------------------------------------
 
 namespace {
-void assign(Matrix& dst, Matrix src, const std::string& name) {
-    if (!dst.sameShape(src))
-        throw std::runtime_error("loadGPT2: " + name + " is " + std::to_string(src.rows()) + "x" +
-                                 std::to_string(src.cols()) + ", expected " + std::to_string(dst.rows()) + "x" +
-                                 std::to_string(dst.cols()));
+// Layers are built without parameters (SkipParameterInit), so shapes are
+// checked against what the configuration implies.
+void assign(Matrix& dst, Matrix src, std::size_t rows, std::size_t cols, const std::string& name) {
+    if (src.rows() != rows || src.cols() != cols)
+        throw std::runtime_error("loader: " + name + " is " + std::to_string(src.rows()) + "x" +
+                                 std::to_string(src.cols()) + ", expected " + std::to_string(rows) + "x" +
+                                 std::to_string(cols));
     dst = std::move(src);
 }
 
@@ -329,7 +331,10 @@ PretrainedModel loadGPT2(const std::string& directory) {
 
     PretrainedModel model;
     model.config = cfg;
-    model.context = buildGPT(model.net, cfg);
+    {
+        SkipParameterInit skip;  // no random weights or gradient buffers: the checkpoint fills everything
+        model.context = buildGPT(model.net, cfg);
+    }
 
     const SafeTensors st(directory + "/model.safetensors");
     const std::string prefix = st.has("wte.weight") ? "" : (st.has("transformer.wte.weight") ? "transformer." : "");
@@ -337,34 +342,34 @@ PretrainedModel loadGPT2(const std::string& directory) {
 
     Network& net = model.net;
     auto& emb = layerAs<TokenEmbedding>(net, 0, "embedding");
-    assign(emb.tokenTable(), load("wte.weight"), "wte.weight");
-    assign(emb.positionTable(), load("wpe.weight"), "wpe.weight");
+    assign(emb.tokenTable(), load("wte.weight"), cfg.vocabSize, cfg.dim, "wte.weight");
+    assign(emb.positionTable(), load("wpe.weight"), cfg.contextLength, cfg.dim, "wpe.weight");
     for (std::size_t i = 0; i < cfg.layers; ++i) {
         const std::string p = "h." + std::to_string(i) + ".";
         Network& att = layerAs<Residual>(net, 1 + 2 * i, "attention block").inner();
         auto& ln1 = layerAs<LayerNorm>(att, 0, "ln_1");
-        assign(ln1.gamma(), load(p + "ln_1.weight"), p + "ln_1.weight");
-        assign(ln1.beta(), load(p + "ln_1.bias"), p + "ln_1.bias");
+        assign(ln1.gamma(), load(p + "ln_1.weight"), 1, cfg.dim, p + "ln_1.weight");
+        assign(ln1.beta(), load(p + "ln_1.bias"), 1, cfg.dim, p + "ln_1.bias");
         auto& sa = layerAs<CausalSelfAttention>(att, 1, "attention");
-        assign(sa.qkvWeight(), load(p + "attn.c_attn.weight"), p + "attn.c_attn.weight");
-        assign(sa.qkvBias(), load(p + "attn.c_attn.bias"), p + "attn.c_attn.bias");
-        assign(sa.outWeight(), load(p + "attn.c_proj.weight"), p + "attn.c_proj.weight");
-        assign(sa.outBias(), load(p + "attn.c_proj.bias"), p + "attn.c_proj.bias");
+        assign(sa.qkvWeight(), load(p + "attn.c_attn.weight"), cfg.dim, 3 * cfg.dim, p + "attn.c_attn.weight");
+        assign(sa.qkvBias(), load(p + "attn.c_attn.bias"), 1, 3 * cfg.dim, p + "attn.c_attn.bias");
+        assign(sa.outWeight(), load(p + "attn.c_proj.weight"), cfg.dim, cfg.dim, p + "attn.c_proj.weight");
+        assign(sa.outBias(), load(p + "attn.c_proj.bias"), 1, cfg.dim, p + "attn.c_proj.bias");
 
         Network& mlp = layerAs<Residual>(net, 2 + 2 * i, "MLP block").inner();
         auto& ln2 = layerAs<LayerNorm>(mlp, 0, "ln_2");
-        assign(ln2.gamma(), load(p + "ln_2.weight"), p + "ln_2.weight");
-        assign(ln2.beta(), load(p + "ln_2.bias"), p + "ln_2.bias");
+        assign(ln2.gamma(), load(p + "ln_2.weight"), 1, cfg.dim, p + "ln_2.weight");
+        assign(ln2.beta(), load(p + "ln_2.bias"), 1, cfg.dim, p + "ln_2.bias");
         auto& fc = layerAs<Dense>(mlp, 1, "c_fc");
-        assign(fc.weights(), load(p + "mlp.c_fc.weight"), p + "mlp.c_fc.weight");
-        assign(fc.bias(), load(p + "mlp.c_fc.bias"), p + "mlp.c_fc.bias");
+        assign(fc.weights(), load(p + "mlp.c_fc.weight"), cfg.dim, 4 * cfg.dim, p + "mlp.c_fc.weight");
+        assign(fc.bias(), load(p + "mlp.c_fc.bias"), 1, 4 * cfg.dim, p + "mlp.c_fc.bias");
         auto& proj = layerAs<Dense>(mlp, 3, "mlp c_proj");
-        assign(proj.weights(), load(p + "mlp.c_proj.weight"), p + "mlp.c_proj.weight");
-        assign(proj.bias(), load(p + "mlp.c_proj.bias"), p + "mlp.c_proj.bias");
+        assign(proj.weights(), load(p + "mlp.c_proj.weight"), 4 * cfg.dim, cfg.dim, p + "mlp.c_proj.weight");
+        assign(proj.bias(), load(p + "mlp.c_proj.bias"), 1, cfg.dim, p + "mlp.c_proj.bias");
     }
     auto& lnf = layerAs<LayerNorm>(net, 1 + 2 * cfg.layers, "ln_f");
-    assign(lnf.gamma(), load("ln_f.weight"), "ln_f.weight");
-    assign(lnf.beta(), load("ln_f.bias"), "ln_f.bias");
+    assign(lnf.gamma(), load("ln_f.weight"), 1, cfg.dim, "ln_f.weight");
+    assign(lnf.beta(), load("ln_f.bias"), 1, cfg.dim, "ln_f.bias");
     net.releaseGradients();
     return model;
 }

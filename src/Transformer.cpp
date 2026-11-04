@@ -31,6 +31,7 @@ TokenEmbedding::TokenEmbedding(std::size_t vocabSize, std::size_t dim, std::size
       learnedPositions_(learnedPositions) {
     if (vocabSize == 0 || dim == 0 || maxContext == 0) throw std::invalid_argument("TokenEmbedding: sizes must be > 0");
     if (!context_) throw std::invalid_argument("TokenEmbedding: context must not be null");
+    if (SkipParameterInit::active()) return;  // a loader assigns the tables
     tokens_ = Matrix::normal(vocabSize, dim, 0.0f, 0.02f);
     tokenGrad_ = Matrix(vocabSize, dim);
     if (learnedPositions_) {
@@ -103,12 +104,21 @@ std::string TokenEmbedding::describe() const {
 
 TiedOutput::TiedOutput(TokenEmbedding& embedding) : embedding_(embedding) { embedding_.markTied(); }
 
+std::size_t TiedOutput::quantize() {
+    if (!quantized_.empty()) return 0;
+    quantized_ = QuantizedWeights::fromOutIn(embedding_.tokenTable());  // vocab x dim = out x in
+    input_ = Matrix();
+    return 1;
+}
+
 Matrix TiedOutput::forward(const Matrix& input, bool) {
+    if (!quantized_.empty()) return quantized_.multiply(input);
     input_ = input;
     return input.matmulTranspose(embedding_.tokenTable());  // (N x D) * (V x D)^T
 }
 
 Matrix TiedOutput::backward(const Matrix& gradOutput) {
+    if (!quantized_.empty()) throw std::logic_error("TiedOutput: quantized layers are inference-only");
     // Runs before the embedding's backward, which then adds the lookup gradient.
     embedding_.tokenGradient() = gradOutput.transposeMatmul(input_);  // V x D
     return gradOutput * embedding_.tokenTable();
@@ -116,7 +126,7 @@ Matrix TiedOutput::backward(const Matrix& gradOutput) {
 
 std::string TiedOutput::describe() const {
     return "TiedOutput(" + std::to_string(embedding_.tokenTable().cols()) + " -> " +
-           std::to_string(embedding_.vocabSize()) + ", shares embedding)";
+           std::to_string(embedding_.vocabSize()) + ", shares embedding" + (quantized_.empty() ? "" : ", int8") + ")";
 }
 
 // ---- RMSNorm ----------------------------------------------------------------------------
@@ -329,21 +339,26 @@ Matrix GELU::backward(const Matrix& gradOutput) {
 // ---- CausalSelfAttention ------------------------------------------------------------------
 
 CausalSelfAttention::CausalSelfAttention(std::size_t dim, std::size_t heads, SequenceContextPtr context,
-                                         bool rotary, float ropeBase)
-    : dim_(dim), heads_(heads), headDim_(heads ? dim / heads : 0), context_(std::move(context)), rotary_(rotary),
-      ropeBase_(ropeBase) {
+                                         bool rotary, float ropeBase, std::size_t kvHeads)
+    : dim_(dim), heads_(heads), kvHeads_(kvHeads ? kvHeads : heads), headDim_(heads ? dim / heads : 0),
+      context_(std::move(context)), rotary_(rotary), ropeBase_(ropeBase) {
     if (dim == 0 || heads == 0 || dim % heads != 0)
         throw std::invalid_argument("CausalSelfAttention: dim must be a positive multiple of heads");
+    if (heads % kvHeads_ != 0)
+        throw std::invalid_argument("CausalSelfAttention: heads must be a multiple of the key/value heads");
     if (rotary && headDim_ % 2 != 0) throw std::invalid_argument("CausalSelfAttention: rotary needs an even head size");
     if (!context_) throw std::invalid_argument("CausalSelfAttention: context must not be null");
-    const float limitQkv = std::sqrt(6.0f / static_cast<float>(dim + 3 * dim));
+    kvDim_ = kvHeads_ * headDim_;
+    const std::size_t cols = dim + 2 * kvDim_;
+    if (SkipParameterInit::active()) return;  // a loader assigns the parameters
+    const float limitQkv = std::sqrt(6.0f / static_cast<float>(dim + cols));
     const float limitOut = std::sqrt(6.0f / static_cast<float>(2 * dim));
-    wQkv_ = Matrix::uniform(dim, 3 * dim, -limitQkv, limitQkv);
-    bQkv_ = Matrix(1, 3 * dim);
+    wQkv_ = Matrix::uniform(dim, cols, -limitQkv, limitQkv);
+    bQkv_ = Matrix(1, cols);
     wOut_ = Matrix::uniform(dim, dim, -limitOut, limitOut);
     bOut_ = Matrix(1, dim);
-    wQkvGrad_ = Matrix(dim, 3 * dim);
-    bQkvGrad_ = Matrix(1, 3 * dim);
+    wQkvGrad_ = Matrix(dim, cols);
+    bQkvGrad_ = Matrix(1, cols);
     wOutGrad_ = Matrix(dim, dim);
     bOutGrad_ = Matrix(1, dim);
 }
@@ -372,13 +387,13 @@ void CausalSelfAttention::rotate(float* qkv, std::size_t rows, std::size_t ld, P
     for (std::size_t r = 0; r < rows; ++r) maxPos = std::max(maxPos, positionOf(r));
     ensureRopeTable(maxPos + 1);
     const float sign = inverse ? -1.0f : 1.0f;
-    const std::size_t parts = keys ? 2 : 1;  // Q (and K)
     parallelFor(0, rows, 64, [&](std::size_t r0, std::size_t r1) {
         for (std::size_t r = r0; r < r1; ++r) {
             const float* c = ropeCos_.data() + positionOf(r) * half;
             const float* s = ropeSin_.data() + positionOf(r) * half;
-            for (std::size_t part = 0; part < parts; ++part)
-                for (std::size_t h = 0; h < heads_; ++h) {
+            for (std::size_t part = 0; part < (keys ? 2u : 1u); ++part) {
+                const std::size_t count = part == 0 ? heads_ : kvHeads_;   // Q heads, then K heads
+                for (std::size_t h = 0; h < count; ++h) {
                     float* x = qkv + r * ld + part * dim_ + h * headDim_;
                     for (std::size_t i = 0; i < half; ++i) {
                         const float x1 = x[i], x2 = x[i + half], sn = sign * s[i];
@@ -386,8 +401,33 @@ void CausalSelfAttention::rotate(float* qkv, std::size_t rows, std::size_t ld, P
                         x[i + half] = x1 * sn + x2 * c[i];
                     }
                 }
+            }
         }
     });
+}
+
+Matrix CausalSelfAttention::projectQkv(const Matrix& input) const {
+    if (!qQkv_.empty()) return qQkv_.multiply(input).addRowVector(bQkv_);
+    return (input * wQkv_).addRowVector(bQkv_);
+}
+
+Matrix CausalSelfAttention::projectOut(const Matrix& merged) const {
+    if (!qOut_.empty()) return qOut_.multiply(merged).addRowVector(bOut_);
+    return (merged * wOut_).addRowVector(bOut_);
+}
+
+std::size_t CausalSelfAttention::quantize() {
+    if (!qQkv_.empty() || wQkv_.empty()) return 0;
+    qQkv_ = QuantizedWeights::fromInOut(wQkv_);
+    qOut_ = QuantizedWeights::fromInOut(wOut_);
+    wQkv_ = Matrix();
+    wOut_ = Matrix();
+    wQkvGrad_ = Matrix();
+    wOutGrad_ = Matrix();
+    bQkvGrad_ = Matrix();
+    bOutGrad_ = Matrix();
+    input_ = Matrix();
+    return 2;
 }
 
 Matrix CausalSelfAttention::forward(const Matrix& input, bool) {
@@ -397,11 +437,11 @@ Matrix CausalSelfAttention::forward(const Matrix& input, bool) {
     if (context_ && context_->incremental) return forwardIncremental(input);
     length_ = requireLength(context_, input.rows(), "CausalSelfAttention");
     batch_ = input.rows() / length_;
-    const std::size_t L = length_, D = dim_, hd = headDim_, ld = 3 * D;
+    const std::size_t L = length_, D = dim_, hd = headDim_, ld = D + 2 * kvDim_, group = heads_ / kvHeads_;
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
-    input_ = input;
-    qkv_ = (input * wQkv_).addRowVector(bQkv_);   // (B*L) x 3D: [Q | K | V]
+    if (qQkv_.empty()) input_ = input;
+    qkv_ = projectQkv(input);  // (B*L) x (D + 2*kvDim): [Q | K | V]
     if (rotary_) rotate(qkv_.data(), qkv_.rows(), ld, [L](std::size_t r) { return r % L; }, false);
     attention_ = Matrix(batch_ * heads_ * L, L);  // softmax probabilities per (sequence, head)
     merged_ = Matrix(batch_ * L, D);              // concatenated head outputs
@@ -409,10 +449,10 @@ Matrix CausalSelfAttention::forward(const Matrix& input, bool) {
     // Products per (sequence, head) are small: run them on the CPU, in parallel.
     parallelFor(0, batch_ * heads_, 1, [&](std::size_t p0, std::size_t p1) {
         for (std::size_t p = p0; p < p1; ++p) {
-            const std::size_t b = p / heads_, h = p % heads_;
+            const std::size_t b = p / heads_, h = p % heads_, g = h / group;
             const float* q = qkv_.data() + b * L * ld + h * hd;
-            const float* k = q + D;
-            const float* v = q + 2 * D;
+            const float* k = qkv_.data() + b * L * ld + D + g * hd;
+            const float* v = qkv_.data() + b * L * ld + D + kvDim_ + g * hd;
             float* s = attention_.data() + p * L * L;
             gemmCpu(false, true, L, L, hd, q, ld, k, ld, s, L);
             for (std::size_t i = 0; i < L; ++i) {
@@ -433,104 +473,112 @@ Matrix CausalSelfAttention::forward(const Matrix& input, bool) {
             gemmCpu(false, false, L, hd, L, s, L, v, ld, merged_.data() + b * L * D + h * hd, D);
         }
     });
-    return (merged_ * wOut_).addRowVector(bOut_);
+    return projectOut(merged_);
 }
 
 Matrix CausalSelfAttention::forwardIncremental(const Matrix& input) {
-    const std::size_t n = input.rows(), D = dim_, hd = headDim_, ld = 3 * D;
+    const std::size_t n = input.rows(), D = dim_, hd = headDim_, kv = kvDim_, ld = D + 2 * kv, group = heads_ / kvHeads_;
     const std::size_t past = context_->offset;
     if (past == 0) {
         cacheK_.clear();
         cacheV_.clear();
         cacheStart_ = 0;
     }
-    const std::size_t cachedRows = cacheK_.size() / D;
+    const std::size_t cachedRows = cacheK_.size() / kv;
     if (cacheStart_ + cachedRows != past)
         throw std::logic_error("CausalSelfAttention: KV cache ends at position " + std::to_string(cacheStart_ + cachedRows) +
                                " but the context offset is " + std::to_string(past));
-    Matrix qkv = (input * wQkv_).addRowVector(bQkv_);
+    Matrix qkv = projectQkv(input);
     if (rotary_) rotate(qkv.data(), n, ld, [past](std::size_t r) { return past + r; }, false);
 
     // Sliding window: keep at most `window` positions including the new ones.
     const std::size_t window = context_->window;
     if (window > 0 && cachedRows + n > window) {
         const std::size_t drop = std::min(cachedRows, cachedRows + n - window);
-        cacheK_.erase(cacheK_.begin(), cacheK_.begin() + static_cast<long>(drop * D));
-        cacheV_.erase(cacheV_.begin(), cacheV_.begin() + static_cast<long>(drop * D));
+        cacheK_.erase(cacheK_.begin(), cacheK_.begin() + static_cast<long>(drop * kv));
+        cacheV_.erase(cacheV_.begin(), cacheV_.begin() + static_cast<long>(drop * kv));
         cacheStart_ += drop;
     }
     for (std::size_t r = 0; r < n; ++r) {
         const float* row = qkv.data() + r * ld;
-        cacheK_.insert(cacheK_.end(), row + D, row + 2 * D);
-        cacheV_.insert(cacheV_.end(), row + 2 * D, row + 3 * D);
+        cacheK_.insert(cacheK_.end(), row + D, row + D + kv);
+        cacheV_.insert(cacheV_.end(), row + D + kv, row + D + 2 * kv);
     }
-    const std::size_t total = cacheK_.size() / D;
+    const std::size_t total = cacheK_.size() / kv;
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
     Matrix merged(n, D);
-    std::vector<float> scores(n * total);
-    for (std::size_t h = 0; h < heads_; ++h) {
-        const float* q = qkv.data() + h * hd;
-        gemmCpu(false, true, n, total, hd, q, ld, cacheK_.data() + h * hd, D, scores.data(), total);
-        for (std::size_t i = 0; i < n; ++i) {
-            float* row = scores.data() + i * total;
-            const std::size_t visible = past + i + 1 - cacheStart_;  // causal: earlier positions and itself
-            float maxVal = -std::numeric_limits<float>::infinity();
-            for (std::size_t j = 0; j < visible; ++j) {
-                row[j] *= scale;
-                maxVal = std::max(maxVal, row[j]);
+    parallelFor(0, heads_, 1, [&](std::size_t h0, std::size_t h1) {
+        std::vector<float> scores(n * total);
+        for (std::size_t h = h0; h < h1; ++h) {
+            const std::size_t g = h / group;
+            const float* q = qkv.data() + h * hd;
+            gemmCpu(false, true, n, total, hd, q, ld, cacheK_.data() + g * hd, kv, scores.data(), total);
+            for (std::size_t i = 0; i < n; ++i) {
+                float* row = scores.data() + i * total;
+                const std::size_t visible = past + i + 1 - cacheStart_;  // causal: earlier positions and itself
+                float maxVal = -std::numeric_limits<float>::infinity();
+                for (std::size_t j = 0; j < visible; ++j) {
+                    row[j] *= scale;
+                    maxVal = std::max(maxVal, row[j]);
+                }
+                float sum = 0.0f;
+                for (std::size_t j = 0; j < visible; ++j) {
+                    row[j] = std::exp(row[j] - maxVal);
+                    sum += row[j];
+                }
+                for (std::size_t j = 0; j < visible; ++j) row[j] /= sum;
+                for (std::size_t j = visible; j < total; ++j) row[j] = 0.0f;
             }
-            float sum = 0.0f;
-            for (std::size_t j = 0; j < visible; ++j) {
-                row[j] = std::exp(row[j] - maxVal);
-                sum += row[j];
-            }
-            for (std::size_t j = 0; j < visible; ++j) row[j] /= sum;
-            for (std::size_t j = visible; j < total; ++j) row[j] = 0.0f;
+            gemmCpu(false, false, n, hd, total, scores.data(), total, cacheV_.data() + g * hd, kv, merged.data() + h * hd, D);
         }
-        gemmCpu(false, false, n, hd, total, scores.data(), total, cacheV_.data() + h * hd, D, merged.data() + h * hd, D);
-    }
+    });
     qkv_ = Matrix();  // inference only: backward is not available after this pass
-    return (merged * wOut_).addRowVector(bOut_);
+    return projectOut(merged);
 }
 
 Matrix CausalSelfAttention::backward(const Matrix& gradOutput) {
+    if (!qQkv_.empty()) throw std::logic_error("CausalSelfAttention: quantized layers are inference-only");
     if (qkv_.empty()) throw std::logic_error("CausalSelfAttention::backward called before forward");
     if (gradOutput.rows() != batch_ * length_ || gradOutput.cols() != dim_)
         throw std::invalid_argument("CausalSelfAttention::backward: gradient shape does not match the last forward");
-    const std::size_t L = length_, D = dim_, hd = headDim_, ld = 3 * D;
+    const std::size_t L = length_, D = dim_, hd = headDim_, ld = D + 2 * kvDim_, group = heads_ / kvHeads_;
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
     wOutGrad_ = merged_.transposeMatmul(gradOutput);
     bOutGrad_ = gradOutput.sumRows();
     const Matrix dMerged = gradOutput.matmulTranspose(wOut_);
-    Matrix dQkv(batch_ * L, 3 * D);
+    Matrix dQkv(batch_ * L, ld);
 
-    parallelFor(0, batch_ * heads_, 1, [&](std::size_t p0, std::size_t p1) {
+    // One task per (sequence, key/value head): the query heads sharing a K/V
+    // head run in order and accumulate into its dK / dV, so nothing races.
+    parallelFor(0, batch_ * kvHeads_, 1, [&](std::size_t p0, std::size_t p1) {
         std::vector<float> dP(L * L);
         for (std::size_t p = p0; p < p1; ++p) {
-            const std::size_t b = p / heads_, h = p % heads_;
-            const std::size_t base = b * L * ld + h * hd;
-            const float* q = qkv_.data() + base;
-            const float* k = q + D;
-            const float* v = q + 2 * D;
-            const float* prob = attention_.data() + p * L * L;
-            const float* dO = dMerged.data() + b * L * D + h * hd;
-            float* dq = dQkv.data() + base;
-            float* dk = dq + D;
-            float* dv = dq + 2 * D;
+            const std::size_t b = p / kvHeads_, g = p % kvHeads_;
+            const float* k = qkv_.data() + b * L * ld + D + g * hd;
+            const float* v = k + kvDim_;
+            float* dk = dQkv.data() + b * L * ld + D + g * hd;
+            float* dv = dk + kvDim_;
+            for (std::size_t h = g * group; h < (g + 1) * group; ++h) {
+                const bool first = h == g * group;
+                const float* q = qkv_.data() + b * L * ld + h * hd;
+                const float* prob = attention_.data() + (b * heads_ + h) * L * L;
+                const float* dO = dMerged.data() + b * L * D + h * hd;
+                float* dq = dQkv.data() + b * L * ld + h * hd;
 
-            gemmCpu(false, true, L, L, hd, dO, D, v, ld, dP.data(), L);  // dP = dO V^T
-            gemmCpu(true, false, L, hd, L, prob, L, dO, D, dv, ld);      // dV = P^T dO
-            for (std::size_t i = 0; i < L; ++i) {                         // softmax backward
-                float* row = dP.data() + i * L;
-                const float* pr = prob + i * L;
-                float dot = 0.0f;
-                for (std::size_t j = 0; j <= i; ++j) dot += row[j] * pr[j];
-                for (std::size_t j = 0; j < L; ++j) row[j] = j <= i ? pr[j] * (row[j] - dot) * scale : 0.0f;
+                gemmCpu(false, true, L, L, hd, dO, D, v, ld, dP.data(), L);    // dP = dO V^T
+                gemmCpu(true, false, L, hd, L, prob, L, dO, D, dv, ld, !first);  // dV += P^T dO
+                for (std::size_t i = 0; i < L; ++i) {                           // softmax backward
+                    float* row = dP.data() + i * L;
+                    const float* pr = prob + i * L;
+                    float dotp = 0.0f;
+                    for (std::size_t j = 0; j <= i; ++j) dotp += row[j] * pr[j];
+                    for (std::size_t j = 0; j < L; ++j) row[j] = j <= i ? pr[j] * (row[j] - dotp) * scale : 0.0f;
+                }
+                gemmCpu(false, false, L, hd, L, dP.data(), L, k, ld, dq, ld);           // dQ = dS K
+                gemmCpu(true, false, L, hd, L, dP.data(), L, q, ld, dk, ld, !first);    // dK += dS^T Q
             }
-            gemmCpu(false, false, L, hd, L, dP.data(), L, k, ld, dq, ld);  // dQ = dS K
-            gemmCpu(true, false, L, hd, L, dP.data(), L, q, ld, dk, ld);   // dK = dS^T Q
         }
     });
 
@@ -542,12 +590,16 @@ Matrix CausalSelfAttention::backward(const Matrix& gradOutput) {
 }
 
 std::vector<Param> CausalSelfAttention::parameters() {
+    if (!qQkv_.empty()) return {};
     return {{&wQkv_, &wQkvGrad_}, {&bQkv_, &bQkvGrad_}, {&wOut_, &wOutGrad_}, {&bOut_, &bOutGrad_}};
 }
 
 std::string CausalSelfAttention::describe() const {
-    return "CausalSelfAttention(" + std::to_string(dim_) + ", " + std::to_string(heads_) + " heads" +
-           (rotary_ ? ", RoPE" : "") + ")";
+    std::string s = "CausalSelfAttention(" + std::to_string(dim_) + ", " + std::to_string(heads_) + " heads";
+    if (kvHeads_ != heads_) s += ", " + std::to_string(kvHeads_) + " kv";
+    if (rotary_) s += ", RoPE";
+    if (!qQkv_.empty()) s += ", int8";
+    return s + ")";
 }
 
 // ---- Residual -------------------------------------------------------------------------------
@@ -580,7 +632,8 @@ void saveGPTConfig(const std::string& path, const GPTConfig& c) {
         << "\nposition = " << (c.position == PositionEncoding::Rotary ? "rotary" : "learned")
         << "\nnorm = " << (c.norm == Normalization::RMSNorm ? "rmsnorm" : "layernorm")
         << "\nmlp = " << (c.mlp == FeedForward::SwiGLU ? "swiglu" : "gelu")
-        << "\ntie_embeddings = " << (c.tieEmbeddings ? 1 : 0) << "\nrope_base = " << c.ropeBase << '\n';
+        << "\ntie_embeddings = " << (c.tieEmbeddings ? 1 : 0) << "\nrope_base = " << c.ropeBase
+        << "\nkv_heads = " << c.kvHeads << "\nnorm_eps = " << c.normEpsilon << "\nmlp_hidden = " << c.mlpHiddenSize << '\n';
     if (!out) throw std::runtime_error("saveGPTConfig: write failed for " + path);
 }
 
@@ -616,6 +669,9 @@ GPTConfig loadGPTConfig(const std::string& path) {
                 c.mlp = value == "swiglu" ? FeedForward::SwiGLU : FeedForward::GELU;
             } else if (key == "tie_embeddings") c.tieEmbeddings = std::stoi(value) != 0;
             else if (key == "rope_base") c.ropeBase = std::stof(value);
+            else if (key == "kv_heads") c.kvHeads = std::stoul(value);
+            else if (key == "norm_eps") c.normEpsilon = std::stof(value);
+            else if (key == "mlp_hidden") c.mlpHiddenSize = std::stoul(value);
         } catch (const std::exception&) {
             throw std::runtime_error("loadGPTConfig: bad value for " + key + " in " + path);
         }
@@ -624,6 +680,7 @@ GPTConfig loadGPTConfig(const std::string& path) {
 }
 
 std::size_t GPTConfig::mlpHidden() const {
+    if (mlpHiddenSize) return mlpHiddenSize;
     if (mlp == FeedForward::GELU) return mlpRatio * dim;
     // SwiGLU has three matrices instead of two: 2/3 of the width keeps the
     // parameter count equal; rounded up to a multiple of 8.
@@ -640,14 +697,14 @@ SequenceContextPtr buildGPT(Network& net, const GPTConfig& c) {
     auto& embedding = net.add<TokenEmbedding>(c.vocabSize, c.dim, c.contextLength, context, !rotary);
     if (c.dropout > 0.0f) net.add<Dropout>(c.dropout);
     auto addNorm = [&](Residual& block) {
-        if (c.norm == Normalization::RMSNorm) block.add<RMSNorm>(c.dim);
-        else block.add<LayerNorm>(c.dim);
+        if (c.norm == Normalization::RMSNorm) block.add<RMSNorm>(c.dim, c.normEpsilon);
+        else block.add<LayerNorm>(c.dim, c.normEpsilon);
     };
     const std::size_t hidden = c.mlpHidden();
     for (std::size_t i = 0; i < c.layers; ++i) {
         auto& attention = net.add<Residual>();
         addNorm(attention);
-        attention.add<CausalSelfAttention>(c.dim, c.heads, context, rotary, c.ropeBase);
+        attention.add<CausalSelfAttention>(c.dim, c.heads, context, rotary, c.ropeBase, c.kvHeads);
         if (c.dropout > 0.0f) attention.add<Dropout>(c.dropout);
 
         auto& mlp = net.add<Residual>();
@@ -662,8 +719,8 @@ SequenceContextPtr buildGPT(Network& net, const GPTConfig& c) {
         mlp.add<Dense>(hidden, c.dim);
         if (c.dropout > 0.0f) mlp.add<Dropout>(c.dropout);
     }
-    if (c.norm == Normalization::RMSNorm) net.add<RMSNorm>(c.dim);
-    else net.add<LayerNorm>(c.dim);
+    if (c.norm == Normalization::RMSNorm) net.add<RMSNorm>(c.dim, c.normEpsilon);
+    else net.add<LayerNorm>(c.dim, c.normEpsilon);
     if (c.tieEmbeddings) net.add<TiedOutput>(embedding);
     else net.add<Dense>(c.dim, c.vocabSize);
     return context;

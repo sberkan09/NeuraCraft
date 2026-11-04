@@ -289,7 +289,7 @@ struct TextToVideoOptions {
     // Lightning's schedule: Euler, linear betas, trailing timesteps. "config"
     // uses DIR/scheduler/scheduler_config.json instead (other motion modules).
     std::string betaSchedule = "linear";
-    std::string sampler = "euler";  // "lcm" for AnimateLCM / LCM-LoRA (uses the model's scheduler config betas)
+    std::string sampler = "euler";  // "lcm" for AnimateLCM (with its LoRA; betaSchedule applies to both samplers)
     std::function<void(const std::string& stage, double seconds)> progress;
 };
 

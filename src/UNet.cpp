@@ -1074,9 +1074,9 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
     loadMotionModules(unet, motion, o.int8);
     reportStage(o, "load unet + motion", t);
     const EulerScheduler sched =
-        v.sampler == "lcm"         ? schedulerFor(dir, v.steps, "lcm")
-        : v.betaSchedule == "config" ? schedulerFor(dir, v.steps)
-                                     : EulerScheduler::make(v.steps, v.betaSchedule, "trailing");
+        v.betaSchedule == "config" ? schedulerFor(dir, v.steps, v.sampler)
+        : v.sampler == "lcm"       ? EulerScheduler::lcm(v.steps, v.betaSchedule)  // AnimateLCM: LCM steps, linear betas
+                                   : EulerScheduler::make(v.steps, v.betaSchedule, "trailing");
     const std::size_t F = v.frames, n = unet.latentShape().size();
     std::size_t first = 0;
     setSeed(v.seed);

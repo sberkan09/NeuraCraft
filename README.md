@@ -509,6 +509,28 @@ $ ./build_and_run.sh video data/animatediff t2v "a red fox walking through a sno
 
 (16 frames at 384 x 384, 4 steps: 10 minutes on the 2-core machine.)
 
+### Inpainting and outpaint zoom
+
+```
+$ scripts/download_sd_inpaint.sh data/sd-inpaint          # SD 1.5 inpainting, fp16 (~2.1 GB) + TAESD
+$ ./build_and_run.sh inpaint data/sd-inpaint cabin.png mask.png "a snowman with a red scarf in a snowy forest at night, photo" \
+      out.png --steps 20 --guidance 7.5
+```
+
+<p><img src="docs/images/inpaint_input.jpg" width="256"> <img src="docs/images/inpaint_result.jpg" width="256"></p>
+
+`StableDiffusion::inpaint()` / `inpaint()` work like diffusers'
+`StableDiffusionInpaintPipeline` on a 9-channel inpainting UNet: the
+masked picture is encoded, the mask is brought to latent size, and both are
+fed to the UNet next to the noisy latent at every step; kept pixels are
+pasted back through a feathered mask (`--feather`). Above: the cabin with
+the white area of the mask (left, shown lighter) redrawn as a snowman
+(20 Euler steps with guidance 7.5, 9 minutes on the 2-core machine). LoRAs
+and `--sampler lcm` work here too; LCM-LoRA on this inpainting model is
+faster (6 steps) but draws objects less well, which is fine for scenery.
+
+OUTPAINT_SAMPLE
+
 **Output formats**, all written by the library itself: `.gif` (`saveGif`,
 256 colours, plays everywhere), `.png` (`saveApng`, animated PNG, full
 colour and lossless, plays in browsers), `.mov` (`saveMjpegMov`, a QuickTime

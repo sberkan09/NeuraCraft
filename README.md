@@ -394,10 +394,11 @@ per frame (TAESD decodes automatically when `DIR/taesd` exists;
   through compositions.
 - **Zoom** (`zoomAnimation()`, Deforum style): each frame is the previous one
   moved (`transformImage()`: zoom, pan, rotation), sharpened, given a little
-  pixel noise and redrawn with image to image from timestep 249, the lowest of
-  the four SD-Turbo was distilled at (lower noise blurs, higher noise
-  flickers). Colours are matched to the first frame so the feedback loop does
-  not drift to over-saturated hues. Several prompts are spread over the
+  pixel noise and redrawn with image to image over two of the timesteps
+  SD-Turbo was distilled at (499 and 249; one pass from 249 alone keeps frames
+  closer but cannot invent the detail zooming needs, and the picture flattens
+  into blocks after a dozen frames). Each channel's histogram is matched to
+  the first frame's, so the feedback loop does not drift to other hues. Several prompts are spread over the
   frames; `--start in.png` begins from your own picture.
 
 `saveGif()` writes the animated GIF itself: one 256-colour palette for all
@@ -405,7 +406,7 @@ frames (median cut over every frame, so colours do not flicker), a fixed 4x4
 ordered dither (no crawling error-diffusion patterns) and LZW compression;
 Pillow and ffmpeg decode it, and the tests decode it with their own LZW
 reader. On the 2-core test machine a 512 x 512 frame takes ~15 s (morph) and
-~25 s (zoom: TAESD encode + UNet + decode); at 256 x 256, 3.5 s, though
+~35 s (zoom: TAESD encode, two UNet passes, decode); at 256 x 256, 3.5 s, though
 SD-Turbo's pictures are best at its native 512. The animations above are
 512 x 512 runs shown at half size.
 

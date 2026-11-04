@@ -206,16 +206,17 @@ struct ZoomOptions {
     float dx = 0.0f, dy = 0.0f;   // pixels per frame
     float rotate = 0.0f;          // degrees per frame
     // Image to image per frame: a `steps` schedule of which steps * strength
-    // run. The default is one UNet pass from timestep 249, one of the four
-    // SD-Turbo was distilled at (lower noise blurs, higher noise flickers).
+    // run. The default runs SD-Turbo's distilled timesteps 499 and 249 (two
+    // UNet passes): one pass from 249 keeps frames closer but cannot invent
+    // the detail zooming needs, so the picture flattens after a dozen frames.
     std::size_t steps = 4;
-    float strength = 0.25f;
+    float strength = 0.5f;
     unsigned seed = 0;
     bool colorCoherence = true;   // match each frame's colour statistics to the first frame's
     // Before each redraw the moved frame is sharpened (unsharp mask of this
     // amount) and given Gaussian pixel noise (standard deviation, 1 = full
     // range): zooming blurs, and the model keeps blur it is shown.
-    float sharpen = 1.0f;
+    float sharpen = 0.5f;
     float noise = 0.04f;
 };
 

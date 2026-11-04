@@ -39,8 +39,9 @@ Trains a 784-128-64-10 ReLU network with dropout and Adam, reports validation
 accuracy on the 10k test set every epoch and saves the weights to
 `data/mnist/mnist.weights`.
 
-Reference run (10 epochs, seed 42, single CPU core, Release build): **97.97 %
-test accuracy**, about 7 seconds per epoch.
+Reference run (10 epochs, seed 42): **97.97 % test accuracy**. With the v1.0
+single-threaded kernel an epoch took ~7 s; the current backends take ~2.3 s on
+the same 2-core machine (see below).
 
 | epoch | train loss | train acc | test loss | test acc |
 |---:|---:|---:|---:|---:|
@@ -50,6 +51,18 @@ test accuracy**, about 7 seconds per epoch.
 | 6 | 0.0702 | 97.75 % | 0.0712 | 97.81 % |
 | 8 | 0.0536 | 98.26 % | 0.0631 | 98.04 % |
 | 10 | 0.0469 | 98.39 % | 0.0696 | 97.97 % |
+
+A convolutional network (2× Conv3×3 + MaxPool, then Dense) does better:
+
+```
+$ ./build_and_run.sh mnist data/mnist 3 cnn   # -> data/mnist/mnist_cnn.weights
+$ ./build_and_run.sh eval data/mnist cnn      # reload, per-digit accuracy, show mistakes
+```
+
+| model | parameters | epochs | test accuracy | time / epoch (2-core x86) |
+|---|---:|---:|---:|---:|
+| MLP 784-128-64-10 | 109 k | 3 | 97.10 % | 2.3 s |
+| CNN 16-32 conv + 128 dense | 207 k | 3 | 98.83 % | 46 s |
 
 ## Performance and devices
 
@@ -131,7 +144,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Component | Header | Contents |
 |---|---|---|
 | Matrix | `Matrix.h` | Row-major float matrix: products (incl. `AᵀB`, `ABᵀ`), element-wise ops, broadcasting, reductions, row gather/slice |
-| Layers | `Dense.h`, `Activations.h` | `Dense` (Xavier / He / zero init), `ReLU`, `LeakyReLU`, `Sigmoid`, `Tanh`, `Softmax`, `Dropout` |
+| Layers | `Dense.h`, `Activations.h`, `Conv.h` | `Dense` (Xavier / He / zero init), `Conv2D` (stride, padding; im2col + GEMM), `MaxPool2D`, `ReLU`, `LeakyReLU`, `Sigmoid`, `Tanh`, `Softmax`, `Dropout` |
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay) |
 | Network | `Network.h` | `add<Layer>(...)`, `fit` (mini-batches, shuffling, validation, accuracy, callbacks), `predict`, `evaluate`, `accuracy`, `summary`, `save` / `load` |
@@ -140,6 +153,8 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Random | `Random.h` | `setSeed()` makes initialization, shuffling and dropout reproducible |
 
 Conventions: a batch is a `(samples × features)` matrix, one sample per row.
+Images are flattened channel-major (C, H, W) into a row; `Conv2D` and
+`MaxPool2D` take the input `ImageShape` in their constructor.
 Every layer's `backward()` takes `dL/d(output)`, stores parameter gradients and
 returns `dL/d(input)`. To add a layer, subclass `nc::Layer`.
 

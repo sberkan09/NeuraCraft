@@ -503,6 +503,89 @@ TEST(toy_datasets_have_expected_shapes) {
     CHECK_NEAR(sn.y(2, 0), 0.0, 1e-5);
 }
 
+// ---- Convolution ----------------------------------------------------------------------
+
+TEST(conv2d_forward_known_values) {
+    // 1x3x3 image, 2x2 kernel of ones, bias 1 -> sums of 2x2 windows + 1.
+    Conv2D conv({1, 3, 3}, 1, 2);
+    conv.weights().fill(1.0f);
+    conv.bias().fill(1.0f);
+    const Matrix out = conv.forward(Matrix{{1, 2, 3, 4, 5, 6, 7, 8, 9}}, false);
+    CHECK(out.approxEquals(Matrix{{13, 17, 25, 29}}));
+    CHECK(conv.outputShape().height == 2 && conv.outputShape().width == 2);
+
+    Conv2D padded({1, 3, 3}, 2, 3, 1, 1);
+    CHECK(padded.outputSize(9) == 2 * 3 * 3);
+    Conv2D strided({1, 5, 5}, 1, 3, 2, 0);
+    CHECK(strided.outputShape().height == 2 && strided.outputShape().width == 2);
+    CHECK_THROWS(conv.forward(Matrix(1, 8), false), std::invalid_argument);
+    CHECK_THROWS(Conv2D({1, 2, 2}, 1, 3), std::invalid_argument);
+}
+
+TEST(gradcheck_conv2d_padding) {
+    setSeed(20);
+    Network net;
+    net.add<Conv2D>(ImageShape{2, 5, 4}, 3, 3, 1, 1);
+    net.add<Tanh>();
+    MSE loss;
+    gradientCheck(net, loss, Matrix::uniform(2, 2 * 5 * 4, -1, 1), Matrix::uniform(2, 3 * 5 * 4, -1, 1));
+}
+
+TEST(gradcheck_conv2d_stride) {
+    setSeed(21);
+    Network net;
+    net.add<Conv2D>(ImageShape{1, 7, 6}, 2, 3, 2, 0, Init::Xavier);
+    MSE loss;
+    gradientCheck(net, loss, Matrix::uniform(3, 42, -1, 1), Matrix::uniform(3, 2 * 3 * 2, -1, 1));
+}
+
+TEST(maxpool_forward_and_gradcheck) {
+    MaxPool2D pool({1, 4, 4}, 2);
+    const Matrix x{{1, 2, 5, 6, 3, 4, 7, 8, -1, -2, 0, 9, -3, -4, 1, 2}};
+    CHECK(pool.forward(x, false).approxEquals(Matrix{{4, 8, -1, 9}}));
+    const Matrix dx = pool.backward(Matrix{{1, 2, 3, 4}});
+    CHECK(dx.approxEquals(Matrix{{0, 0, 0, 0, 0, 1, 0, 2, 3, 0, 0, 4, 0, 0, 0, 0}}));
+
+    // Pool directly on well-separated inputs (gaps of 0.1 >> the 0.01 probe),
+    // so the numerical gradient never flips which element is the maximum.
+    setSeed(22);
+    Network net;
+    net.add<MaxPool2D>(ImageShape{2, 6, 6}, 2);
+    net.add<Dense>(2 * 3 * 3, 3);
+    net.add<Tanh>();
+    Matrix input(2, 72);
+    for (std::size_t i = 0; i < input.size(); ++i) input.data()[i] = static_cast<float>((i * 37) % 144) / 10.0f - 7.2f;
+    MSE loss;
+    gradientCheck(net, loss, input, Matrix::uniform(2, 3, -1, 1));
+}
+
+TEST(cnn_learns_simple_patterns) {
+    // Vertical vs horizontal bars on 6x6 images.
+    setSeed(23);
+    Matrix x(40, 36);
+    Matrix y(40, 2);
+    std::uniform_int_distribution<int> pos(0, 5);
+    for (std::size_t i = 0; i < 40; ++i) {
+        const bool vertical = i % 2 == 0;
+        const int p = pos(rng());
+        for (int k = 0; k < 6; ++k) x(i, vertical ? static_cast<std::size_t>(k * 6 + p) : static_cast<std::size_t>(p * 6 + k)) = 1.0f;
+        y(i, vertical ? 0 : 1) = 1.0f;
+    }
+    Network net;
+    net.add<Conv2D>(ImageShape{1, 6, 6}, 4, 3, 1, 1);
+    net.add<ReLU>();
+    net.add<MaxPool2D>(ImageShape{4, 6, 6}, 2);
+    net.add<Dense>(4 * 3 * 3, 2);
+    SoftmaxCrossEntropy loss;
+    Adam opt(0.01f);
+    FitOptions opts;
+    opts.epochs = 60;
+    opts.batchSize = 8;
+    opts.verbose = false;
+    net.fit(x, y, loss, opt, opts);
+    CHECK_NEAR(net.accuracy(x, y), 1.0, 1e-6);
+}
+
 // ---- Backends & threading -----------------------------------------------------------
 
 namespace {

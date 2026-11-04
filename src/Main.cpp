@@ -2,8 +2,10 @@
 //
 //   NeuraCraft                 run the xor, spiral and sine demos
 //   NeuraCraft xor|spiral|sine run one demo
-//   NeuraCraft mnist <dir> [epochs]
+//   NeuraCraft mnist <dir> [epochs] [mlp|cnn]
 //                              train a digit classifier on MNIST IDX files in <dir>
+//   NeuraCraft eval <dir> [mlp|cnn]
+//                              evaluate the saved weights on the MNIST test set
 //                              (see scripts/download_mnist.sh)
 //   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
 //
@@ -11,6 +13,7 @@
 
 #include "NeuraCraft.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -141,31 +144,68 @@ int runSine() {
     return mse < 0.01f ? 0 : 1;
 }
 
-int runMnist(const std::string& dir, std::size_t epochs) {
-    banner("MNIST (784-128-64-10, ReLU + dropout, Adam)");
-    Matrix trainX, testX;
-    std::vector<int> trainLabels, testLabels;
+struct Mnist {
+    Matrix trainX, trainY, testX, testY;
+    std::vector<int> testLabels;
+};
+
+bool loadMnist(const std::string& dir, bool withTraining, Mnist& m) {
     try {
-        trainX = loadIdxImages(dir + "/train-images-idx3-ubyte");
-        trainLabels = loadIdxLabels(dir + "/train-labels-idx1-ubyte");
-        testX = loadIdxImages(dir + "/t10k-images-idx3-ubyte");
-        testLabels = loadIdxLabels(dir + "/t10k-labels-idx1-ubyte");
+        if (withTraining) {
+            m.trainX = loadIdxImages(dir + "/train-images-idx3-ubyte");
+            m.trainY = oneHot(loadIdxLabels(dir + "/train-labels-idx1-ubyte"), 10);
+        }
+        m.testX = loadIdxImages(dir + "/t10k-images-idx3-ubyte");
+        m.testLabels = loadIdxLabels(dir + "/t10k-labels-idx1-ubyte");
+        m.testY = oneHot(m.testLabels, 10);
     } catch (const std::exception& e) {
         std::cerr << "could not load MNIST: " << e.what() << "\n"
                   << "download it with: scripts/download_mnist.sh " << dir << '\n';
-        return 2;
+        return false;
     }
-    const Matrix trainY = oneHot(trainLabels, 10);
-    const Matrix testY = oneHot(testLabels, 10);
-    std::cout << "train: " << trainX.rows() << " images, test: " << testX.rows() << " images\n";
+    return true;
+}
 
+// The architectures must match between training and `eval`, since weight files
+// store parameter values only.
+bool buildMnistModel(Network& net, const std::string& model) {
+    if (model == "mlp") {
+        net.add<Dense>(784, 128, Init::He);
+        net.add<ReLU>();
+        net.add<Dropout>(0.2f);
+        net.add<Dense>(128, 64, Init::He);
+        net.add<ReLU>();
+        net.add<Dense>(64, 10);
+        return true;
+    }
+    if (model == "cnn") {
+        net.add<Conv2D>(ImageShape{1, 28, 28}, 16, 3, 1, 1);
+        net.add<ReLU>();
+        net.add<MaxPool2D>(ImageShape{16, 28, 28}, 2);
+        net.add<Conv2D>(ImageShape{16, 14, 14}, 32, 3, 1, 1);
+        net.add<ReLU>();
+        net.add<MaxPool2D>(ImageShape{32, 14, 14}, 2);
+        net.add<Dense>(32 * 7 * 7, 128, Init::He);
+        net.add<ReLU>();
+        net.add<Dropout>(0.3f);
+        net.add<Dense>(128, 10);
+        return true;
+    }
+    std::cerr << "unknown model '" << model << "' (use mlp or cnn)\n";
+    return false;
+}
+
+std::string mnistWeightsPath(const std::string& dir, const std::string& model) {
+    return dir + (model == "mlp" ? "/mnist.weights" : "/mnist_" + model + ".weights");
+}
+
+int runMnist(const std::string& dir, std::size_t epochs, const std::string& model) {
+    banner("MNIST " + model + " (Adam, batch 64)");
     Network net;
-    net.add<Dense>(784, 128, Init::He);
-    net.add<ReLU>();
-    net.add<Dropout>(0.2f);
-    net.add<Dense>(128, 64, Init::He);
-    net.add<ReLU>();
-    net.add<Dense>(64, 10);
+    if (!buildMnistModel(net, model)) return 2;
+    Mnist m;
+    if (!loadMnist(dir, true, m)) return 2;
+    std::cout << "train: " << m.trainX.rows() << " images, test: " << m.testX.rows() << " images\n";
     net.summary();
 
     SoftmaxCrossEntropy loss;
@@ -174,15 +214,82 @@ int runMnist(const std::string& dir, std::size_t epochs) {
     opts.epochs = epochs;
     opts.batchSize = 64;
     opts.trackAccuracy = true;
-    opts.validationX = &testX;
-    opts.validationY = &testY;
-    net.fit(trainX, trainY, loss, optimizer, opts);
+    opts.validationX = &m.testX;
+    opts.validationY = &m.testY;
+    const auto start = std::chrono::steady_clock::now();
+    net.fit(m.trainX, m.trainY, loss, optimizer, opts);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
-    const std::string weights = dir + "/mnist.weights";
+    const std::string weights = mnistWeightsPath(dir, model);
     net.save(weights);
-    std::cout << "weights saved to " << weights << '\n';
-    std::cout << "test accuracy: " << std::fixed << std::setprecision(2) << net.accuracy(testX, testY) * 100.0f
+    std::cout << "trained in " << std::fixed << std::setprecision(1) << seconds << " s ("
+              << seconds / static_cast<double>(epochs) << " s/epoch)\n"
+              << "weights saved to " << weights << '\n'
+              << "test accuracy: " << std::setprecision(2) << net.accuracy(m.testX, m.testY) * 100.0f
               << std::defaultfloat << "%\n";
+    return 0;
+}
+
+void printDigit(const Matrix& images, std::size_t row) {
+    static const char shades[] = " .:-=+*#%@";
+    for (std::size_t y = 0; y < 28; y += 2) {  // halve rows: terminal cells are tall
+        std::cout << "    ";
+        for (std::size_t x = 0; x < 28; ++x) {
+            const float v = std::max(images(row, y * 28 + x), images(row, (y + 1) * 28 + x));
+            std::cout << shades[static_cast<int>(v * 9.0f + 0.5f)];
+        }
+        std::cout << '\n';
+    }
+}
+
+int runEval(const std::string& dir, const std::string& model) {
+    banner("Evaluate saved MNIST " + model);
+    Network net;
+    if (!buildMnistModel(net, model)) return 2;
+    Mnist m;
+    if (!loadMnist(dir, false, m)) return 2;
+    const std::string weights = mnistWeightsPath(dir, model);
+    try {
+        net.load(weights);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\ntrain first with: NeuraCraft mnist " << dir << " 5 " << model << '\n';
+        return 2;
+    }
+    std::cout << "loaded " << weights << " (" << net.parameterCount() << " parameters)\n";
+
+    std::vector<int> predicted;
+    for (std::size_t start = 0; start < m.testX.rows(); start += 500) {
+        const std::size_t end = std::min(m.testX.rows(), start + 500);
+        const auto batch = argmaxRows(net.predict(m.testX.sliceRows(start, end)));
+        predicted.insert(predicted.end(), batch.begin(), batch.end());
+    }
+
+    std::size_t correct = 0, perTotal[10] = {}, perCorrect[10] = {};
+    std::vector<std::size_t> mistakes;
+    for (std::size_t i = 0; i < predicted.size(); ++i) {
+        const int label = m.testLabels[i];
+        ++perTotal[label];
+        if (predicted[i] == label) {
+            ++correct;
+            ++perCorrect[label];
+        } else {
+            mistakes.push_back(i);
+        }
+    }
+    std::cout << "test accuracy: " << std::fixed << std::setprecision(2)
+              << 100.0 * static_cast<double>(correct) / static_cast<double>(predicted.size()) << "%  ("
+              << mistakes.size() << " mistakes)\nper digit:";
+    for (int d = 0; d < 10; ++d)
+        std::cout << "  " << d << ": " << std::setprecision(1)
+                  << 100.0 * static_cast<double>(perCorrect[d]) / static_cast<double>(std::max<std::size_t>(1, perTotal[d]))
+                  << "%";
+    std::cout << std::defaultfloat << "\n";
+
+    for (std::size_t k = 0; k < std::min<std::size_t>(3, mistakes.size()); ++k) {
+        const std::size_t i = mistakes[k];
+        std::cout << "\n  test image #" << i << ": label " << m.testLabels[i] << ", predicted " << predicted[i] << '\n';
+        printDigit(m.testX, i);
+    }
     return 0;
 }
 
@@ -248,8 +355,10 @@ void usage() {
               << "usage:\n"
               << "  NeuraCraft                   run the xor, spiral and sine demos\n"
               << "  NeuraCraft xor|spiral|sine   run one demo\n"
-              << "  NeuraCraft mnist <dir> [epochs]\n"
-              << "                               train on MNIST IDX files in <dir>\n"
+              << "  NeuraCraft mnist <dir> [epochs] [mlp|cnn]\n"
+              << "                               train on MNIST IDX files in <dir>, save weights\n"
+              << "  NeuraCraft eval <dir> [mlp|cnn]\n"
+              << "                               evaluate saved MNIST weights on the test set\n"
               << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
               << "options:\n"
               << "  --gpu          run large matrix products on the GPU (Metal)\n"
@@ -300,7 +409,14 @@ int main(int argc, char** argv) {
                 return 2;
             }
             const std::size_t epochs = args.size() > 2 ? static_cast<std::size_t>(std::strtoul(args[2].c_str(), nullptr, 10)) : 5;
-            return runMnist(args[1], epochs == 0 ? 5 : epochs);
+            return runMnist(args[1], epochs == 0 ? 5 : epochs, args.size() > 3 ? args[3] : "mlp");
+        }
+        if (cmd == "eval") {
+            if (args.size() < 2) {
+                usage();
+                return 2;
+            }
+            return runEval(args[1], args.size() > 2 ? args[2] : "mlp");
         }
         if (cmd == "-h" || cmd == "--help" || cmd == "help") {
             usage();

@@ -23,6 +23,7 @@ find_package(Threads REQUIRED)
 add_library(neuracraft_lib STATIC
     src/Activations.cpp
     src/Backend.cpp
+    src/Conv.cpp
     src/Data.cpp
     src/Dense.cpp
     src/Loss.cpp

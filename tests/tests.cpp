@@ -2896,6 +2896,105 @@ TEST(stable_diffusion_session_and_animations) {
     std::filesystem::remove_all(tok);
 }
 
+// An AnimateDiff motion adapter for the tiny UNet (layers_per_block L).
+std::map<std::string, Matrix> tinyMotionWeights(const std::vector<std::size_t>& ch, std::size_t L) {
+    std::map<std::string, Matrix> w;
+    auto module = [&](const std::string& p, std::size_t C) {
+        addTensor(w, p + ".norm.weight", C, 0.8f, 1.2f);
+        addTensor(w, p + ".norm.bias", C, -0.1f, 0.1f);
+        for (const char* n : {".proj_in", ".proj_out"}) {
+            addTensor(w, p + n + ".weight", C * C, -0.3f, 0.3f);
+            addTensor(w, p + n + ".bias", C, -0.1f, 0.1f);
+        }
+        const std::string b = p + ".transformer_blocks.0";
+        for (const char* n : {".norm1", ".norm2", ".norm3"}) {
+            addTensor(w, b + n + ".weight", C, 0.8f, 1.2f);
+            addTensor(w, b + n + ".bias", C, -0.1f, 0.1f);
+        }
+        for (const char* a : {".attn1", ".attn2"}) {
+            for (const char* n : {".to_q", ".to_k", ".to_v"}) addTensor(w, b + a + n + ".weight", C * C, -0.5f, 0.5f);
+            addTensor(w, b + a + ".to_out.0.weight", C * C, -0.3f, 0.3f);
+            addTensor(w, b + a + ".to_out.0.bias", C, -0.1f, 0.1f);
+        }
+        addTensor(w, b + ".ff.net.0.proj.weight", 8 * C * C, -0.3f, 0.3f);
+        addTensor(w, b + ".ff.net.0.proj.bias", 8 * C, -0.1f, 0.1f);
+        addTensor(w, b + ".ff.net.2.weight", 4 * C * C, -0.3f, 0.3f);
+        addTensor(w, b + ".ff.net.2.bias", C, -0.1f, 0.1f);
+    };
+    for (std::size_t i = 0; i < ch.size(); ++i)
+        for (std::size_t j = 0; j < L; ++j) module("down_blocks." + std::to_string(i) + ".motion_modules." + std::to_string(j), ch[i]);
+    module("mid_block.motion_modules.0", ch.back());
+    for (std::size_t i = 0; i < ch.size(); ++i)
+        for (std::size_t j = 0; j <= L; ++j)
+            module("up_blocks." + std::to_string(i) + ".motion_modules." + std::to_string(j), ch[ch.size() - 1 - i]);
+    return w;
+}
+
+TEST(animatediff_motion_modules_and_text_to_video) {
+    std::string tok;
+    const std::string dir = writeTinyStableDiffusion("sd_video", tok);
+    std::filesystem::create_directories(dir + "/motion");
+    const std::string motion = dir + "/motion/tiny.safetensors";
+    saveAll(motion, tinyMotionWeights({8, 16}, 1));
+    UNet2DCondition plain = loadUNet(dir, 8, 8);
+    UNet2DCondition unet = loadUNet(dir, 8, 8);
+    CHECK(!unet.hasMotionModules());
+    loadMotionModules(unet, motion);
+    CHECK(unet.hasMotionModules() && unet.parameterCount() > plain.parameterCount());
+    const std::size_t n = 4 * 8 * 8, F = 4;
+    const Matrix latents = Matrix::normal(F, n, 0.0f, 1.0f), ctx = Matrix::uniform(8, 6, -1.0f, 1.0f);
+    // Without motion modules, frames are independent forward() calls.
+    const Matrix alone = plain.forwardFrames(latents, 500.0f, ctx);
+    Matrix first(1, n);
+    std::copy(latents.data() + n, latents.data() + 2 * n, first.data());
+    const Matrix one = plain.forward(first, 500.0f, ctx);
+    for (std::size_t k = 0; k < n; ++k) CHECK_NEAR(alone(1, k), one(0, k), 1e-5);
+    // With them, every frame sees the others: changing frame 0 changes frame 3.
+    const Matrix mixed = unet.forwardFrames(latents, 500.0f, ctx);
+    CHECK(mixed.rows() == F && mixed.cols() == n);
+    Matrix changed = latents;
+    for (std::size_t k = 0; k < n; ++k) changed(0, k) += 0.5f;
+    const Matrix after = unet.forwardFrames(changed, 500.0f, ctx);
+    double diff = 0, plainDiff = 0;
+    const Matrix plainAfter = plain.forwardFrames(changed, 500.0f, ctx);
+    for (std::size_t k = 0; k < n; ++k) {
+        diff += std::abs(after(3, k) - mixed(3, k));
+        plainDiff += std::abs(plainAfter(3, k) - alone(3, k));
+    }
+    CHECK(diff > 1e-3 && plainDiff < 1e-6);
+    CHECK(unet.forwardFrames(latents, 500.0f, ctx).values() == mixed.values());  // deterministic
+    CHECK_THROWS(unet.forwardFrames(Matrix(33, n), 500.0f, ctx), std::invalid_argument);
+    // An adapter without the mid block module (AnimateDiff v1) is refused.
+    auto v1 = tinyMotionWeights({8, 16}, 1);
+    for (auto it = v1.begin(); it != v1.end();) it = it->first.rfind("mid_block", 0) == 0 ? v1.erase(it) : std::next(it);
+    saveAll(dir + "/v1.safetensors", v1);
+    UNet2DCondition other = loadUNet(dir, 8, 8);
+    CHECK_THROWS(loadMotionModules(other, dir + "/v1.safetensors"), std::runtime_error);
+
+    // The pipeline: frames of the requested size, reproducible by seed.
+    TextToVideoOptions o;
+    o.width = o.height = 64;
+    o.frames = 3;
+    o.steps = 2;
+    std::vector<std::string> stages;
+    o.progress = [&](const std::string& s, double) { stages.push_back(s); };
+    const auto video = textToVideo(dir, "hello he", o);
+    CHECK(video.size() == 3);
+    for (const Image& f : video) CHECK(f.width == 64 && f.height == 64 && f.channels == 3);
+    CHECK(stages == std::vector<std::string>({"text encoder", "load unet + motion", "step 1/2", "step 2/2", "vae decode"}));
+    o.progress = nullptr;
+    CHECK(textToVideo(dir, "hello he", o)[2].pixels == video[2].pixels);
+    o.seed = 9;
+    CHECK(textToVideo(dir, "hello he", o)[0].pixels != video[0].pixels);
+    o.frames = 40;
+    CHECK_THROWS(textToVideo(dir, "hello", o), std::invalid_argument);
+    o.frames = 2;
+    o.motion = dir + "/missing.safetensors";
+    CHECK_THROWS(textToVideo(dir, "hello", o), std::exception);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(tok);
+}
+
 // ---- Training robustness ------------------------------------------------------------------
 
 TEST(cosine_schedule_and_gradient_clipping) {

@@ -410,6 +410,30 @@ reader. On the 2-core test machine a 512 x 512 frame takes ~15 s (morph) and
 SD-Turbo's pictures are best at its native 512. The animations above are
 512 x 512 runs shown at half size.
 
+### Text to video: AnimateDiff-Lightning
+
+```
+$ scripts/download_animatediff.sh data/animatediff     # epiCRealism (SD 1.5), AnimateDiff-Lightning 4-step, TAESD (~5 GB)
+$ ./build_and_run.sh video data/animatediff t2v "a corgi running on the beach, golden hour, photo" --frames 16 --seed 1
+```
+
+<p><img src="docs/images/video_t2v.gif" width="256"></p>
+
+Real motion instead of redrawn frames: `textToVideo()` adds an AnimateDiff
+motion adapter to a Stable Diffusion 1.5 UNet and denoises all frames
+together. `loadMotionModules()` reads diffusers `MotionAdapter` files
+(AnimateDiff v2, AnimateDiff-Lightning) and puts a temporal transformer after
+every resnet / attention of the down, mid and up blocks: GroupNorm over all
+frames, sinusoidal frame positions, two self-attention layers in which each
+pixel's frames attend to each other, a GEGLU feed-forward.
+`UNet2DCondition::forwardFrames()` runs the spatial layers frame by frame and
+the motion modules across frames, in pixel chunks so memory stays bounded.
+ByteDance's AnimateDiff-Lightning is distilled for 1, 2, 4 or 8 steps
+(Euler, linear betas, trailing timesteps, no guidance), so a 16-frame clip
+takes 4 UNet passes over 16 frames. `scripts/animatediff_reference.py` (NumPy)
+agrees with it within 3e-6 on a synthetic model; with the real int8 weights
+the predicted noise correlates 0.9998 with the float32 reference. TIMING_LINE
+
 ## Performance and devices
 
 All matrix products in the library go through one `gemm()` dispatcher

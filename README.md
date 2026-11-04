@@ -67,11 +67,11 @@ int main() {
 }
 ```
 
-Link your own program against the `neuracraft` CMake target:
+Link your own program against the `neuracraft_lib` CMake target:
 
 ```cmake
 add_subdirectory(neuracraft)
-target_link_libraries(my_app PRIVATE neuracraft)
+target_link_libraries(my_app PRIVATE neuracraft_lib)
 ```
 
 ## What's inside

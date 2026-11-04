@@ -89,6 +89,7 @@ struct SamplingOptions {
     std::size_t topK = 0;      // 0 = sample from the whole vocabulary
     std::function<void(int)> onToken;  // called with each new token as it is produced (streaming)
     int stopToken = -1;        // stop after producing this token (e.g. <|endoftext|>), -1 = never
+    std::vector<int> stopTokens;  // further stop tokens (Llama 3 ends turns with <|eot_id|> or <|eom_id|>)
 };
 
 // Autoregressive sampling from a language model built with buildGPT (or any

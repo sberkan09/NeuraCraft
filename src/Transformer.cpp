@@ -4,6 +4,7 @@
 #include "Dense.h"
 #include "Parallel.h"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <limits>
@@ -60,19 +61,27 @@ Matrix TokenEmbedding::forward(const Matrix& input, bool) {
         if (id < 0 || static_cast<std::size_t>(id) >= vocab_)
             throw std::out_of_range("TokenEmbedding: token id " + std::to_string(id) + " outside the vocabulary");
         ids_[r] = static_cast<std::size_t>(id);
-        const float* tok = tokens_.data() + ids_[r] * dim_;
         float* o = out.data() + r * dim_;
+        if (quantized()) quantizedTokens_.expandRow(ids_[r], o);
+        else std::copy(tokens_.data() + ids_[r] * dim_, tokens_.data() + (ids_[r] + 1) * dim_, o);
         if (learnedPositions_) {
             const float* pos = positions_.data() + (offset + r % length_) * dim_;
-            for (std::size_t j = 0; j < dim_; ++j) o[j] = tok[j] + pos[j];
-        } else {
-            for (std::size_t j = 0; j < dim_; ++j) o[j] = tok[j];
+            for (std::size_t j = 0; j < dim_; ++j) o[j] += pos[j];
         }
     }
     return out;
 }
 
+std::size_t TokenEmbedding::quantize() {
+    if (quantized() || tokens_.empty()) return 0;
+    quantizedTokens_ = QuantizedWeights::fromOutIn(tokens_);  // vocab x dim: one row per token
+    tokens_ = Matrix();
+    tokenGrad_ = Matrix();
+    return 1;
+}
+
 Matrix TokenEmbedding::backward(const Matrix& gradOutput) {
+    if (quantized()) throw std::logic_error("TokenEmbedding: a quantized table is inference-only");
     if (gradOutput.rows() != ids_.size() || gradOutput.cols() != dim_)
         throw std::invalid_argument("TokenEmbedding::backward: gradient shape does not match the last forward");
     // Tied: TiedOutput already wrote its share. Buffers may have been released.
@@ -91,42 +100,36 @@ Matrix TokenEmbedding::backward(const Matrix& gradOutput) {
 }
 
 std::vector<Param> TokenEmbedding::parameters() {
+    if (quantized()) return learnedPositions_ ? std::vector<Param>{{&positions_, &positionGrad_}} : std::vector<Param>{};
     if (!learnedPositions_) return {{&tokens_, &tokenGrad_}};
     return {{&tokens_, &tokenGrad_}, {&positions_, &positionGrad_}};
 }
 
 std::string TokenEmbedding::describe() const {
     return "TokenEmbedding(" + std::to_string(vocab_) + " x " + std::to_string(dim_) + ", ctx " +
-           std::to_string(maxContext_) + (learnedPositions_ ? "" : ", no positions") + ")";
+           std::to_string(maxContext_) + (learnedPositions_ ? "" : ", no positions") + (quantized() ? ", int8" : "") + ")";
 }
 
 // ---- TiedOutput ---------------------------------------------------------------------------
 
 TiedOutput::TiedOutput(TokenEmbedding& embedding) : embedding_(embedding) { embedding_.markTied(); }
 
-std::size_t TiedOutput::quantize() {
-    if (!quantized_.empty()) return 0;
-    quantized_ = QuantizedWeights::fromOutIn(embedding_.tokenTable());  // vocab x dim = out x in
-    input_ = Matrix();
-    return 1;
-}
-
 Matrix TiedOutput::forward(const Matrix& input, bool training) {
-    if (!quantized_.empty()) return quantized_.multiply(input);
+    if (embedding_.quantized()) return embedding_.quantizedTable().multiply(input);
     input_ = training ? input : Matrix();
     return input.matmulTranspose(embedding_.tokenTable());  // (N x D) * (V x D)^T
 }
 
 Matrix TiedOutput::backward(const Matrix& gradOutput) {
-    if (!quantized_.empty()) throw std::logic_error("TiedOutput: quantized layers are inference-only");
+    if (embedding_.quantized()) throw std::logic_error("TiedOutput: quantized layers are inference-only");
     // Runs before the embedding's backward, which then adds the lookup gradient.
     embedding_.tokenGradient() = gradOutput.transposeMatmul(input_);  // V x D
     return gradOutput * embedding_.tokenTable();
 }
 
 std::string TiedOutput::describe() const {
-    return "TiedOutput(" + std::to_string(embedding_.tokenTable().cols()) + " -> " +
-           std::to_string(embedding_.vocabSize()) + ", shares embedding" + (quantized_.empty() ? "" : ", int8") + ")";
+    return "TiedOutput(" + std::to_string(embedding_.outputSize(0)) + " -> " + std::to_string(embedding_.vocabSize()) +
+           ", shares embedding" + (embedding_.quantized() ? ", int8" : "") + ")";
 }
 
 // ---- RMSNorm ----------------------------------------------------------------------------
@@ -368,6 +371,34 @@ CausalSelfAttention::CausalSelfAttention(std::size_t dim, std::size_t heads, Seq
     bOutGrad_ = Matrix(1, dim);
 }
 
+std::vector<double> ropeFrequencies(std::size_t headDim, double base, const RopeScaling& s) {
+    const double pi = 3.14159265358979323846;
+    std::vector<double> freq(headDim / 2);
+    for (std::size_t i = 0; i < freq.size(); ++i) {
+        double f = std::pow(base, -2.0 * static_cast<double>(i) / static_cast<double>(headDim));
+        if (s.enabled()) {
+            const double context = static_cast<double>(s.originalContext), wavelength = 2.0 * pi / f;
+            const double longest = context / s.lowFreqFactor, shortest = context / s.highFreqFactor;
+            if (wavelength > longest) {
+                f /= s.factor;
+            } else if (wavelength >= shortest) {
+                const double smooth = (context / wavelength - s.lowFreqFactor) / (s.highFreqFactor - s.lowFreqFactor);
+                f = (1.0 - smooth) * f / s.factor + smooth * f;
+            }
+        }
+        freq[i] = f;
+    }
+    return freq;
+}
+
+void CausalSelfAttention::setRopeScaling(const RopeScaling& scaling) {
+    if (scaling.enabled() && (scaling.factor <= 0.0f || scaling.highFreqFactor <= scaling.lowFreqFactor || scaling.originalContext == 0))
+        throw std::invalid_argument("CausalSelfAttention: invalid RoPE scaling");
+    ropeScaling_ = scaling;
+    ropeCos_.clear();
+    ropeSin_.clear();
+}
+
 void CausalSelfAttention::ensureRopeTable(std::size_t positions) {
     const std::size_t half = headDim_ / 2;
     const std::size_t have = half ? ropeCos_.size() / half : 0;
@@ -375,10 +406,10 @@ void CausalSelfAttention::ensureRopeTable(std::size_t positions) {
     const std::size_t target = std::max(positions, have * 2);
     ropeCos_.resize(target * half);
     ropeSin_.resize(target * half);
+    const std::vector<double> freq = ropeFrequencies(headDim_, ropeBase_, ropeScaling_);
     for (std::size_t p = have; p < target; ++p)
         for (std::size_t i = 0; i < half; ++i) {
-            const double freq = std::pow(static_cast<double>(ropeBase_), -2.0 * static_cast<double>(i) / static_cast<double>(headDim_));
-            const double angle = static_cast<double>(p) * freq;
+            const double angle = static_cast<double>(p) * freq[i];
             ropeCos_[p * half + i] = static_cast<float>(std::cos(angle));
             ropeSin_[p * half + i] = static_cast<float>(std::sin(angle));
         }
@@ -662,6 +693,10 @@ void saveGPTConfig(const std::string& path, const GPTConfig& c) {
         << "\nmlp = " << (c.mlp == FeedForward::SwiGLU ? "swiglu" : "gelu")
         << "\ntie_embeddings = " << (c.tieEmbeddings ? 1 : 0) << "\nrope_base = " << c.ropeBase
         << "\nkv_heads = " << c.kvHeads << "\nnorm_eps = " << c.normEpsilon << "\nmlp_hidden = " << c.mlpHiddenSize << '\n';
+    if (c.ropeScaling.enabled())
+        out << "rope_scaling_factor = " << c.ropeScaling.factor << "\nrope_low_freq_factor = " << c.ropeScaling.lowFreqFactor
+            << "\nrope_high_freq_factor = " << c.ropeScaling.highFreqFactor
+            << "\nrope_original_context = " << c.ropeScaling.originalContext << '\n';
     if (!out) throw std::runtime_error("saveGPTConfig: write failed for " + path);
 }
 
@@ -700,6 +735,10 @@ GPTConfig loadGPTConfig(const std::string& path) {
             else if (key == "kv_heads") c.kvHeads = std::stoul(value);
             else if (key == "norm_eps") c.normEpsilon = std::stof(value);
             else if (key == "mlp_hidden") c.mlpHiddenSize = std::stoul(value);
+            else if (key == "rope_scaling_factor") c.ropeScaling.factor = std::stof(value);
+            else if (key == "rope_low_freq_factor") c.ropeScaling.lowFreqFactor = std::stof(value);
+            else if (key == "rope_high_freq_factor") c.ropeScaling.highFreqFactor = std::stof(value);
+            else if (key == "rope_original_context") c.ropeScaling.originalContext = std::stoul(value);
         } catch (const std::exception&) {
             throw std::runtime_error("loadGPTConfig: bad value for " + key + " in " + path);
         }
@@ -732,7 +771,8 @@ SequenceContextPtr buildGPT(Network& net, const GPTConfig& c) {
     for (std::size_t i = 0; i < c.layers; ++i) {
         auto& attention = net.add<Residual>();
         addNorm(attention);
-        attention.add<CausalSelfAttention>(c.dim, c.heads, context, rotary, c.ropeBase, c.kvHeads);
+        auto& selfAttention = attention.add<CausalSelfAttention>(c.dim, c.heads, context, rotary, c.ropeBase, c.kvHeads);
+        if (rotary) selfAttention.setRopeScaling(c.ropeScaling);
         if (c.dropout > 0.0f) attention.add<Dropout>(c.dropout);
 
         auto& mlp = net.add<Residual>();

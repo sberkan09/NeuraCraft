@@ -304,6 +304,12 @@ struct IncrementalScope {
 };
 } // namespace
 
+namespace {
+bool isStop(int token, const SamplingOptions& o) {
+    return token == o.stopToken || std::find(o.stopTokens.begin(), o.stopTokens.end(), token) != o.stopTokens.end();
+}
+} // namespace
+
 std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::size_t newTokens,
                           std::size_t contextLength, const SamplingOptions& options,
                           const std::shared_ptr<SequenceContext>& kvCache) {
@@ -321,7 +327,7 @@ std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::siz
             tokens.push_back(next);
             produced.push_back(next);
             if (options.onToken) options.onToken(next);
-            if (next == options.stopToken) break;
+            if (isStop(next, options)) break;
         }
         return produced;
     }
@@ -343,7 +349,7 @@ std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::siz
         tokens.push_back(next);
         produced.push_back(next);
         if (options.onToken) options.onToken(next);
-        if (step + 1 == newTokens || next == options.stopToken) break;
+        if (step + 1 == newTokens || isStop(next, options)) break;
         if (!sliding && kvCache->offset >= contextLength) {
             kvCache->offset = 0;  // cache full: rebuild from the most recent half window
             last = feed(tokens.size() - std::max<std::size_t>(1, contextLength / 2));

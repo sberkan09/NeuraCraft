@@ -3,6 +3,7 @@
 #include "Dense.h"
 #include "Json.h"
 #include "SafeTensors.h"
+#include "UnicodeTables.h"
 
 #include <algorithm>
 #include <cmath>
@@ -70,41 +71,8 @@ bool isSpace(std::uint32_t c) {
            (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
 }
 
-bool isNumber(std::uint32_t c) {
-    return (c >= '0' && c <= '9') || c == 0xB2 || c == 0xB3 || c == 0xB9 || (c >= 0xBC && c <= 0xBE) ||
-           (c >= 0x660 && c <= 0x669) || (c >= 0x6F0 && c <= 0x6F9) || (c >= 0x966 && c <= 0x96F) ||
-           (c >= 0x2070 && c <= 0x2079) || (c >= 0x2080 && c <= 0x2089) || (c >= 0x2150 && c <= 0x2189) ||
-           (c >= 0x2460 && c <= 0x249B) || (c >= 0xFF10 && c <= 0xFF19);
-}
-
-// Approximation of \p{L}: the letter blocks of the scripts GPT-2 users meet in
-// practice. Symbols, punctuation and emoji fall outside and count as "other".
-bool isLetter(std::uint32_t c) {
-    if (c < 0x80) return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-    if (c == 0xAA || c == 0xB5 || c == 0xBA) return true;
-    if (c >= 0xC0 && c <= 0x24F) return c != 0xD7 && c != 0xF7;  // Latin-1 / Extended-A/B (Turkish ç ğ ı ö ş ü)
-    if (c >= 0x250 && c <= 0x2C1) return true;                      // IPA, spacing modifiers (letter part)
-    if (c >= 0x2C6 && c <= 0x2D1) return true;
-    if (c >= 0x370 && c <= 0x3FF) return c != 0x37E && c != 0x387 && c != 0x375 && c != 0x3F6;  // Greek
-    if (c >= 0x400 && c <= 0x52F) return !(c >= 0x482 && c <= 0x489);  // Cyrillic
-    if (c >= 0x531 && c <= 0x587) return true;                          // Armenian
-    if (c >= 0x5D0 && c <= 0x5F2) return true;                          // Hebrew
-    if ((c >= 0x620 && c <= 0x64A) || (c >= 0x671 && c <= 0x6D3)) return true;  // Arabic
-    if (c >= 0x904 && c <= 0x939) return true;                          // Devanagari letters
-    if (c >= 0xE01 && c <= 0xE30) return true;                          // Thai
-    if (c >= 0x10A0 && c <= 0x10FF) return true;                        // Georgian
-    if (c >= 0x1100 && c <= 0x11FF) return true;                        // Hangul Jamo
-    if (c >= 0x1E00 && c <= 0x1FFF) return !(c >= 0x1FBD && c <= 0x1FC1) && !(c >= 0x1FCD && c <= 0x1FCF) &&
-                                           !(c >= 0x1FDD && c <= 0x1FDF) && !(c >= 0x1FED && c <= 0x1FEF) &&
-                                           c != 0x1FFD && c != 0x1FFE;
-    if (c >= 0x3041 && c <= 0x3096) return true;                        // Hiragana
-    if (c >= 0x30A1 && c <= 0x30FA) return true;                        // Katakana
-    if ((c >= 0x3400 && c <= 0x4DBF) || (c >= 0x4E00 && c <= 0x9FFF)) return true;  // CJK
-    if (c >= 0xAC00 && c <= 0xD7A3) return true;                        // Hangul syllables
-    if (c >= 0xFF21 && c <= 0xFF3A) return true;                        // Fullwidth Latin
-    if (c >= 0xFF41 && c <= 0xFF5A) return true;
-    return false;
-}
+bool isNumber(std::uint32_t c) { return unicodeIsNumber(c); }
+bool isLetter(std::uint32_t c) { return unicodeIsLetter(c); }
 
 enum class Kind { Space, Letter, Number, Other };
 
@@ -180,8 +148,9 @@ std::vector<std::string> Gpt2Tokenizer::splitWords(const std::string& text) {
     return words;
 }
 
-Gpt2Tokenizer::Gpt2Tokenizer(const std::string& vocabJsonPath, const std::string& mergesPath) {
-    // bytes_to_unicode(): printable bytes map to themselves, the rest to 256+.
+namespace {
+// GPT-2's bytes_to_unicode(): printable bytes map to themselves, the rest to 256+.
+void byteLevelTables(std::array<std::string, 256>& byteToUnicode_, std::unordered_map<std::uint32_t, unsigned char>& unicodeToByte_) {
     std::vector<int> printable;
     for (int b = '!'; b <= '~'; ++b) printable.push_back(b);
     for (int b = 0xA1; b <= 0xAC; ++b) printable.push_back(b);
@@ -196,6 +165,12 @@ Gpt2Tokenizer::Gpt2Tokenizer(const std::string& vocabJsonPath, const std::string
         byteToUnicode_[static_cast<std::size_t>(b)] = s;
         unicodeToByte_[cp] = static_cast<unsigned char>(b);
     }
+
+}
+} // namespace
+
+Gpt2Tokenizer::Gpt2Tokenizer(const std::string& vocabJsonPath, const std::string& mergesPath) {
+    byteLevelTables(byteToUnicode_, unicodeToByte_);
 
     const json::Value vocab = json::parse(readFile(vocabJsonPath));
     if (!vocab.isObject() || vocab.object.empty()) throw std::runtime_error("Gpt2Tokenizer: bad vocab.json");
@@ -290,6 +265,125 @@ std::string Gpt2Tokenizer::decode(const std::vector<int>& ids) const {
 
 // ---- Llama tokenizer ---------------------------------------------------------------------
 
+namespace {
+// The Llama 3 split pattern exactly as tokenizer.json spells it, and Qwen 2's
+// variant (single digits).
+const char* kLlama3Pattern =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+const char* kQwen2Pattern =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+// The bos token a TemplateProcessing post-processor puts in front of a single sequence.
+const json::Value* findTemplate(const json::Value* p) {
+    if (!p || !p->isObject()) return nullptr;
+    const json::Value* type = p->find("type");
+    if (type && type->string == "TemplateProcessing") return p;
+    if (const json::Value* list = p->find("processors"))
+        for (const auto& q : list->array)
+            if (const json::Value* t = findTemplate(&q)) return t;
+    return nullptr;
+}
+} // namespace
+
+std::vector<std::string> LlamaTokenizer::splitLlama3(const std::string& text, std::size_t maxDigits) {
+    struct Cp {
+        std::uint32_t cp;
+        std::size_t pos;
+        Kind kind;
+    };
+    std::vector<Cp> cps;
+    for (std::size_t i = 0; i < text.size();) {
+        std::size_t len = 1;
+        const std::uint32_t cp = decodeUtf8(text, i, len);
+        cps.push_back({cp, i, kindOf(cp)});
+        i += len;
+    }
+    std::vector<std::string> words;
+    const std::size_t n = cps.size();
+    auto emit = [&](std::size_t a, std::size_t b) {
+        const std::size_t begin = cps[a].pos, end = b < n ? cps[b].pos : text.size();
+        words.push_back(text.substr(begin, end - begin));
+    };
+    auto crlf = [&](std::size_t k) { return cps[k].cp == '\r' || cps[k].cp == '\n'; };
+    auto kind = [&](std::size_t k) { return cps[k].kind; };
+    // (?i:...) uses simple case folding: ASCII letters, plus U+017F (long s) for 's'.
+    auto fold = [](std::uint32_t c) -> std::uint32_t {
+        if (c >= 'A' && c <= 'Z') return c + 32;
+        return c == 0x17F ? 's' : c;
+    };
+    std::size_t i = 0;
+    while (i < n) {
+        // (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if (cps[i].cp == '\'' && i + 1 < n) {
+            const std::uint32_t a = fold(cps[i + 1].cp), b = i + 2 < n ? fold(cps[i + 2].cp) : 0;
+            std::size_t take = 0;
+            if (a == 's' || a == 't' || a == 'm' || a == 'd') take = 2;
+            else if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) take = 3;
+            if (take) {
+                emit(i, i + take);
+                i += take;
+                continue;
+            }
+        }
+        // [^\r\n\p{L}\p{N}]?\p{L}+
+        {
+            std::size_t j = i;
+            if (kind(i) != Kind::Letter && kind(i) != Kind::Number && !crlf(i)) j = i + 1;
+            if (j < n && kind(j) == Kind::Letter) {
+                std::size_t e = j;
+                while (e < n && kind(e) == Kind::Letter) ++e;
+                emit(i, e);
+                i = e;
+                continue;
+            }
+        }
+        // \p{N}{1,maxDigits}
+        if (kind(i) == Kind::Number) {
+            std::size_t e = i;
+            while (e < n && e - i < maxDigits && kind(e) == Kind::Number) ++e;
+            emit(i, e);
+            i = e;
+            continue;
+        }
+        // ' ?[^\s\p{L}\p{N}]+[\r\n]*'
+        {
+            std::size_t j = i;
+            if (cps[i].cp == ' ' && i + 1 < n && kind(i + 1) == Kind::Other) j = i + 1;
+            if (kind(j) == Kind::Other) {
+                std::size_t e = j;
+                while (e < n && kind(e) == Kind::Other) ++e;
+                while (e < n && crlf(e)) ++e;
+                emit(i, e);
+                i = e;
+                continue;
+            }
+        }
+        // Whitespace from here on. \s*[\r\n]+ ends at the last line break of the run.
+        std::size_t e = i;
+        while (e < n && kind(e) == Kind::Space) ++e;
+        std::size_t lastBreak = n;
+        for (std::size_t k = i; k < e; ++k)
+            if (crlf(k)) lastBreak = k;
+        if (lastBreak != n) {
+            emit(i, lastBreak + 1);
+            i = lastBreak + 1;
+            continue;
+        }
+        // \s+(?!\S) leaves the last space before a non-space, else \s+.
+        if (e == n) {
+            emit(i, e);
+            i = e;
+        } else if (e - i >= 2) {
+            emit(i, e - 1);
+            i = e - 1;
+        } else {
+            emit(i, i + 1);
+            i += 1;
+        }
+    }
+    return words;
+}
+
 LlamaTokenizer::LlamaTokenizer(const std::string& tokenizerJsonPath) {
     byteTokens_.fill(-1);
     const json::Value root = json::parse(readFile(tokenizerJsonPath));
@@ -311,6 +405,7 @@ LlamaTokenizer::LlamaTokenizer(const std::string& tokenizerJsonPath) {
         else if (m.isArray() && m.array.size() == 2) ranks_.emplace(m.array[0].string + " " + m.array[1].string, rank++);
         else throw std::runtime_error("LlamaTokenizer: bad merge entry");
     }
+    if (const json::Value* im = model.find("ignore_merges")) ignoreMerges_ = im->boolean;
     for (int b = 0; b < 256; ++b) {
         char name[8];
         std::snprintf(name, sizeof(name), "<0x%02X>", b);
@@ -327,14 +422,52 @@ LlamaTokenizer::LlamaTokenizer(const std::string& tokenizerJsonPath) {
             vocab_[content] = id;
         }
     }
+    special_.assign(idToToken_.size(), false);
+    for (const auto& s : specials_) special_[static_cast<std::size_t>(s.second)] = true;
     // Longest first, so overlapping names match greedily.
     std::sort(specials_.begin(), specials_.end(), [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
-    auto findId = [&](const char* name) { auto it = vocab_.find(name); return it == vocab_.end() ? -1 : it->second; };
-    bos_ = findId("<s>");
-    eos_ = findId("</s>");
-    unk_ = findId("<unk>");
 
-    // Normalizer: the Llama/Mistral one is Sequence[Prepend("▁"), Replace(" ", "▁")].
+    // Pre-tokenizer: none (SentencePiece style) or byte-level.
+    const json::Value* pre = root.find("pre_tokenizer");
+    if (pre && pre->isObject()) {
+        std::vector<const json::Value*> steps;
+        if (pre->at("type").string == "Sequence") for (const auto& s : pre->at("pretokenizers").array) steps.push_back(&s);
+        else steps.push_back(pre);
+        bool haveSplit = false, haveByteLevel = false;
+        for (const auto* s : steps) {
+            const std::string& type = s->at("type").string;
+            if (type == "Split") {
+                const json::Value* pattern = s->at("pattern").find("Regex");
+                const std::string regex = pattern ? pattern->string : std::string();
+                if (regex == kLlama3Pattern) maxDigits_ = 3;
+                else if (regex == kQwen2Pattern) maxDigits_ = 1;
+                else throw std::runtime_error("LlamaTokenizer: unsupported pre-tokenizer pattern " + regex);
+                if (s->find("behavior") && s->at("behavior").string != "Isolated")
+                    throw std::runtime_error("LlamaTokenizer: unsupported Split behavior");
+                if (s->find("invert") && s->at("invert").boolean)
+                    throw std::runtime_error("LlamaTokenizer: unsupported inverted Split");
+                split_ = Split::Llama3;
+                haveSplit = true;
+            } else if (type == "ByteLevel") {
+                haveByteLevel = true;
+                addPrefixSpace_ = s->find("add_prefix_space") && s->at("add_prefix_space").boolean;
+                const bool useRegex = !s->find("use_regex") || s->at("use_regex").boolean;
+                if (useRegex) {
+                    if (haveSplit) throw std::runtime_error("LlamaTokenizer: two pre-tokenizer patterns");
+                    split_ = Split::Gpt2;
+                    haveSplit = true;
+                }
+            } else {
+                throw std::runtime_error("LlamaTokenizer: unsupported pre-tokenizer '" + type + "'");
+            }
+        }
+        if (!haveByteLevel || !haveSplit)
+            throw std::runtime_error("LlamaTokenizer: only byte-level pre-tokenizers (Llama 3, GPT-2 style) are supported");
+        byteLevel_ = true;
+        byteLevelTables(byteToUnicode_, unicodeToByte_);
+    }
+
+    // Normalizer: the Llama/Mistral one is Sequence[Prepend("▁"), Replace(" ", "▁")]; byte-level models have none.
     prepend_.clear();
     replaceSpaces_ = false;
     const json::Value* norm = root.find("normalizer");
@@ -345,39 +478,37 @@ LlamaTokenizer::LlamaTokenizer(const std::string& tokenizerJsonPath) {
     }
     for (const auto* s : steps) {
         const std::string& type = s->at("type").string;
-        if (type == "Prepend") prepend_ = s->at("prepend").string;
-        else if (type == "Replace" && s->at("pattern").find("String") && s->at("pattern").at("String").string == " ")
+        if (!byteLevel_ && type == "Prepend") prepend_ = s->at("prepend").string;
+        else if (!byteLevel_ && type == "Replace" && s->at("pattern").find("String") &&
+                 s->at("pattern").at("String").string == " ")
             replaceSpaces_ = true;
         else throw std::runtime_error("LlamaTokenizer: unsupported normalizer step '" + type + "'");
     }
-    const json::Value* pre = root.find("pre_tokenizer");
-    if (pre && pre->isObject())
-        throw std::runtime_error("LlamaTokenizer: tokenizers with a pre_tokenizer (e.g. Llama 3) are not supported");
+
+    // bos: what the post-processor adds in front of a sequence; eos: the usual end markers.
+    bos_ = tokenId("<s>");
+    if (const json::Value* tmpl = findTemplate(root.find("post_processor"))) {
+        bos_ = -1;
+        const json::Value& single = tmpl->at("single");
+        if (!single.array.empty())
+            if (const json::Value* st = single.array.front().find("SpecialToken")) bos_ = tokenId(st->at("id").string);
+    }
+    for (const char* name : {"</s>", "<|eot_id|>", "<|end_of_text|>", "<|endoftext|>"})
+        if ((eos_ = tokenId(name)) >= 0) break;
+    unk_ = tokenId("<unk>");
+}
+
+int LlamaTokenizer::tokenId(const std::string& token) const {
+    auto it = vocab_.find(token);
+    return it == vocab_.end() ? -1 : it->second;
 }
 
 bool LlamaTokenizer::isSpecial(int id) const {
-    for (const auto& s : specials_)
-        if (s.second == id) return true;
-    return false;
+    return id >= 0 && static_cast<std::size_t>(id) < special_.size() && special_[static_cast<std::size_t>(id)];
 }
 
-std::vector<int> LlamaTokenizer::encodeSegment(const std::string& text) const {
-    std::vector<int> ids;
-    if (text.empty()) return ids;
-    std::string normalized = prepend_;
-    for (char c : text) {
-        if (replaceSpaces_ && c == ' ') normalized += "\xe2\x96\x81";
-        else normalized += c;
-    }
-    // BPE over UTF-8 characters.
-    std::vector<std::string> symbols;
-    for (std::size_t i = 0; i < normalized.size();) {
-        std::size_t len = 1;
-        decodeUtf8(normalized, i, len);
-        symbols.push_back(normalized.substr(i, len));
-        i += len;
-    }
-    for (;;) {
+void LlamaTokenizer::applyMerges(std::vector<std::string>& symbols) const {
+    while (symbols.size() > 1) {
         int best = std::numeric_limits<int>::max();
         std::size_t at = 0;
         for (std::size_t i = 0; i + 1 < symbols.size(); ++i) {
@@ -401,6 +532,59 @@ std::vector<int> LlamaTokenizer::encodeSegment(const std::string& text) const {
         }
         symbols = std::move(merged);
     }
+}
+
+std::vector<int> LlamaTokenizer::encodeByteLevelWord(const std::string& word) const {
+    auto hit = cache_.find(word);
+    if (hit != cache_.end()) return hit->second;
+    std::vector<std::string> symbols;
+    std::string mapped;
+    for (unsigned char b : word) {
+        symbols.push_back(byteToUnicode_[b]);
+        mapped += byteToUnicode_[b];
+    }
+    std::vector<int> ids;
+    auto whole = vocab_.find(mapped);
+    if (ignoreMerges_ && whole != vocab_.end()) {
+        ids.push_back(whole->second);
+    } else {
+        applyMerges(symbols);
+        for (const auto& s : symbols) {
+            auto it = vocab_.find(s);
+            if (it != vocab_.end()) ids.push_back(it->second);
+            else if (unk_ >= 0) ids.push_back(unk_);
+            else throw std::runtime_error("LlamaTokenizer: byte-level token missing from the vocabulary");
+        }
+    }
+    if (cache_.size() < 200000) cache_.emplace(word, ids);
+    return ids;
+}
+
+std::vector<int> LlamaTokenizer::encodeSegment(const std::string& text) const {
+    std::vector<int> ids;
+    if (text.empty()) return ids;
+    if (byteLevel_) {
+        const std::string input = addPrefixSpace_ && text[0] != ' ' ? " " + text : text;
+        for (const auto& w : split_ == Split::Llama3 ? splitLlama3(input, maxDigits_) : Gpt2Tokenizer::splitWords(input)) {
+            const auto part = encodeByteLevelWord(w);
+            ids.insert(ids.end(), part.begin(), part.end());
+        }
+        return ids;
+    }
+    std::string normalized = prepend_;
+    for (char c : text) {
+        if (replaceSpaces_ && c == ' ') normalized += "\xe2\x96\x81";
+        else normalized += c;
+    }
+    // BPE over UTF-8 characters.
+    std::vector<std::string> symbols;
+    for (std::size_t i = 0; i < normalized.size();) {
+        std::size_t len = 1;
+        decodeUtf8(normalized, i, len);
+        symbols.push_back(normalized.substr(i, len));
+        i += len;
+    }
+    applyMerges(symbols);
     for (const auto& s : symbols) {
         auto it = vocab_.find(s);
         if (it != vocab_.end()) {
@@ -444,9 +628,20 @@ std::string LlamaTokenizer::decodePiece(int id) const {
         throw std::out_of_range("LlamaTokenizer: id " + std::to_string(id) + " out of range");
     if (isSpecial(id)) return std::string();
     const std::string& tok = idToToken_[static_cast<std::size_t>(id)];
+    std::string out;
+    if (byteLevel_) {
+        for (std::size_t i = 0; i < tok.size();) {
+            std::size_t len = 1;
+            const std::uint32_t cp = decodeUtf8(tok, i, len);
+            auto it = unicodeToByte_.find(cp);
+            if (it != unicodeToByte_.end()) out += static_cast<char>(it->second);
+            else out += tok.substr(i, len);
+            i += len;
+        }
+        return out;
+    }
     if (tok.size() == 6 && tok.compare(0, 3, "<0x") == 0 && tok[5] == '>')  // byte token
         return std::string(1, static_cast<char>(std::stoi(tok.substr(3, 2), nullptr, 16)));
-    std::string out;
     for (std::size_t i = 0; i < tok.size();) {
         if (tok.compare(i, 3, "\xe2\x96\x81") == 0) {
             out += ' ';
@@ -615,8 +810,6 @@ PretrainedModel loadLlama(const std::string& directory, bool int8) {
         throw std::runtime_error("loadLlama: model_type is '" + type + "', expected llama or mistral");
     if (const json::Value* act = c.find("hidden_act"); act && act->string != "silu")
         throw std::runtime_error("loadLlama: activation '" + act->string + "' is not supported (silu only)");
-    if (const json::Value* rs = c.find("rope_scaling"); rs && rs->type != json::Value::Type::Null)
-        throw std::runtime_error("loadLlama: rope_scaling is not supported");
     if (const json::Value* ab = c.find("attention_bias"); ab && ab->boolean)
         throw std::runtime_error("loadLlama: attention biases are not supported");
     if (const json::Value* sw = c.find("sliding_window"); sw && sw->isNumber())
@@ -635,6 +828,17 @@ PretrainedModel loadLlama(const std::string& directory, bool int8) {
     cfg.ropeBase = static_cast<float>(c.numberOr("rope_theta", 10000.0));
     cfg.tieEmbeddings = c.find("tie_word_embeddings") && c.at("tie_word_embeddings").boolean;
     cfg.dropout = 0.0f;
+    if (const json::Value* rs = c.find("rope_scaling"); rs && rs->isObject()) {
+        const json::Value* kind = rs->find("rope_type");
+        if (!kind) kind = rs->find("type");
+        const std::string name = kind ? kind->string : std::string();
+        if (name != "llama3")
+            throw std::runtime_error("loadLlama: rope_scaling type '" + name + "' is not supported (llama3 only)");
+        cfg.ropeScaling.factor = static_cast<float>(rs->at("factor").number);
+        cfg.ropeScaling.lowFreqFactor = static_cast<float>(rs->numberOr("low_freq_factor", 1.0));
+        cfg.ropeScaling.highFreqFactor = static_cast<float>(rs->numberOr("high_freq_factor", 4.0));
+        cfg.ropeScaling.originalContext = static_cast<std::size_t>(rs->numberOr("original_max_position_embeddings", 8192));
+    }
     if (const json::Value* hd = c.find("head_dim"); hd && hd->isNumber() && static_cast<std::size_t>(hd->number) * cfg.heads != cfg.dim)
         throw std::runtime_error("loadLlama: head_dim * heads must equal hidden_size");
 
@@ -652,6 +856,7 @@ PretrainedModel loadLlama(const std::string& directory, bool int8) {
     Matrix table = files.load("model.embed_tokens.weight");
     expectShape(table, V, D, "embed_tokens");
     emb.tokenTable() = std::move(table);
+    if (int8) emb.quantize();  // right away, so the float table never coexists with the layers; a tied head reuses it
 
     for (std::size_t i = 0; i < cfg.layers; ++i) {
         const std::string p = "model.layers." + std::to_string(i) + ".";
@@ -691,14 +896,24 @@ PretrainedModel loadLlama(const std::string& directory, bool int8) {
     Matrix gf = files.load("model.norm.weight");
     expectShape(gf, 1, D, "model.norm");
     layerAs<RMSNorm>(net, 1 + 2 * cfg.layers, "final norm").gamma() = std::move(gf);
-    if (cfg.tieEmbeddings) {
-        if (int8) net.layer(2 + 2 * cfg.layers).quantize();
-    } else {
+    if (!cfg.tieEmbeddings) {
         const Matrix head = files.load("lm_head.weight");
         expectShape(head, V, D, "lm_head");
         setDense(layerAs<Dense>(net, 2 + 2 * cfg.layers, "lm_head"), head, int8);
     }
     net.releaseGradients();
+
+    // Generation stops at any end-of-sequence id (Llama 3 lists several).
+    auto addStops = [&](const json::Value* v) {
+        if (!v) return;
+        if (v->isNumber()) model.stopTokens.push_back(static_cast<int>(v->number));
+        for (const auto& e : v->array) model.stopTokens.push_back(static_cast<int>(e.number));
+    };
+    if (std::ifstream(directory + "/generation_config.json")) {
+        const json::Value g = json::parse(readFile(directory + "/generation_config.json"));
+        addStops(g.find("eos_token_id"));
+    }
+    if (model.stopTokens.empty()) addStops(c.find("eos_token_id"));
     return model;
 }
 

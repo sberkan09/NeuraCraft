@@ -42,34 +42,62 @@ private:
     mutable std::unordered_map<std::string, std::vector<int>> cache_;
 };
 
-// Llama / Mistral SentencePiece-style BPE tokenizer from a Hugging Face
-// `tokenizer.json`: special tokens are split out first, each piece of text is
-// normalized (prepend "▁", spaces -> "▁"), BPE merges run over characters, and
-// characters missing from the vocabulary fall back to <0xXX> byte tokens.
+// Tokenizer from a Hugging Face `tokenizer.json`, in either of the two forms
+// Llama-family models use:
+//  - SentencePiece style (Llama 1/2, TinyLlama, Mistral): each piece of text is
+//    normalized (prepend "▁", spaces -> "▁"), BPE merges run over characters,
+//    and characters missing from the vocabulary fall back to <0xXX> tokens.
+//  - Byte-level BPE (Llama 3, also GPT-2-style tokenizer.json files): text is
+//    split with the model's regex pre-tokenizer (implemented by hand for the
+//    Llama 3 and GPT-2 patterns), bytes are mapped to printable characters,
+//    and whole words already in the vocabulary skip the merges when the model
+//    sets `ignore_merges`.
+// In both, added (special) tokens are split out of the text first.
+// encode() caches per-word results in byte-level mode (not thread-safe).
 class LlamaTokenizer : public Tokenizer {
 public:
     explicit LlamaTokenizer(const std::string& tokenizerJsonPath);
 
-    // Special token names in the text (e.g. "</s>") become their ids.
+    // Special token names in the text (e.g. "</s>", "<|eot_id|>") become their ids.
     std::vector<int> encode(const std::string& text) const override { return encode(text, false); }
+    // addBos prepends the token the tokenizer's post-processor adds (<s>, <|begin_of_text|>).
     std::vector<int> encode(const std::string& text, bool addBos) const;
     std::string decode(const std::vector<int>& ids) const override;  // skips special tokens
     std::string decodePiece(int id) const;  // one token, for streaming (no leading-space strip)
     std::size_t vocabSize() const override { return idToToken_.size(); }
     int bos() const { return bos_; }
     int eos() const { return eos_; }
+    int tokenId(const std::string& token) const;  // -1 if absent
     bool isSpecial(int id) const;
+    bool byteLevel() const { return byteLevel_; }
+
+    // Llama 3 pre-tokenization (exposed for tests): the regex
+    // (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+    // maxDigits = 1 gives the Qwen 2 variant (\p{N} instead of \p{N}{1,3}).
+    static std::vector<std::string> splitLlama3(const std::string& text, std::size_t maxDigits = 3);
 
 private:
+    enum class Split { Gpt2, Llama3 };
     std::vector<int> encodeSegment(const std::string& text) const;
+    std::vector<int> encodeByteLevelWord(const std::string& word) const;
+    void applyMerges(std::vector<std::string>& symbols) const;
 
     std::unordered_map<std::string, int> vocab_;
     std::vector<std::string> idToToken_;
     std::unordered_map<std::string, int> ranks_;  // "left right" -> merge rank
     std::vector<std::pair<std::string, int>> specials_;  // added tokens matched verbatim
+    std::vector<bool> special_;                  // by id
     std::array<int, 256> byteTokens_{};          // <0xXX> ids, -1 if absent
     std::string prepend_ = "\xe2\x96\x81";      // "▁"
     bool replaceSpaces_ = true;
+    bool byteLevel_ = false;
+    bool ignoreMerges_ = false;
+    bool addPrefixSpace_ = false;
+    Split split_ = Split::Llama3;
+    std::size_t maxDigits_ = 3;
+    std::array<std::string, 256> byteToUnicode_;
+    std::unordered_map<std::uint32_t, unsigned char> unicodeToByte_;
+    mutable std::unordered_map<std::string, std::vector<int>> cache_;
     int bos_ = -1, eos_ = -1, unk_ = -1;
 };
 
@@ -77,6 +105,7 @@ struct PretrainedModel {
     Network net;
     SequenceContextPtr context;  // pass to generate() for the KV cache
     GPTConfig config;
+    std::vector<int> stopTokens;  // end-of-turn ids from generation_config.json / config.json (Llama)
 };
 
 // Loads a Hugging Face GPT-2 checkpoint directory (config.json +

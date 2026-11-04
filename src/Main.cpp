@@ -959,6 +959,7 @@ void usage() {
               << "  NeuraCraft video <dir> zoom \"prompt\" ... [-o out.gif] [--frames N] [--zoom Z] [--pan DX,DY] [--rotate DEG]\n"
               << "  NeuraCraft video <dir> t2v \"prompt\" [-o out.gif] [--frames 16] [--steps 4] [--seed S] [--motion file] [--guidance G]\n"
               << "        [--context 16 --overlap 4] [--init image.png | --init-dir frames/] [--strength 0.75]\n"
+              << "        [--prompt-at FRAME:prompt ...]   (prompt travel)\n"
               << "  video output: .gif (256 colours), .png (animated PNG, full colour) or .mov (QuickTime Motion-JPEG)\n"
               << "        [--strength S] [--steps N] [--start in.png] [--seed S] [--size N] [--frames-dir DIR] [--full-vae]\n"
               << "        [--sharpen A] [--noise N] [--no-color-match]\n"
@@ -1196,6 +1197,12 @@ int main(int argc, char** argv) {
                     zo.dy = std::stof(parts[1]);
                 } else if (a == "--rotate") zo.rotate = std::stof(value());
                 else if (a == "--strength") zo.strength = vo.strength = std::stof(value());
+                else if (a == "--prompt-at") {  // FRAME:prompt
+                    const std::string s = value();
+                    const std::size_t colon = s.find(':');
+                    if (colon == std::string::npos) throw std::invalid_argument("--prompt-at takes FRAME:prompt");
+                    vo.promptAt.emplace_back(std::stoul(s.substr(0, colon)), s.substr(colon + 1));
+                }
                 else if (a == "--context") vo.context = std::stoul(value());
                 else if (a == "--overlap") vo.overlap = std::stoul(value());
                 else if (a == "--init") vo.init.push_back(loadImage(value()));

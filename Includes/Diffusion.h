@@ -96,6 +96,8 @@ public:
     // temporal attention mixes the frames after every spatial block; without,
     // each row is forward() of that frame.
     Matrix forwardFrames(const Matrix& latents, float timestep, const Matrix& context);
+    // ... with one text condition per frame (prompt travel), or a single one for all.
+    Matrix forwardFrames(const Matrix& latents, float timestep, const std::vector<Matrix>& contexts);
     ImageShape latentShape() const;
     std::size_t contextDim() const;
     std::size_t parameterCount() const;
@@ -258,6 +260,10 @@ struct TextToVideoOptions {
     // frame noised to the sigma of step steps - steps * strength.
     std::vector<Image> init;
     float strength = 0.75f;
+    // Prompt travel: (frame, prompt) keyframes after the main prompt (frame
+    // 0); each frame's text condition is interpolated between the keyframes
+    // around it, so the scene changes over the clip.
+    std::vector<std::pair<std::size_t, std::string>> promptAt;
     std::size_t steps = 4;                  // AnimateDiff-Lightning: the step count the module was distilled for
     unsigned seed = 0;
     float guidance = 1.0f;                  // <= 1: off (Lightning); else classifier-free guidance

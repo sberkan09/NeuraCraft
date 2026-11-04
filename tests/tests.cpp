@@ -3072,6 +3072,15 @@ TEST(animatediff_motion_modules_and_text_to_video) {
     CHECK(diff > 1e-3 && plainDiff < 1e-6);
     CHECK(unet.forwardFrames(latents, 500.0f, ctx).values() == mixed.values());  // deterministic
     CHECK_THROWS(unet.forwardFrames(Matrix(33, n), 500.0f, ctx), std::invalid_argument);
+    // Per-frame text conditions: identical ones equal the shared one; another one changes its frame.
+    CHECK(unet.forwardFrames(latents, 500.0f, std::vector<Matrix>(F, ctx)).values() == mixed.values());
+    std::vector<Matrix> travel(F, ctx);
+    travel[3] = Matrix::uniform(8, 6, -1.0f, 1.0f);
+    const Matrix travelled = unet.forwardFrames(latents, 500.0f, travel);
+    double changed3 = 0;
+    for (std::size_t k = 0; k < n; ++k) changed3 += std::abs(travelled(3, k) - mixed(3, k));
+    CHECK(changed3 > 1e-3);
+    CHECK_THROWS(unet.forwardFrames(latents, 500.0f, std::vector<Matrix>(2, ctx)), std::invalid_argument);
     // An adapter without the mid block module (AnimateDiff v1) is refused.
     auto v1 = tinyMotionWeights({8, 16}, 1);
     for (auto it = v1.begin(); it != v1.end();) it = it->first.rfind("mid_block", 0) == 0 ? v1.erase(it) : std::next(it);
@@ -3092,6 +3101,13 @@ TEST(animatediff_motion_modules_and_text_to_video) {
     CHECK(stages == std::vector<std::string>({"text encoder", "load unet + motion", "step 1/2", "step 2/2", "vae decode"}));
     o.progress = nullptr;
     CHECK(textToVideo(dir, "hello he", o)[2].pixels == video[2].pixels);
+    // Prompt travel: frame 0 keeps the main prompt, later frames move towards the keyframe.
+    o.promptAt = {{2, "he"}};
+    const auto travelVideo = textToVideo(dir, "hello he", o);
+    CHECK(travelVideo.size() == 3 && travelVideo[2].pixels != video[2].pixels);
+    o.promptAt = {{3, "he"}};
+    CHECK_THROWS(textToVideo(dir, "hello he", o), std::invalid_argument);
+    o.promptAt.clear();
     o.seed = 9;
     CHECK(textToVideo(dir, "hello he", o)[0].pixels != video[0].pixels);
     // Longer than the context: overlapping windows, same frame count and size.

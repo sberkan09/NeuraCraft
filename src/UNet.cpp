@@ -457,18 +457,26 @@ std::size_t UNet2DCondition::parameterCount() const { return impl_->params; }
 bool UNet2DCondition::hasMotionModules() const { return impl_->midMotion != nullptr; }
 
 Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, const Matrix& context) {
+    return forwardFrames(latents, timestep, std::vector<Matrix>{context});
+}
+
+Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, const std::vector<Matrix>& contexts) {
     Impl& m = *impl_;
     const std::size_t F = latents.rows();
     if (F == 0 || latents.cols() != m.latent.size())
         throw std::invalid_argument("UNet2DCondition::forwardFrames: expected F x " + std::to_string(m.latent.size()) + " latents");
-    if (context.cols() != m.contextDim)
-        throw std::invalid_argument("UNet2DCondition::forwardFrames: context must have " + std::to_string(m.contextDim) + " columns");
+    if (contexts.size() != 1 && contexts.size() != F)
+        throw std::invalid_argument("UNet2DCondition::forwardFrames: give one context or one per frame");
+    for (const Matrix& c : contexts)
+        if (c.cols() != m.contextDim)
+            throw std::invalid_argument("UNet2DCondition::forwardFrames: context must have " + std::to_string(m.contextDim) + " columns");
+    auto ctx = [&](std::size_t f) -> const Matrix& { return contexts[contexts.size() == 1 ? 0 : f]; };
     Matrix out(F, m.latent.size());
     if (!hasMotionModules()) {
         for (std::size_t f = 0; f < F; ++f) {
             Matrix one(1, m.latent.size());
             std::copy(latents.data() + f * one.size(), latents.data() + (f + 1) * one.size(), one.data());
-            const Matrix eps = forward(one, timestep, context);
+            const Matrix eps = forward(one, timestep, ctx(f));
             std::copy(eps.data(), eps.data() + eps.size(), out.data() + f * eps.size());
         }
         return out;
@@ -488,10 +496,13 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
     auto each = [&](auto&& fn) {
         for (Matrix& x : h) x = fn(x);
     };
+    auto attend = [&](CrossTransformer& a) {
+        for (std::size_t f = 0; f < F; ++f) h[f] = a.forward(h[f], ctx(f));
+    };
     for (auto& d : m.downs) {
         for (std::size_t j = 0; j < d.resnets.size(); ++j) {
             each([&](const Matrix& x) { return d.resnets[j]->forward(x, temb); });
-            if (!d.attentions.empty()) each([&](const Matrix& x) { return d.attentions[j]->forward(x, context); });
+            if (!d.attentions.empty()) attend(*d.attentions[j]);
             d.motions[j]->forward(h);
             skips.push_back(h);
         }
@@ -501,7 +512,7 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
         }
     }
     each([&](const Matrix& x) { return m.mid1->forward(x, temb); });
-    each([&](const Matrix& x) { return m.midAttention->forward(x, context); });
+    attend(*m.midAttention);
     m.midMotion->forward(h);
     each([&](const Matrix& x) { return m.mid2->forward(x, temb); });
     for (auto& u : m.ups) {
@@ -509,7 +520,7 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
             std::vector<Matrix>& s = skips.back();
             for (std::size_t f = 0; f < F; ++f) h[f] = u.resnets[j]->forward(concatChannels(h[f], s[f]), temb);
             skips.pop_back();
-            if (!u.attentions.empty()) each([&](const Matrix& x) { return u.attentions[j]->forward(x, context); });
+            if (!u.attentions.empty()) attend(*u.attentions[j]);
             u.motions[j]->forward(h);
         }
         if (u.upsample) each([&](const Matrix& x) { return u.upConv->forward(u.upsample->forward(x, false), false); });
@@ -955,7 +966,45 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
                 }
         if (motion.empty()) throw std::runtime_error("textToVideo: no motion module (.safetensors) in " + md);
     }
-    const auto context = encodePrompts(dir, prompt, o);
+    // Text conditions: one for all frames, or per frame between prompt-travel keyframes.
+    std::vector<Matrix> conds;
+    Matrix uncond;
+    {
+        auto te = PipelineClock::now();
+        const ClipTokenizer tok = ClipTokenizer::fromDirectory(dir + "/tokenizer");
+        ClipTextEncoder enc = loadClipTextEncoder(dir, o.int8);
+        int pad = tok.endOfText();
+        if (std::ifstream(dir + "/tokenizer/tokenizer_config.json")) {
+            const json::Value c = json::parse(readFile(dir + "/tokenizer/tokenizer_config.json"));
+            if (const json::Value* p = c.find("pad_token"); p && p->isString() && p->string == "!") pad = 0;
+        }
+        auto encode = [&](const std::string& s) { return enc.encode(tok.encodeForModel(s, enc.length, pad)); };
+        std::vector<std::pair<std::size_t, Matrix>> keys{{0, encode(prompt)}};
+        std::vector<std::pair<std::size_t, std::string>> at = v.promptAt;
+        std::sort(at.begin(), at.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& [frame, text] : at) {
+            if (frame == 0 || frame >= v.frames) throw std::invalid_argument("textToVideo: prompt keyframes must be in 1..frames-1");
+            if (frame == keys.back().first) throw std::invalid_argument("textToVideo: two prompts at frame " + std::to_string(frame));
+            keys.emplace_back(frame, encode(text));
+        }
+        if (keys.size() == 1) conds.push_back(keys[0].second);
+        else
+            for (std::size_t f = 0; f < v.frames; ++f) {
+                std::size_t k = 0;
+                while (k + 1 < keys.size() && keys[k + 1].first <= f) ++k;
+                if (k + 1 == keys.size()) {
+                    conds.push_back(keys[k].second);
+                    continue;
+                }
+                const float w = static_cast<float>(f - keys[k].first) / static_cast<float>(keys[k + 1].first - keys[k].first);
+                Matrix c = keys[k].second;
+                const Matrix& b = keys[k + 1].second;
+                for (std::size_t i = 0; i < c.size(); ++i) c.data()[i] += w * (b.data()[i] - c.data()[i]);
+                conds.push_back(std::move(c));
+            }
+        if (o.guidance > 1.0f) uncond = encode(o.negativePrompt);
+        reportStage(o, "text encoder", te);
+    }
     auto t = PipelineClock::now();
     UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8);
     loadMotionModules(unet, motion, o.int8);
@@ -999,14 +1048,15 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
         }
         starts.push_back(s);
     }
-    auto predict = [&](const Matrix& in, float timestep, const Matrix& ctx) {
+    auto predict = [&](const Matrix& in, float timestep, const std::vector<Matrix>& ctx) {
         if (starts.size() == 1) return unet.forwardFrames(in, timestep, ctx);
         Matrix sum(F, n);
         std::vector<float> weight(F, 0.0f);
         for (std::size_t s : starts) {
             Matrix win(ctxLen, n);
             std::copy(in.data() + s * n, in.data() + (s + ctxLen) * n, win.data());
-            const Matrix e = unet.forwardFrames(win, timestep, ctx);
+            const Matrix e = unet.forwardFrames(
+                win, timestep, ctx.size() == 1 ? ctx : std::vector<Matrix>(ctx.begin() + static_cast<long>(s), ctx.begin() + static_cast<long>(s + ctxLen)));
             for (std::size_t f = 0; f < ctxLen; ++f) {
                 // Pyramid weights: frames near a window's middle count most.
                 const float wgt = static_cast<float>(std::min(f + 1, ctxLen - f));
@@ -1027,10 +1077,10 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
         Matrix in = latents;
         const float scale = static_cast<float>(sched.inputScale(i));
         for (float& x : in.values()) x *= scale;
-        Matrix eps = predict(in, static_cast<float>(sched.timesteps[i]), context.first);
+        Matrix eps = predict(in, static_cast<float>(sched.timesteps[i]), conds);
         if (o.guidance > 1.0f) {
-            const Matrix uncond = predict(in, static_cast<float>(sched.timesteps[i]), context.second);
-            for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + o.guidance * (eps.data()[k] - uncond.data()[k]);
+            const Matrix un = predict(in, static_cast<float>(sched.timesteps[i]), std::vector<Matrix>{uncond});
+            for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = un.data()[k] + o.guidance * (eps.data()[k] - un.data()[k]);
         }
         sched.step(i, eps, latents);
         reportStage(o, "step " + std::to_string(i + 1) + "/" + std::to_string(sched.timesteps.size()), t);

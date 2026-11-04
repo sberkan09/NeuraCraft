@@ -77,7 +77,7 @@ $ ./build_and_run.sh generate data/shakespeare.txt "ROMEO:" 200
 ```
 
 `gpt` trains a decoder (default: 4 layers, 4 heads, dim 128, context 64
-tokens) on any text file, prints a sample after every epoch and saves
+tokens, modern architecture) on any text file, prints a sample after every epoch and saves
 `<file>.gpt.weights`, `.gpt.config`, `.gpt.tokenizer` and a
 `.gpt.checkpoint` (weights + Adam state + step + random state, written after
 every epoch); `generate` rebuilds the model from the config and samples with
@@ -85,7 +85,30 @@ temperature 0.8, top-k 20. Training clips the global gradient norm to 1;
 `--cosine` adds linear warmup and cosine decay of the learning rate over the
 whole run (`--lr` is the peak). For a short run a constant rate is better:
 over 2 epochs it reaches 1.817 per character, cosine 1.894 (peak 1e-3) or 1.842
-(peak 2e-3), because the rate decays before the model has learned enough. `--resume` continues from the checkpoint, and a resumed run
+(peak 2e-3), because the rate decays before the model has learned enough.
+Over 6 epochs the picture flips: cosine with peak 2e-3 ends at **1.589**,
+the constant rate at 1.604.
+
+Two architectures are available (`--arch`):
+
+| | classic (GPT-2) | modern (Llama-style, default) |
+|---|---|---|
+| positions | learned table | rotary (RoPE) in attention |
+| normalization | LayerNorm | RMSNorm |
+| MLP | GELU, 4× wide | SwiGLU, same parameter count |
+| output layer | separate | tied to the embedding |
+| parameters (BPE 512) | 0.93 M | 0.86 M |
+| val loss / char after 2 epochs | 1.817 | **1.713** |
+| time / epoch | 86 s | 79 s |
+
+With RoPE, attention scores depend only on relative distance, so the KV
+cache can simply slide once the context is full (sliding-window attention, as
+in Mistral). For a single layer that is identical to recomputing the last 64
+tokens; deeper layers also carry information from beyond the window. Measured
+on the trained model over 1136 tokens past the window, mean next-token loss is
+3.1048 sliding vs 3.1046 recomputing (and 3.0973 when rebuilding from the
+last half window), so the O(1) sliding cache costs nothing in quality. Models
+with learned positions rebuild the cache from its last half instead. `--resume` continues from the checkpoint, and a resumed run
 is bit-for-bit identical to one that never stopped; asking for more epochs
 than originally planned stretches the cosine curve from that point. The default tokenizer is byte-level BPE with 512
 tokens (learned from the file in under a second); `char` uses one token per
@@ -232,7 +255,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Matrix | `Matrix.h` | Row-major float matrix: products (incl. `AᵀB`, `ABᵀ`), element-wise ops, broadcasting, reductions, row gather/slice |
 | Layers | `Dense.h`, `Activations.h`, `Conv.h` | `Dense` (Xavier / He / zero init), `Conv2D` (stride, padding; im2col + GEMM), `MaxPool2D`, `ReLU`, `LeakyReLU`, `Sigmoid`, `Tanh`, `Softmax`, `Dropout` |
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
-| Transformer | `Transformer.h` | `TokenEmbedding` (token + learned positions), `LayerNorm`, `GELU`, multi-head `CausalSelfAttention`, `Residual` blocks, `buildGPT()` |
+| Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
 | Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |
 | Network | `Network.h` | `add<Layer>(...)`, `fit` (mini-batches, shuffling, validation, accuracy, LR schedule, gradient clipping, step limits, callbacks), `predict`, `evaluate`, `accuracy`, `summary`, `save` / `load`, `saveCheckpoint` / `loadCheckpoint` (exact resume) |
@@ -267,8 +290,11 @@ dropout statistics, XOR training, save/load, CSV and IDX loading, every GEMM
 backend against a double-precision reference (all transpose combinations,
 ragged sizes), CPU-vs-GPU training equivalence, the thread pool, gradient
 checks for convolution, pooling, LayerNorm, GELU, attention and a whole GPT,
-attention causality, KV-cached inference against the full forward pass, and a
-GPT that memorizes and regenerates a sequence. CI runs
+attention causality, KV-cached inference against the full forward pass,
+RMSNorm, SwiGLU, rotary attention and a whole modern GPT (gradient checks),
+RoPE's relative-position invariance, exact sliding-cache generation far past
+the window, exact checkpoint resume, and GPTs (both architectures) that
+memorize and regenerate a sequence. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
 kernels).
 

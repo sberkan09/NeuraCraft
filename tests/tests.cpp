@@ -822,6 +822,205 @@ TEST(gpt_memorizes_a_sequence_and_generates_it) {
     CHECK(generate(net, tok.encode("a"), 20, cfg.contextLength, sampled).size() == 20);
 }
 
+// ---- Modern transformer parts ----------------------------------------------------------------
+
+TEST(rmsnorm_and_swiglu_gradcheck) {
+    setSeed(60);
+    Network net;
+    net.add<Dense>(4, 8);
+    net.add<RMSNorm>(8);
+    net.add<SwiGLUGate>();
+    net.add<Dense>(4, 2);
+    MSE loss;
+    gradientCheck(net, loss, Matrix::uniform(5, 4, -1.5f, 1.5f), Matrix::uniform(5, 2, -1, 1));
+
+    RMSNorm rms(2);
+    CHECK(rms.forward(Matrix{{3, 4}}, false).approxEquals(Matrix{{3 / std::sqrt(12.5f), 4 / std::sqrt(12.5f)}}, 1e-5f));
+    CHECK(SwiGLUGate().forward(Matrix{{0, 5}}, false).approxEquals(Matrix{{0}}));
+}
+
+TEST(rotary_attention_gradcheck) {
+    setSeed(61);
+    auto ctx = std::make_shared<SequenceContext>();
+    ctx->length = 3;
+    Network net;
+    auto& block = net.add<Residual>();
+    block.add<RMSNorm>(8);
+    block.add<CausalSelfAttention>(8, 2, ctx, true);
+    net.add<Dense>(8, 3);
+    MSE loss;
+    gradientCheck(net, loss, Matrix::uniform(6, 8, -1, 1), Matrix::uniform(6, 3, -1, 1));
+    CHECK_THROWS(CausalSelfAttention(6, 2, ctx, true), std::invalid_argument);  // odd head size
+}
+
+TEST(rotary_scores_depend_on_relative_position_only) {
+    // The same tokens at shifted absolute positions give the same outputs.
+    setSeed(62);
+    auto ctx = std::make_shared<SequenceContext>();
+    CausalSelfAttention att(8, 2, ctx, true);
+    const Matrix x = Matrix::uniform(4, 8, -1, 1);
+    ctx->incremental = true;
+    ctx->offset = 0;
+    const Matrix at0 = att.forward(x, false);
+    // Prime the cache with 7 unrelated positions, then drop them with a window.
+    ctx->offset = 0;
+    att.forward(Matrix::uniform(7, 8, -1, 1), false);
+    ctx->offset = 7;
+    ctx->window = 4;  // keeps only the 4 new rows
+    const Matrix at7 = att.forward(x, false);
+    ctx->incremental = false;
+    ctx->offset = 0;
+    ctx->window = 0;
+    CHECK(at0.approxEquals(at7, 1e-4f));
+}
+
+namespace {
+Network modernGpt(SequenceContextPtr& ctx, std::size_t context = 16) {
+    GPTConfig cfg;
+    cfg.vocabSize = 11;
+    cfg.contextLength = context;
+    cfg.dim = 16;
+    cfg.heads = 4;
+    cfg.layers = 2;
+    cfg.modern();
+    Network net;
+    ctx = buildGPT(net, cfg);
+    return net;
+}
+} // namespace
+
+TEST(modern_gpt_gradcheck_and_tied_parameters) {
+    setSeed(63);
+    GPTConfig cfg;
+    cfg.vocabSize = 5;
+    cfg.contextLength = 4;
+    cfg.dim = 8;
+    cfg.heads = 2;
+    cfg.layers = 1;
+    cfg.mlpRatio = 2;
+    cfg.modern();
+    Network net;
+    buildGPT(net, cfg);
+    auto& emb = dynamic_cast<TokenEmbedding&>(net.layer(0));
+    emb.tokenTable() = Matrix::uniform(cfg.vocabSize, cfg.dim, -1, 1);
+    SparseSoftmaxCrossEntropy loss;
+    gradientCheck(net, loss, Matrix{{0, 3, 1, 4}, {2, 2, 0, 1}}, Matrix{{3, 1, 4, 0}, {2, 0, 1, 3}});
+
+    // Tied output adds no parameters; there is no position table.
+    GPTConfig untied = cfg;
+    untied.tieEmbeddings = false;
+    Network other;
+    buildGPT(other, untied);
+    CHECK(other.parameterCount() == net.parameterCount() + cfg.dim * cfg.vocabSize + cfg.vocabSize);
+    CHECK(emb.parameters().size() == 1);
+    CHECK(cfg.mlpHidden() % 8 == 0);
+}
+
+namespace {
+// Largest logit difference between the incremental (sliding KV cache) path
+// and the uncached forward pass over the last `window` tokens, feeding `steps`
+// tokens one at a time after a 3-token prompt.
+float slidingCacheError(Network& net, SequenceContextPtr& ctx, std::size_t window, int steps) {
+    auto row = [](const std::vector<int>& toks, std::size_t from) {
+        Matrix x(1, toks.size() - from);
+        for (std::size_t i = from; i < toks.size(); ++i) x(0, i - from) = static_cast<float>(toks[i]);
+        return x;
+    };
+    std::vector<int> toks{1, 2, 3};
+    ctx->incremental = true;
+    ctx->offset = 0;
+    ctx->window = window;
+    net.predict(row(toks, 0));
+    ctx->offset = toks.size();
+    float worst = 0.0f;
+    for (int step = 0; step < steps; ++step) {
+        toks.push_back((step * 7 + 3) % 11);
+        const Matrix cached = net.predict(row(toks, toks.size() - 1));
+        ctx->offset += 1;
+        ctx->incremental = false;  // reference pass leaves the KV caches untouched
+        const Matrix full = net.predict(row(toks, toks.size() - std::min(window, toks.size())));
+        ctx->incremental = true;
+        const float* last = full.data() + (full.rows() - 1) * full.cols();
+        for (std::size_t j = 0; j < full.cols(); ++j) worst = std::max(worst, std::fabs(last[j] - cached.data()[j]));
+    }
+    ctx->incremental = false;
+    ctx->offset = 0;
+    ctx->window = 0;
+    return worst;
+}
+} // namespace
+
+TEST(modern_kv_cache_slides) {
+    // One layer: rotary scores depend only on relative distance, so the sliding
+    // cache equals recomputing the window, even 40 tokens past an 8-token window.
+    setSeed(64);
+    GPTConfig one;
+    one.vocabSize = 11;
+    one.contextLength = 8;
+    one.dim = 16;
+    one.heads = 4;
+    one.layers = 1;
+    one.modern();
+    Network shallow;
+    SequenceContextPtr ctx1 = buildGPT(shallow, one);
+    CHECK(slidingCacheError(shallow, ctx1, 8, 40) < 1e-3f);
+
+    // Deeper models: exact while the text fits the window. Past it, later layers
+    // keep information from beyond the window (sliding-window attention), so
+    // they legitimately differ from a fresh recomputation.
+    SequenceContextPtr ctx;
+    Network net = modernGpt(ctx, 8);
+    CHECK(slidingCacheError(net, ctx, 8, 5) < 1e-3f);
+
+    SamplingOptions greedy;
+    greedy.temperature = 0.0f;
+    CHECK(generate(net, {1, 2, 3}, 30, 8, greedy, ctx).size() == 30);
+    CHECK(ctx->window == 0 && !ctx->incremental);
+}
+
+TEST(modern_gpt_learns_and_config_roundtrip) {
+    setSeed(65);
+    const std::string text = "abcdefgh abcdefgh abcdefgh abcdefgh abcdefgh abcdefgh ";
+    const CharTokenizer tok(text);
+    const Dataset d = makeNextTokenDataset(tok.encode(text), 8, 1);
+    GPTConfig cfg;
+    cfg.vocabSize = tok.vocabSize();
+    cfg.contextLength = 8;
+    cfg.dim = 32;
+    cfg.heads = 4;
+    cfg.layers = 2;
+    cfg.modern();
+    Network net;
+    auto ctx = buildGPT(net, cfg);
+    SparseSoftmaxCrossEntropy loss;
+    Adam opt(0.01f);
+    FitOptions opts;
+    opts.epochs = 40;
+    opts.batchSize = 16;
+    opts.verbose = false;
+    CHECK(net.fit(d.x, d.y, loss, opt, opts).back().loss < 0.1f);
+    SamplingOptions greedy;
+    greedy.temperature = 0.0f;
+    CHECK(tok.decode(generate(net, tok.encode("abc"), 13, 8, greedy, ctx)) == "defgh abcdefg");
+
+    const std::string path = tempPath("modern.config");
+    saveGPTConfig(path, cfg);
+    const GPTConfig r = loadGPTConfig(path);
+    CHECK(r.position == PositionEncoding::Rotary && r.norm == Normalization::RMSNorm &&
+          r.mlp == FeedForward::SwiGLU && r.tieEmbeddings);
+    std::remove(path.c_str());
+
+    // Weights saved from a tied model load back into the same architecture.
+    const std::string weights = tempPath("modern.weights");
+    net.save(weights);
+    Network again;
+    buildGPT(again, r);
+    again.load(weights);
+    const Matrix x = d.x.sliceRows(0, 2);
+    CHECK(net.predict(x).approxEquals(again.predict(x), 1e-6f));
+    std::remove(weights.c_str());
+}
+
 // ---- Training robustness ------------------------------------------------------------------
 
 TEST(cosine_schedule_and_gradient_clipping) {

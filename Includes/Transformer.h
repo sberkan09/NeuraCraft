@@ -82,6 +82,7 @@ public:
 
 private:
     Matrix input_;
+    Matrix tanh_;  // tanh term from forward, reused by backward
 };
 
 // Multi-head causal self-attention: each position attends to itself and

@@ -52,15 +52,23 @@ void packA(bool trans, std::size_t M, std::size_t K, const float* A, std::size_t
     parallelFor(0, panels, std::max<std::size_t>(1, 4096 / (K + 1)), [&](std::size_t p0, std::size_t p1) {
         for (std::size_t p = p0; p < p1; ++p) {
             float* dst = packed + p * K * MR;
-            for (std::size_t i = 0; i < MR; ++i) {
-                const std::size_t r = p * MR + i;
-                if (r >= M) {
-                    for (std::size_t k = 0; k < K; ++k) dst[k * MR + i] = 0.0f;
-                } else if (trans) {
-                    for (std::size_t k = 0; k < K; ++k) dst[k * MR + i] = A[k * lda + r];
-                } else {
-                    const float* src = A + r * lda;
-                    for (std::size_t k = 0; k < K; ++k) dst[k * MR + i] = src[k];
+            const std::size_t r0 = p * MR;
+            const std::size_t height = std::min(MR, M - r0);
+            if (trans) {
+                // A is stored K x M: each k reads `height` contiguous floats.
+                for (std::size_t k = 0; k < K; ++k) {
+                    const float* src = A + k * lda + r0;
+                    float* d = dst + k * MR;
+                    for (std::size_t i = 0; i < height; ++i) d[i] = src[i];
+                    for (std::size_t i = height; i < MR; ++i) d[i] = 0.0f;
+                }
+            } else {
+                // `height` sequential read streams, one contiguous write stream.
+                const float* rows[MR];
+                for (std::size_t i = 0; i < MR; ++i) rows[i] = A + (r0 + std::min(i, height - 1)) * lda;
+                for (std::size_t k = 0; k < K; ++k) {
+                    float* d = dst + k * MR;
+                    for (std::size_t i = 0; i < MR; ++i) d[i] = i < height ? rows[i][k] : 0.0f;
                 }
             }
         }
@@ -75,10 +83,23 @@ void packB(bool trans, std::size_t N, std::size_t K, const float* B, std::size_t
             float* dst = packed + p * K * NR;
             const std::size_t c0 = p * NR;
             const std::size_t width = std::min(NR, N - c0);
-            for (std::size_t k = 0; k < K; ++k) {
-                float* row = dst + k * NR;
-                for (std::size_t j = 0; j < width; ++j) row[j] = trans ? B[(c0 + j) * ldb + k] : B[k * ldb + c0 + j];
-                for (std::size_t j = width; j < NR; ++j) row[j] = 0.0f;
+            if (trans) {
+                // B is stored N x K: read each of the panel's columns contiguously.
+                for (std::size_t j = 0; j < NR; ++j) {
+                    if (j >= width) {
+                        for (std::size_t k = 0; k < K; ++k) dst[k * NR + j] = 0.0f;
+                        continue;
+                    }
+                    const float* src = B + (c0 + j) * ldb;
+                    for (std::size_t k = 0; k < K; ++k) dst[k * NR + j] = src[k];
+                }
+            } else {
+                for (std::size_t k = 0; k < K; ++k) {
+                    float* row = dst + k * NR;
+                    const float* src = B + k * ldb + c0;
+                    for (std::size_t j = 0; j < width; ++j) row[j] = src[j];
+                    for (std::size_t j = width; j < NR; ++j) row[j] = 0.0f;
+                }
             }
         }
     });

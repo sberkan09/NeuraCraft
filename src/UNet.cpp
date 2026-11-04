@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -243,14 +244,178 @@ struct CrossTransformer {
     }
 };
 
+// AnimateDiff's motion module (diffusers AnimateDiffTransformer3D with one
+// BasicTransformerBlock): for every pixel, the frames form a sequence of
+// channel vectors that attend to each other.
+struct TemporalTransformer {
+    static constexpr std::size_t kMaxFrames = 32;
+    ImageShape shape;
+    std::size_t heads, groups;
+    Matrix gamma, beta;  // GroupNorm over channels x frames x pixels
+    Dense projIn, projOut;
+    LayerNorm ln1, ln2, ln3;
+    Dense q1, k1, v1, o1, q2, k2, v2, o2, ff1, ff2;
+    std::vector<float> pe;  // kMaxFrames x C sinusoidal frame positions
+
+    TemporalTransformer(ImageShape s, std::size_t h, std::size_t g)
+        : shape(s), heads(h), groups(g), projIn(s.channels, s.channels), projOut(s.channels, s.channels), ln1(s.channels),
+          ln2(s.channels), ln3(s.channels), q1(s.channels, s.channels), k1(s.channels, s.channels), v1(s.channels, s.channels),
+          o1(s.channels, s.channels), q2(s.channels, s.channels), k2(s.channels, s.channels), v2(s.channels, s.channels),
+          o2(s.channels, s.channels), ff1(s.channels, 8 * s.channels), ff2(4 * s.channels, s.channels) {
+        const std::size_t C = s.channels;
+        pe.assign(kMaxFrames * C, 0.0f);
+        for (std::size_t f = 0; f < kMaxFrames; ++f)
+            for (std::size_t i = 0; i < C; i += 2) {
+                const double a = static_cast<double>(f) * std::exp(static_cast<double>(i) * (-std::log(10000.0) / static_cast<double>(C)));
+                pe[f * C + i] = static_cast<float>(std::sin(a));
+                if (i + 1 < C) pe[f * C + i + 1] = static_cast<float>(std::cos(a));
+            }
+    }
+
+    void load(Weights& w, const std::string& p) {
+        const std::size_t C = shape.channels;
+        gamma = w.take(p + ".norm.weight", 1, C);
+        beta = w.take(p + ".norm.bias", 1, C);
+        w.linear(projIn, p + ".proj_in");
+        w.linear(projOut, p + ".proj_out");
+        const std::string b = p + ".transformer_blocks.0";
+        w.layerNorm(ln1, b + ".norm1", C);
+        w.layerNorm(ln2, b + ".norm2", C);
+        w.layerNorm(ln3, b + ".norm3", C);
+        w.linear(q1, b + ".attn1.to_q");
+        w.linear(k1, b + ".attn1.to_k");
+        w.linear(v1, b + ".attn1.to_v");
+        w.linear(o1, b + ".attn1.to_out.0");
+        w.linear(q2, b + ".attn2.to_q");
+        w.linear(k2, b + ".attn2.to_k");
+        w.linear(v2, b + ".attn2.to_v");
+        w.linear(o2, b + ".attn2.to_out.0");
+        w.linear(ff1, b + ".ff.net.0.proj");
+        w.linear(ff2, b + ".ff.net.2");
+        if (w.has(b + ".pos_embed.pe")) {  // the stored table, when the file has one
+            const Matrix stored = w.take(b + ".pos_embed.pe", w.st.info(b + ".pos_embed.pe").elements() / C, C);
+            if (stored.rows() < kMaxFrames) throw std::runtime_error("loadMotionModules: positional table shorter than 32 frames");
+            std::copy(stored.data(), stored.data() + kMaxFrames * C, pe.begin());
+        }
+    }
+
+    // Self-attention within each group of F consecutive rows (one pixel's frames).
+    Matrix frameAttention(const Matrix& q, const Matrix& k, const Matrix& v, std::size_t F) const {
+        const std::size_t rows = q.rows(), C = q.cols(), dh = C / heads, P = rows / F;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+        Matrix out(rows, C);
+        parallelFor(0, P, 8, [&](std::size_t p0, std::size_t p1) {
+            std::vector<float> s(F);
+            for (std::size_t p = p0; p < p1; ++p)
+                for (std::size_t h = 0; h < heads; ++h)
+                    for (std::size_t i = 0; i < F; ++i) {
+                        const float* qi = q.data() + (p * F + i) * C + h * dh;
+                        float m = -std::numeric_limits<float>::infinity();
+                        for (std::size_t j = 0; j < F; ++j) {
+                            const float* kj = k.data() + (p * F + j) * C + h * dh;
+                            float d = 0.0f;
+                            for (std::size_t e = 0; e < dh; ++e) d += qi[e] * kj[e];
+                            m = std::max(m, s[j] = d * scale);
+                        }
+                        float sum = 0.0f;
+                        for (std::size_t j = 0; j < F; ++j) sum += s[j] = std::exp(s[j] - m);
+                        float* o = out.data() + (p * F + i) * C + h * dh;
+                        for (std::size_t j = 0; j < F; ++j) {
+                            const float wj = s[j] / sum;
+                            const float* vj = v.data() + (p * F + j) * C + h * dh;
+                            for (std::size_t e = 0; e < dh; ++e) o[e] += wj * vj[e];
+                        }
+                    }
+        });
+        return out;
+    }
+
+    // frames: F matrices of 1 x (C H W), updated in place (output + residual).
+    void forward(std::vector<Matrix>& frames) {
+        const std::size_t F = frames.size(), C = shape.channels, HW = shape.height * shape.width, cg = C / groups;
+        if (F > kMaxFrames) throw std::invalid_argument("motion module: at most 32 frames");
+        // Group statistics over the group's channels, all frames and all pixels.
+        std::vector<float> mean(groups), inv(groups);
+        parallelFor(0, groups, 1, [&](std::size_t g0, std::size_t g1) {
+            for (std::size_t g = g0; g < g1; ++g) {
+                double s = 0, q = 0;
+                for (const Matrix& fr : frames)
+                    for (std::size_t c = g * cg; c < (g + 1) * cg; ++c)
+                        for (std::size_t p = 0; p < HW; ++p) {
+                            const double v = fr.data()[c * HW + p];
+                            s += v;
+                            q += v * v;
+                        }
+                const double n = static_cast<double>(F * cg * HW), mu = s / n;
+                mean[g] = static_cast<float>(mu);
+                inv[g] = static_cast<float>(1.0 / std::sqrt(std::max(q / n - mu * mu, 0.0) + 1e-6));
+            }
+        });
+        // Pixels in chunks (temporal attention never crosses pixels), so the
+        // feed-forward's 8C-wide rows stay within a few tens of MB.
+        const std::size_t P = std::max<std::size_t>(1, ((std::size_t(1) << 23) / (8 * C)) / F);
+        for (std::size_t p0 = 0; p0 < HW; p0 += P) {
+            const std::size_t np = std::min(P, HW - p0), rows = np * F;
+            Matrix x(rows, C);
+            parallelFor(0, C, 8, [&](std::size_t c0, std::size_t c1) {
+                for (std::size_t c = c0; c < c1; ++c) {
+                    const std::size_t g = c / cg;
+                    const float a = inv[g] * gamma.data()[c], b = beta.data()[c] - mean[g] * a;
+                    for (std::size_t f = 0; f < F; ++f) {
+                        const float* src = frames[f].data() + c * HW + p0;
+                        for (std::size_t p = 0; p < np; ++p) x.data()[(p * F + f) * C + c] = src[p] * a + b;
+                    }
+                }
+            });
+            Matrix h = projIn.forward(x, false);
+            auto withPositions = [&](Matrix a) {
+                for (std::size_t r = 0; r < rows; ++r) {
+                    const float* e = pe.data() + (r % F) * C;
+                    float* row = a.data() + r * C;
+                    for (std::size_t c = 0; c < C; ++c) row[c] += e[c];
+                }
+                return a;
+            };
+            Matrix a = withPositions(ln1.forward(h, false));
+            addInPlace(h, o1.forward(frameAttention(q1.forward(a, false), k1.forward(a, false), v1.forward(a, false), F), false));
+            a = withPositions(ln2.forward(h, false));
+            addInPlace(h, o2.forward(frameAttention(q2.forward(a, false), k2.forward(a, false), v2.forward(a, false), F), false));
+            a = ln3.forward(h, false);
+            const Matrix g = ff1.forward(a, false);
+            Matrix geglu(rows, 4 * C);
+            parallelFor(0, rows, 16, [&](std::size_t r0, std::size_t r1) {
+                for (std::size_t r = r0; r < r1; ++r) {
+                    const float* row = g.data() + r * 8 * C;
+                    float* o = geglu.data() + r * 4 * C;
+                    for (std::size_t j = 0; j < 4 * C; ++j) {
+                        const float gate = row[4 * C + j];
+                        o[j] = row[j] * 0.5f * gate * (1.0f + std::erf(gate * 0.70710678118654752f));
+                    }
+                }
+            });
+            addInPlace(h, ff2.forward(geglu, false));
+            const Matrix y = projOut.forward(h, false);
+            parallelFor(0, C, 8, [&](std::size_t c0, std::size_t c1) {
+                for (std::size_t c = c0; c < c1; ++c)
+                    for (std::size_t f = 0; f < F; ++f) {
+                        float* dst = frames[f].data() + c * HW + p0;
+                        for (std::size_t p = 0; p < np; ++p) dst[p] += y.data()[(p * F + f) * C + c];
+                    }
+            });
+        }
+    }
+};
+
 struct DownBlock {
     std::vector<std::unique_ptr<TimeResnet>> resnets;
     std::vector<std::unique_ptr<CrossTransformer>> attentions;
+    std::vector<std::unique_ptr<TemporalTransformer>> motions;
     std::unique_ptr<Conv2D> downsample;
 };
 struct UpBlock {
     std::vector<std::unique_ptr<TimeResnet>> resnets;
     std::vector<std::unique_ptr<CrossTransformer>> attentions;
+    std::vector<std::unique_ptr<TemporalTransformer>> motions;
     std::unique_ptr<Upsample2D> upsample;
     std::unique_ptr<Conv2D> upConv;
 };
@@ -273,8 +438,12 @@ struct UNet2DCondition::Impl {
     std::vector<DownBlock> downs;
     std::unique_ptr<TimeResnet> mid1, mid2;
     std::unique_ptr<CrossTransformer> midAttention;
+    std::unique_ptr<TemporalTransformer> midMotion;
     std::vector<UpBlock> ups;
     std::unique_ptr<GroupNorm> normOut;
+    std::size_t groups = 32;
+    // Down / up block shapes after each resnet, for building motion modules.
+    std::vector<std::vector<ImageShape>> downShapes, upShapes;
 };
 
 UNet2DCondition::UNet2DCondition() = default;
@@ -285,6 +454,99 @@ UNet2DCondition& UNet2DCondition::operator=(UNet2DCondition&&) noexcept = defaul
 ImageShape UNet2DCondition::latentShape() const { return impl_->latent; }
 std::size_t UNet2DCondition::contextDim() const { return impl_->contextDim; }
 std::size_t UNet2DCondition::parameterCount() const { return impl_->params; }
+bool UNet2DCondition::hasMotionModules() const { return impl_->midMotion != nullptr; }
+
+Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, const Matrix& context) {
+    Impl& m = *impl_;
+    const std::size_t F = latents.rows();
+    if (F == 0 || latents.cols() != m.latent.size())
+        throw std::invalid_argument("UNet2DCondition::forwardFrames: expected F x " + std::to_string(m.latent.size()) + " latents");
+    if (context.cols() != m.contextDim)
+        throw std::invalid_argument("UNet2DCondition::forwardFrames: context must have " + std::to_string(m.contextDim) + " columns");
+    Matrix out(F, m.latent.size());
+    if (!hasMotionModules()) {
+        for (std::size_t f = 0; f < F; ++f) {
+            Matrix one(1, m.latent.size());
+            std::copy(latents.data() + f * one.size(), latents.data() + (f + 1) * one.size(), one.data());
+            const Matrix eps = forward(one, timestep, context);
+            std::copy(eps.data(), eps.data() + eps.size(), out.data() + f * eps.size());
+        }
+        return out;
+    }
+    Matrix temb = m.t1->forward(timestepEmbedding(timestep, m.timeDim, m.flipSinToCos, m.freqShift), false);
+    siluInPlace(temb);
+    temb = m.t2->forward(temb, false);
+    siluInPlace(temb);
+
+    std::vector<Matrix> h(F);
+    for (std::size_t f = 0; f < F; ++f) {
+        Matrix one(1, m.latent.size());
+        std::copy(latents.data() + f * one.size(), latents.data() + (f + 1) * one.size(), one.data());
+        h[f] = m.convIn->forward(one, false);
+    }
+    std::vector<std::vector<Matrix>> skips{h};
+    auto each = [&](auto&& fn) {
+        for (Matrix& x : h) x = fn(x);
+    };
+    for (auto& d : m.downs) {
+        for (std::size_t j = 0; j < d.resnets.size(); ++j) {
+            each([&](const Matrix& x) { return d.resnets[j]->forward(x, temb); });
+            if (!d.attentions.empty()) each([&](const Matrix& x) { return d.attentions[j]->forward(x, context); });
+            d.motions[j]->forward(h);
+            skips.push_back(h);
+        }
+        if (d.downsample) {
+            each([&](const Matrix& x) { return d.downsample->forward(x, false); });
+            skips.push_back(h);
+        }
+    }
+    each([&](const Matrix& x) { return m.mid1->forward(x, temb); });
+    each([&](const Matrix& x) { return m.midAttention->forward(x, context); });
+    m.midMotion->forward(h);
+    each([&](const Matrix& x) { return m.mid2->forward(x, temb); });
+    for (auto& u : m.ups) {
+        for (std::size_t j = 0; j < u.resnets.size(); ++j) {
+            std::vector<Matrix>& s = skips.back();
+            for (std::size_t f = 0; f < F; ++f) h[f] = u.resnets[j]->forward(concatChannels(h[f], s[f]), temb);
+            skips.pop_back();
+            if (!u.attentions.empty()) each([&](const Matrix& x) { return u.attentions[j]->forward(x, context); });
+            u.motions[j]->forward(h);
+        }
+        if (u.upsample) each([&](const Matrix& x) { return u.upConv->forward(u.upsample->forward(x, false), false); });
+    }
+    for (std::size_t f = 0; f < F; ++f) {
+        Matrix x = m.normOut->forward(h[f], false);
+        siluInPlace(x);
+        x = m.convOut->forward(x, false);
+        std::copy(x.data(), x.data() + x.size(), out.data() + f * x.size());
+    }
+    return out;
+}
+
+void loadMotionModules(UNet2DCondition& unet, const std::string& file, bool int8) {
+    UNet2DCondition::Impl& m = *unet.impl_;
+    Weights w(file);
+    w.int8 = int8;
+    SkipParameterInit skip;
+    // Heads: the adapter's config is not in the file; diffusers' default (and
+    // every released AnimateDiff v1 / v2 / Lightning module) uses 8.
+    const std::size_t heads = 8;
+    for (std::size_t i = 0; i < m.downs.size(); ++i)
+        for (std::size_t j = 0; j < m.downShapes[i].size(); ++j) {
+            m.downs[i].motions.push_back(std::make_unique<TemporalTransformer>(m.downShapes[i][j], heads, m.groups));
+            m.downs[i].motions.back()->load(w, "down_blocks." + std::to_string(i) + ".motion_modules." + std::to_string(j));
+        }
+    if (!w.has("mid_block.motion_modules.0.norm.weight"))
+        throw std::runtime_error("loadMotionModules: " + file + " has no mid block motion module (AnimateDiff v1 is not supported)");
+    m.midMotion = std::make_unique<TemporalTransformer>(m.downShapes.back().back(), heads, m.groups);
+    m.midMotion->load(w, "mid_block.motion_modules.0");
+    for (std::size_t i = 0; i < m.ups.size(); ++i)
+        for (std::size_t j = 0; j < m.upShapes[i].size(); ++j) {
+            m.ups[i].motions.push_back(std::make_unique<TemporalTransformer>(m.upShapes[i][j], heads, m.groups));
+            m.ups[i].motions.back()->load(w, "up_blocks." + std::to_string(i) + ".motion_modules." + std::to_string(j));
+        }
+    for (const auto& name : w.st.names()) m.params += w.st.info(name).elements();
+}
 
 Matrix UNet2DCondition::forward(const Matrix& latent, float timestep, const Matrix& context) {
     Impl& m = *impl_;
@@ -384,6 +646,7 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
     m.timeDim = ch[0];
     m.flipSinToCos = !c.find("flip_sin_to_cos") || c.at("flip_sin_to_cos").boolean;
     m.freqShift = static_cast<float>(c.numberOr("freq_shift", 0));
+    m.groups = groups;
     const std::size_t tembDim = 4 * ch[0];
     Weights w(file);
     w.int8 = int8;
@@ -403,10 +666,12 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
         const std::string p = "down_blocks." + std::to_string(i);
         const bool cross = downTypes[i] == "CrossAttnDownBlock2D";
         if (!cross && downTypes[i] != "DownBlock2D") throw std::runtime_error("loadUNet: unsupported block " + downTypes[i]);
+        m.downShapes.emplace_back();
         for (std::size_t j = 0; j < L; ++j) {
             d.resnets.push_back(std::make_unique<TimeResnet>(s, ch[i], tembDim, groups, eps));
             d.resnets.back()->load(w, p + ".resnets." + std::to_string(j));
             s.channels = ch[i];
+            m.downShapes.back().push_back(s);
             if (cross) {
                 d.attentions.push_back(std::make_unique<CrossTransformer>(s, heads[i], ctx, groups));
                 d.attentions.back()->load(w, p + ".attentions." + std::to_string(j));
@@ -434,12 +699,14 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
         const std::size_t out = ch[ch.size() - 1 - i];
         const bool cross = upTypes[i] == "CrossAttnUpBlock2D";
         if (!cross && upTypes[i] != "UpBlock2D") throw std::runtime_error("loadUNet: unsupported block " + upTypes[i]);
+        m.upShapes.emplace_back();
         for (std::size_t j = 0; j <= L; ++j) {
             const ImageShape in{s.channels + skipChannels.back(), s.height, s.width};
             skipChannels.pop_back();
             u.resnets.push_back(std::make_unique<TimeResnet>(in, out, tembDim, groups, eps));
             u.resnets.back()->load(w, p + ".resnets." + std::to_string(j));
             s.channels = out;
+            m.upShapes.back().push_back(s);
             if (cross) {
                 u.attentions.push_back(std::make_unique<CrossTransformer>(s, heads[ch.size() - 1 - i], ctx, groups));
                 u.attentions.back()->load(w, p + ".attentions." + std::to_string(j));
@@ -506,6 +773,11 @@ EulerScheduler makeEuler(std::size_t steps, std::size_t trainSteps, double betaS
     return s;
 }
 } // namespace
+
+EulerScheduler EulerScheduler::make(std::size_t steps, const std::string& schedule, const std::string& spacing, double betaStart,
+                                    double betaEnd, std::size_t trainSteps, std::size_t offset) {
+    return makeEuler(steps, trainSteps, betaStart, betaEnd, schedule, spacing, offset);
+}
 
 EulerScheduler EulerScheduler::standard(std::size_t steps) {
     return makeEuler(steps, 1000, 0.00085, 0.012, "scaled_linear", "trailing", 1);
@@ -651,6 +923,72 @@ Image decodeLatent(const std::string& dir, const Matrix& latent, const TextToIma
 
 Image textToImage(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
     return decodeLatent(dir, textToLatent(dir, prompt, o), o);
+}
+
+// ---- Text to video (AnimateDiff) -------------------------------------------------------------------
+
+std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt, const TextToVideoOptions& v) {
+    TextToImageOptions o;
+    o.width = v.width;
+    o.height = v.height;
+    o.seed = v.seed;
+    o.guidance = v.guidance;
+    o.negativePrompt = v.negativePrompt;
+    o.tinyVae = v.tinyVae;
+    o.int8 = v.int8;
+    o.progress = v.progress;
+    checkSize(o);
+    if (v.frames == 0 || v.frames > 32) throw std::invalid_argument("textToVideo: frames must be in 1..32");
+    std::string motion = v.motion;
+    if (motion.empty()) {
+        const std::string md = dir + "/motion";
+        if (std::filesystem::is_directory(md))
+            for (const auto& e : std::filesystem::directory_iterator(md))
+                if (e.path().extension() == ".safetensors") {
+                    if (!motion.empty()) throw std::runtime_error("textToVideo: several motion modules in " + md + "; choose one");
+                    motion = e.path().string();
+                }
+        if (motion.empty()) throw std::runtime_error("textToVideo: no motion module (.safetensors) in " + md);
+    }
+    const auto context = encodePrompts(dir, prompt, o);
+    auto t = PipelineClock::now();
+    UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8);
+    loadMotionModules(unet, motion, o.int8);
+    reportStage(o, "load unet + motion", t);
+    const EulerScheduler sched =
+        v.betaSchedule == "config" ? schedulerFor(dir, v.steps) : EulerScheduler::make(v.steps, v.betaSchedule, "trailing");
+    const std::size_t F = v.frames, n = unet.latentShape().size();
+    setSeed(v.seed);
+    Matrix latents = Matrix::normal(F, n, 0.0f, 1.0f);
+    for (float& x : latents.values()) x *= static_cast<float>(sched.initNoiseSigma);
+    for (std::size_t i = 0; i < sched.timesteps.size(); ++i) {
+        t = PipelineClock::now();
+        Matrix in = latents;
+        const float scale = static_cast<float>(sched.inputScale(i));
+        for (float& x : in.values()) x *= scale;
+        Matrix eps = unet.forwardFrames(in, static_cast<float>(sched.timesteps[i]), context.first);
+        if (o.guidance > 1.0f) {
+            const Matrix uncond = unet.forwardFrames(in, static_cast<float>(sched.timesteps[i]), context.second);
+            for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + o.guidance * (eps.data()[k] - uncond.data()[k]);
+        }
+        sched.step(i, eps, latents);
+        reportStage(o, "step " + std::to_string(i + 1) + "/" + std::to_string(sched.timesteps.size()), t);
+    }
+    unet = UNet2DCondition();  // free the UNet before decoding
+    t = PipelineClock::now();
+    std::unique_ptr<TinyVae> tiny;
+    std::unique_ptr<Vae> vae;
+    if (!o.tinyVae.empty()) tiny = std::make_unique<TinyVae>(loadTinyVae(o.tinyVae, o.width, o.height, false, true));
+    else vae = std::make_unique<Vae>(loadVae(dir, o.width, o.height, false, true));
+    std::vector<Image> frames;
+    for (std::size_t f = 0; f < F; ++f) {
+        Matrix one(1, n);
+        std::copy(latents.data() + f * n, latents.data() + (f + 1) * n, one.data());
+        const Matrix img = tiny ? tiny->decode(one) : vae->decode(one);
+        frames.push_back(tensorToImage(img.data(), {3, o.height, o.width}));
+    }
+    reportStage(o, o.tinyVae.empty() ? "vae decode" : "taesd decode", t);
+    return frames;
 }
 
 // ---- Persistent model and animations --------------------------------------------------------------

@@ -91,16 +91,30 @@ public:
 
     // latent: 1 x (C h w); context: tokens x contextDim. Returns 1 x (C h w).
     Matrix forward(const Matrix& latent, float timestep, const Matrix& context);
+    // Several frames at once (AnimateDiff): latents has one frame per row and
+    // the same text conditions every frame. With motion modules loaded,
+    // temporal attention mixes the frames after every spatial block; without,
+    // each row is forward() of that frame.
+    Matrix forwardFrames(const Matrix& latents, float timestep, const Matrix& context);
     ImageShape latentShape() const;
     std::size_t contextDim() const;
     std::size_t parameterCount() const;
+    bool hasMotionModules() const;
 
     struct Impl;
 
 private:
     std::unique_ptr<Impl> impl_;
     friend UNet2DCondition loadUNet(const std::string&, std::size_t, std::size_t, bool);
+    friend void loadMotionModules(UNet2DCondition&, const std::string&, bool);
 };
+
+// Adds an AnimateDiff motion adapter (diffusers MotionAdapter safetensors, such
+// as AnimateDiff-Lightning or mm_sd_v15_v2) to an SD 1.x UNet: a temporal
+// transformer after every resnet / attention of the down, mid and up blocks
+// (GroupNorm over all frames, sinusoidal frame positions, two self-attention
+// layers across frames per pixel, GEGLU feed-forward). Up to 32 frames.
+void loadMotionModules(UNet2DCondition& unet, const std::string& file, bool int8 = false);
 
 // Loads `directory`/unet (or `directory` itself): config.json plus
 // diffusion_pytorch_model(.fp16).safetensors, for latents of the given size
@@ -116,6 +130,10 @@ struct EulerScheduler {
     double initNoiseSigma = 1.0;    // scale of the initial Gaussian latent
 
     static EulerScheduler fromConfig(const std::string& schedulerConfigPath, std::size_t steps);
+    // Explicit settings (diffusers names: "scaled_linear" / "linear", "trailing" / "leading" / "linspace").
+    static EulerScheduler make(std::size_t steps, const std::string& betaSchedule, const std::string& spacing,
+                               double betaStart = 0.00085, double betaEnd = 0.012, std::size_t trainSteps = 1000,
+                               std::size_t offset = 1);
     // Uses the defaults of Stable Diffusion (1000 steps, scaled_linear 0.00085 .. 0.012, trailing).
     static EulerScheduler standard(std::size_t steps);
     double inputScale(std::size_t step) const;  // multiply the latent by this before the UNet
@@ -227,6 +245,27 @@ struct ZoomOptions {
 // Works best at the model's native size (512 for SD-Turbo).
 std::vector<Image> zoomAnimation(StableDiffusion& sd, const std::vector<std::string>& prompts, const ZoomOptions& options = {},
                                  const Image* start = nullptr);
+
+struct TextToVideoOptions {
+    std::size_t width = 512, height = 512;  // multiples of 64
+    std::size_t frames = 16;                // 1 .. 32 (AnimateDiff was trained on 16)
+    std::size_t steps = 4;                  // AnimateDiff-Lightning: the step count the module was distilled for
+    unsigned seed = 0;
+    float guidance = 1.0f;                  // <= 1: off (Lightning); else classifier-free guidance
+    std::string negativePrompt;
+    std::string motion;                     // motion adapter file; empty: the one .safetensors in DIR/motion
+    std::string tinyVae;                    // TAESD directory: decode with it instead of the full VAE
+    bool int8 = true;
+    // Lightning's schedule: Euler, linear betas, trailing timesteps. "config"
+    // uses DIR/scheduler/scheduler_config.json instead (other motion modules).
+    std::string betaSchedule = "linear";
+    std::function<void(const std::string& stage, double seconds)> progress;
+};
+
+// AnimateDiff text to video on an SD 1.x diffusers directory plus a motion
+// adapter: CLIP encodes the prompt, the UNet with motion modules denoises all
+// frames' latents together, each frame is decoded. Returns the frames.
+std::vector<Image> textToVideo(const std::string& directory, const std::string& prompt, const TextToVideoOptions& options = {});
 
 } // namespace nc
 

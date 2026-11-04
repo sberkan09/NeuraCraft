@@ -3,9 +3,11 @@
 
 #include "Data.h"
 #include "Network.h"
+#include "Transformer.h"
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -89,8 +91,15 @@ struct SamplingOptions {
 // Autoregressive sampling from a language model built with buildGPT (or any
 // network mapping 1 x L token ids to L x vocab logits). Uses at most the last
 // `contextLength` tokens as context. Returns only the newly generated ids.
+//
+// Passing the SequenceContext returned by buildGPT enables the KV cache: each
+// step then runs only the new token through the network. When the cache is
+// full it is rebuilt from the last contextLength / 2 tokens, so after that
+// point the context window is between half and full length rather than
+// sliding by one token as in the uncached path.
 std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::size_t newTokens,
-                          std::size_t contextLength, const SamplingOptions& options = SamplingOptions{});
+                          std::size_t contextLength, const SamplingOptions& options = SamplingOptions{},
+                          const std::shared_ptr<SequenceContext>& kvCache = nullptr);
 
 } // namespace nc
 

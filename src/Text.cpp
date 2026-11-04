@@ -265,42 +265,83 @@ Dataset makeNextTokenDataset(const std::vector<int>& tokens, std::size_t seqLen,
     return d;
 }
 
+namespace {
+int sampleToken(const float* logits, std::size_t vocab, const SamplingOptions& options) {
+    if (options.temperature <= 0.0f) return static_cast<int>(std::max_element(logits, logits + vocab) - logits);
+    std::vector<std::size_t> order(vocab);
+    std::iota(order.begin(), order.end(), 0);
+    std::size_t keep = vocab;
+    if (options.topK > 0 && options.topK < vocab) {
+        keep = options.topK;
+        std::partial_sort(order.begin(), order.begin() + static_cast<long>(keep), order.end(),
+                          [&](std::size_t a, std::size_t b) { return logits[a] > logits[b]; });
+    }
+    float maxVal = -std::numeric_limits<float>::infinity();
+    for (std::size_t i = 0; i < keep; ++i) maxVal = std::max(maxVal, logits[order[i]]);
+    std::vector<float> probs(keep);
+    for (std::size_t i = 0; i < keep; ++i) probs[i] = std::exp((logits[order[i]] - maxVal) / options.temperature);
+    std::discrete_distribution<std::size_t> pick(probs.begin(), probs.end());
+    return static_cast<int>(order[pick(rng())]);
+}
+
+Matrix tokensRow(const std::vector<int>& tokens, std::size_t from) {
+    Matrix x(1, tokens.size() - from);
+    for (std::size_t t = from; t < tokens.size(); ++t) x(0, t - from) = static_cast<float>(tokens[t]);
+    return x;
+}
+
+struct IncrementalScope {
+    SequenceContext& ctx;
+    explicit IncrementalScope(SequenceContext& c) : ctx(c) {
+        ctx.incremental = true;
+        ctx.offset = 0;
+    }
+    ~IncrementalScope() {
+        ctx.incremental = false;
+        ctx.offset = 0;
+    }
+};
+} // namespace
+
 std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::size_t newTokens,
-                          std::size_t contextLength, const SamplingOptions& options) {
+                          std::size_t contextLength, const SamplingOptions& options,
+                          const std::shared_ptr<SequenceContext>& kvCache) {
     if (prompt.empty()) throw std::invalid_argument("generate: prompt must contain at least one token");
     if (contextLength == 0) throw std::invalid_argument("generate: contextLength must be > 0");
     std::vector<int> tokens = prompt, produced;
     produced.reserve(newTokens);
-    std::vector<float> probs;
-    for (std::size_t step = 0; step < newTokens; ++step) {
-        const std::size_t len = std::min(contextLength, tokens.size());
-        Matrix x(1, len);
-        for (std::size_t t = 0; t < len; ++t) x(0, t) = static_cast<float>(tokens[tokens.size() - len + t]);
-        const Matrix logits = net.predict(x);
-        const std::size_t vocab = logits.cols();
-        const float* last = logits.data() + (logits.rows() - 1) * vocab;
+    if (newTokens == 0) return produced;
 
-        int next = 0;
-        if (options.temperature <= 0.0f) {
-            next = static_cast<int>(std::max_element(last, last + vocab) - last);
-        } else {
-            std::vector<std::size_t> order(vocab);
-            std::iota(order.begin(), order.end(), 0);
-            std::size_t keep = vocab;
-            if (options.topK > 0 && options.topK < vocab) {
-                keep = options.topK;
-                std::partial_sort(order.begin(), order.begin() + static_cast<long>(keep), order.end(),
-                                  [&](std::size_t a, std::size_t b) { return last[a] > last[b]; });
-            }
-            float maxVal = -std::numeric_limits<float>::infinity();
-            for (std::size_t i = 0; i < keep; ++i) maxVal = std::max(maxVal, last[order[i]]);
-            probs.assign(keep, 0.0f);
-            for (std::size_t i = 0; i < keep; ++i) probs[i] = std::exp((last[order[i]] - maxVal) / options.temperature);
-            std::discrete_distribution<std::size_t> pick(probs.begin(), probs.end());
-            next = static_cast<int>(order[pick(rng())]);
+    if (!kvCache) {
+        for (std::size_t step = 0; step < newTokens; ++step) {
+            const std::size_t len = std::min(contextLength, tokens.size());
+            const Matrix logits = net.predict(tokensRow(tokens, tokens.size() - len));
+            const int next = sampleToken(logits.data() + (logits.rows() - 1) * logits.cols(), logits.cols(), options);
+            tokens.push_back(next);
+            produced.push_back(next);
         }
+        return produced;
+    }
+
+    IncrementalScope scope(*kvCache);
+    // Runs tokens[from..] through the network on top of the cache; returns the last logits row.
+    auto feed = [&](std::size_t from) {
+        const Matrix logits = net.predict(tokensRow(tokens, from));
+        kvCache->offset += tokens.size() - from;
+        return std::vector<float>(logits.data() + (logits.rows() - 1) * logits.cols(), logits.data() + logits.size());
+    };
+    std::vector<float> last = feed(tokens.size() - std::min(contextLength, tokens.size()));
+    for (std::size_t step = 0; step < newTokens; ++step) {
+        const int next = sampleToken(last.data(), last.size(), options);
         tokens.push_back(next);
         produced.push_back(next);
+        if (step + 1 == newTokens) break;
+        if (kvCache->offset >= contextLength) {
+            kvCache->offset = 0;  // cache full: rebuild from the most recent half window
+            last = feed(tokens.size() - std::max<std::size_t>(1, contextLength / 2));
+        } else {
+            last = feed(tokens.size() - 1);
+        }
     }
     return produced;
 }

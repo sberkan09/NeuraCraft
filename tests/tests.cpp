@@ -722,6 +722,72 @@ TEST(bpe_save_load_and_determinism) {
     std::remove(path.c_str());
 }
 
+namespace {
+Network smallGpt(SequenceContextPtr& ctx, std::size_t context = 16) {
+    GPTConfig cfg;
+    cfg.vocabSize = 11;
+    cfg.contextLength = context;
+    cfg.dim = 16;
+    cfg.heads = 4;
+    cfg.layers = 2;
+    Network net;
+    ctx = buildGPT(net, cfg);
+    return net;
+}
+} // namespace
+
+TEST(kv_cache_matches_full_forward) {
+    setSeed(40);
+    SequenceContextPtr ctx;
+    Network net = smallGpt(ctx);
+    const std::vector<float> ids{3, 1, 4, 1, 5, 9, 2, 6, 5, 3};
+    const Matrix full = net.predict(Matrix(1, ids.size(), ids));  // 10 x vocab
+
+    ctx->incremental = true;
+    ctx->offset = 0;
+    Matrix cached(0, full.cols());
+    std::vector<float> rows;
+    std::size_t pos = 0;
+    for (std::size_t chunk : {4, 1, 1, 3, 1}) {  // prompt, then single tokens / a small chunk
+        const Matrix out = net.predict(Matrix(1, chunk, std::vector<float>(ids.begin() + pos, ids.begin() + pos + chunk)));
+        rows.insert(rows.end(), out.values().begin(), out.values().end());
+        ctx->offset += chunk;
+        pos += chunk;
+    }
+    ctx->incremental = false;
+    ctx->offset = 0;
+    CHECK(Matrix(ids.size(), full.cols(), rows).approxEquals(full, 1e-4f));
+
+    // A wrong offset must be detected, not silently produce garbage.
+    ctx->incremental = true;
+    ctx->offset = 3;
+    CHECK_THROWS(net.predict(Matrix(1, 1, std::vector<float>{2})), std::logic_error);
+    ctx->incremental = false;
+    ctx->offset = 0;
+}
+
+TEST(kv_cached_generation_matches_uncached) {
+    setSeed(41);
+    SequenceContextPtr ctx;
+    Network net = smallGpt(ctx);
+    SamplingOptions greedy;
+    greedy.temperature = 0.0f;
+    const std::vector<int> prompt{1, 2, 3};
+    // Within the context window both paths see exactly the same tokens.
+    CHECK(generate(net, prompt, 13, 16, greedy) == generate(net, prompt, 13, 16, greedy, ctx));
+    CHECK(!ctx->incremental && ctx->offset == 0);  // state restored
+
+    // Beyond the window the cache is rebuilt; it must keep working.
+    const auto longRun = generate(net, prompt, 60, 16, greedy, ctx);
+    CHECK(longRun.size() == 60);
+    // Training-mode forward still works afterwards (incremental mode is off).
+    Matrix batch(2, 16);
+    CHECK(net.forward(batch, true).rows() == 32);
+    // A prompt longer than the window is trimmed to its last tokens.
+    std::vector<int> longPrompt(40, 4);
+    CHECK(generate(net, longPrompt, 5, 16, greedy, ctx) == generate(net, longPrompt, 5, 16, greedy));
+}
+
 TEST(gpt_memorizes_a_sequence_and_generates_it) {
     setSeed(34);
     const std::string text = "abcdefgh abcdefgh abcdefgh abcdefgh abcdefgh abcdefgh ";

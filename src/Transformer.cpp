@@ -38,9 +38,13 @@ TokenEmbedding::TokenEmbedding(std::size_t vocabSize, std::size_t dim, std::size
 Matrix TokenEmbedding::forward(const Matrix& input, bool) {
     batch_ = input.rows();
     length_ = input.cols();
-    if (length_ == 0 || length_ > maxContext_)
-        throw std::invalid_argument("TokenEmbedding: sequence length " + std::to_string(length_) +
-                                    " must be in 1.." + std::to_string(maxContext_));
+    const std::size_t offset = context_->incremental ? context_->offset : 0;
+    if (context_->incremental && batch_ != 1)
+        throw std::invalid_argument("TokenEmbedding: incremental inference handles one sequence at a time");
+    if (length_ == 0 || offset + length_ > maxContext_)
+        throw std::invalid_argument("TokenEmbedding: positions " + std::to_string(offset) + ".." +
+                                    std::to_string(offset + length_ - 1) + " exceed the context of " +
+                                    std::to_string(maxContext_));
     context_->length = length_;
     ids_.resize(batch_ * length_);
     Matrix out(batch_ * length_, dim_);
@@ -50,7 +54,7 @@ Matrix TokenEmbedding::forward(const Matrix& input, bool) {
             throw std::out_of_range("TokenEmbedding: token id " + std::to_string(id) + " outside the vocabulary");
         ids_[r] = static_cast<std::size_t>(id);
         const float* tok = tokens_.data() + ids_[r] * dim_;
-        const float* pos = positions_.data() + (r % length_) * dim_;
+        const float* pos = positions_.data() + (offset + r % length_) * dim_;
         float* o = out.data() + r * dim_;
         for (std::size_t j = 0; j < dim_; ++j) o[j] = tok[j] + pos[j];
     }
@@ -205,6 +209,7 @@ Matrix CausalSelfAttention::forward(const Matrix& input, bool) {
     if (input.cols() != dim_)
         throw std::invalid_argument("CausalSelfAttention: expected " + std::to_string(dim_) + " features, got " +
                                     std::to_string(input.cols()));
+    if (context_ && context_->incremental) return forwardIncremental(input);
     length_ = requireLength(context_, input.rows(), "CausalSelfAttention");
     batch_ = input.rows() / length_;
     const std::size_t L = length_, D = dim_, hd = headDim_, ld = 3 * D;
@@ -243,6 +248,54 @@ Matrix CausalSelfAttention::forward(const Matrix& input, bool) {
         }
     });
     return (merged_ * wOut_).addRowVector(bOut_);
+}
+
+Matrix CausalSelfAttention::forwardIncremental(const Matrix& input) {
+    const std::size_t n = input.rows(), D = dim_, hd = headDim_, ld = 3 * D;
+    const std::size_t past = context_->offset;
+    if (past == 0) {
+        cacheK_.clear();
+        cacheV_.clear();
+        cachedPositions_ = 0;
+    }
+    if (cachedPositions_ != past)
+        throw std::logic_error("CausalSelfAttention: KV cache holds " + std::to_string(cachedPositions_) +
+                               " positions but the context offset is " + std::to_string(past));
+    const Matrix qkv = (input * wQkv_).addRowVector(bQkv_);
+    for (std::size_t r = 0; r < n; ++r) {
+        const float* row = qkv.data() + r * ld;
+        cacheK_.insert(cacheK_.end(), row + D, row + 2 * D);
+        cacheV_.insert(cacheV_.end(), row + 2 * D, row + 3 * D);
+    }
+    cachedPositions_ += n;
+    const std::size_t total = cachedPositions_;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+
+    Matrix merged(n, D);
+    std::vector<float> scores(n * total);
+    for (std::size_t h = 0; h < heads_; ++h) {
+        const float* q = qkv.data() + h * hd;
+        gemmCpu(false, true, n, total, hd, q, ld, cacheK_.data() + h * hd, D, scores.data(), total);
+        for (std::size_t i = 0; i < n; ++i) {
+            float* row = scores.data() + i * total;
+            const std::size_t visible = past + i + 1;  // causal: earlier positions and itself
+            float maxVal = -std::numeric_limits<float>::infinity();
+            for (std::size_t j = 0; j < visible; ++j) {
+                row[j] *= scale;
+                maxVal = std::max(maxVal, row[j]);
+            }
+            float sum = 0.0f;
+            for (std::size_t j = 0; j < visible; ++j) {
+                row[j] = std::exp(row[j] - maxVal);
+                sum += row[j];
+            }
+            for (std::size_t j = 0; j < visible; ++j) row[j] /= sum;
+            for (std::size_t j = visible; j < total; ++j) row[j] = 0.0f;
+        }
+        gemmCpu(false, false, n, hd, total, scores.data(), total, cacheV_.data() + h * hd, D, merged.data() + h * hd, D);
+    }
+    qkv_ = Matrix();  // inference only: backward is not available after this pass
+    return (merged * wOut_).addRowVector(bOut_);
 }
 
 Matrix CausalSelfAttention::backward(const Matrix& gradOutput) {
@@ -319,7 +372,7 @@ std::string Residual::describe() const {
 
 // ---- GPT ------------------------------------------------------------------------------------
 
-void buildGPT(Network& net, const GPTConfig& c) {
+SequenceContextPtr buildGPT(Network& net, const GPTConfig& c) {
     if (c.vocabSize == 0 || c.contextLength == 0 || c.dim == 0 || c.heads == 0 || c.dim % c.heads != 0)
         throw std::invalid_argument("buildGPT: invalid configuration");
     auto context = std::make_shared<SequenceContext>();
@@ -340,6 +393,7 @@ void buildGPT(Network& net, const GPTConfig& c) {
     }
     net.add<LayerNorm>(c.dim);
     net.add<Dense>(c.dim, c.vocabSize);
+    return context;
 }
 
 } // namespace nc

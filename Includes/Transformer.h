@@ -14,8 +14,15 @@ namespace nc {
 // ordered sequence by sequence; every later layer works on that row layout.
 // Layers that mix positions (attention) read the current sequence length from
 // a SequenceContext shared with the embedding.
+//
+// Incremental (KV-cached) inference: with `incremental` set, a forward pass
+// carries only new tokens of a single sequence that start at absolute position
+// `offset`; each attention layer keeps the keys/values of earlier positions.
+// generate() manages this; offset 0 starts a fresh cache.
 struct SequenceContext {
     std::size_t length = 0;
+    bool incremental = false;
+    std::size_t offset = 0;
 };
 using SequenceContextPtr = std::shared_ptr<SequenceContext>;
 
@@ -96,6 +103,10 @@ private:
     Matrix wQkvGrad_, bQkvGrad_, wOutGrad_, bOutGrad_;
     Matrix input_, qkv_, attention_, merged_;  // caches for backward
     std::size_t batch_ = 0, length_ = 0;
+
+    Matrix forwardIncremental(const Matrix& input);
+    std::vector<float> cacheK_, cacheV_;  // (positions x dim) keys / values for incremental inference
+    std::size_t cachedPositions_ = 0;
 };
 
 // y = x + f(x), where f is a stack of layers (a pre-norm transformer sub-block).
@@ -131,7 +142,8 @@ struct GPTConfig {
 // Appends a GPT-style decoder (pre-norm blocks) to `net`. The network maps
 // (batch x seqLen) token ids to (batch * seqLen) x vocab logits; train it with
 // SparseSoftmaxCrossEntropy against the (batch x seqLen) next-token ids.
-void buildGPT(Network& net, const GPTConfig& config);
+// Returns the shared sequence context; pass it to generate() for KV caching.
+SequenceContextPtr buildGPT(Network& net, const GPTConfig& config);
 
 } // namespace nc
 

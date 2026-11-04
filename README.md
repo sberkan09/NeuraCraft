@@ -90,7 +90,16 @@ Tiny Shakespeare, 2 epochs, 2-core x86 sandbox:
 | BPE (512) | 1.92 | 0.93 M | **259 s** | **1.817** |
 
 BPE sees about twice as much text in the same 64-token context and needs half
-the steps per epoch, so it is both better and faster here. Samples already
+the steps per epoch, so it is both better and faster here.
+
+Generation uses a **KV cache**: every attention layer keeps the keys and
+values of earlier positions, so each new token runs alone through the network
+instead of re-processing the whole window. On the model above that is
+**~1170 tokens/s instead of ~130** (9×), with identical output while the text
+fits in the context window. When the window fills up, the cache is rebuilt
+from its most recent half (positions are learned absolute embeddings, so the
+window cannot simply slide); pass no context to `generate()` for the exact
+sliding-window behaviour. Samples already
 have the play's structure (speaker names, verse lines) with partly invented
 words; more epochs or a wider model improve them:
 
@@ -113,14 +122,14 @@ cfg.vocabSize = tok.vocabSize();
 cfg.contextLength = 64;
 cfg.dim = 128; cfg.heads = 4; cfg.layers = 4;
 Network net;
-buildGPT(net, cfg);                  // (batch x seq) ids -> (batch*seq x vocab) logits
+auto ctx = buildGPT(net, cfg);       // (batch x seq) ids -> (batch*seq x vocab) logits
 
 SparseSoftmaxCrossEntropy loss;      // targets: next-token ids, any shape
 Adam opt(1e-3f);
 net.fit(d.x, d.y, loss, opt);
 
 SamplingOptions s; s.temperature = 0.8f; s.topK = 20;
-std::string out = tok.decode(generate(net, tok.encode("ROMEO:"), 200, cfg.contextLength, s));
+std::string out = tok.decode(generate(net, tok.encode("ROMEO:"), 200, cfg.contextLength, s, ctx));  // ctx: KV cache
 ```
 
 ## Performance and devices
@@ -240,7 +249,8 @@ dropout statistics, XOR training, save/load, CSV and IDX loading, every GEMM
 backend against a double-precision reference (all transpose combinations,
 ragged sizes), CPU-vs-GPU training equivalence, the thread pool, gradient
 checks for convolution, pooling, LayerNorm, GELU, attention and a whole GPT,
-attention causality, and a GPT that memorizes and regenerates a sequence. CI runs
+attention causality, KV-cached inference against the full forward pass, and a
+GPT that memorizes and regenerates a sequence. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
 kernels).
 

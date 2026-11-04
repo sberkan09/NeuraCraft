@@ -33,6 +33,11 @@ jobs:
       if: runner.os == 'macOS'
       run: NEURACRAFT_METAL_KERNEL=tiled ./build/neuracraft_tests
 
+    - name: Unit tests with the simdgroup Metal kernel forced
+      if: runner.os == 'macOS'
+      continue-on-error: true
+      run: NEURACRAFT_METAL_KERNEL=simdgroup ./build/neuracraft_tests && NEURACRAFT_METAL_KERNEL=simdgroup ./bin/NeuraCraft bench
+
     - name: Benchmark
       run: ./bin/NeuraCraft bench
 

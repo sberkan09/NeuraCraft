@@ -233,8 +233,10 @@ Context& context() {
             } else {
                 wantSimd = false;
             }
+            // NEURACRAFT_METAL_KERNEL=tiled|simdgroup overrides the automatic choice.
             const char* forced = std::getenv("NEURACRAFT_METAL_KERNEL");
             if (forced && std::string(forced) == "tiled") wantSimd = false;
+            if (forced && std::string(forced) == "simdgroup") wantSimd = true;
             if (wantSimd) {
                 NSError* simdErr = nil;
                 NSString* simdSrc = [NSString stringWithUTF8String:kSimdShaderSource];

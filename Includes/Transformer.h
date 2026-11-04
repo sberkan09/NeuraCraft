@@ -152,6 +152,13 @@ public:
     std::string name() const override { return "CausalSelfAttention"; }
     std::string describe() const override;
 
+    // Fused [Q | K | V] projection (dim x 3*dim, heads contiguous within each
+    // block) and the output projection (dim x dim), as in GPT-2's c_attn / c_proj.
+    Matrix& qkvWeight() { return wQkv_; }
+    Matrix& qkvBias() { return bQkv_; }
+    Matrix& outWeight() { return wOut_; }
+    Matrix& outBias() { return bOut_; }
+
 private:
     std::size_t dim_, heads_, headDim_;
     SequenceContextPtr context_;
@@ -205,6 +212,7 @@ public:
     std::vector<Param> parameters() override { return inner_.parameters(); }
     std::string name() const override { return "Residual"; }
     std::string describe() const override;
+    Network& inner() { return inner_; }
 
 private:
     Network inner_;

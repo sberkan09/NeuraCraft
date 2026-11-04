@@ -11,6 +11,8 @@
 //                              train a GPT on a text file (scripts/download_shakespeare.sh)
 //   NeuraCraft generate <text-file> [prompt] [length]
 //                              sample from the trained GPT
+//   NeuraCraft gpt2 <dir> [prompt] [tokens] [options]
+//                              run pretrained GPT-2 weights (scripts/download_gpt2.sh)
 //   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
 //
 // Global options: --gpu (Metal on Apple silicon), --threads N
@@ -25,6 +27,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <numeric>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -513,6 +516,75 @@ int runGenerate(const std::string& path, const std::string& prompt, std::size_t 
     return 0;
 }
 
+std::string quoted(const std::string& s) {  // Python-repr-like, for --check output
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\n') out += "\\n";
+        else if (c == '\'') out += "\\'";
+        else if (c == '\\') out += "\\\\";
+        else out += c;
+    }
+    return out + "'";
+}
+
+int runGpt2(const std::string& dir, const std::string& prompt, std::size_t tokens, const SamplingOptions& base,
+            bool check) {
+    const auto t0 = std::chrono::steady_clock::now();
+    PretrainedModel model;
+    std::unique_ptr<Gpt2Tokenizer> tok;
+    try {
+        tok = std::make_unique<Gpt2Tokenizer>(dir + "/vocab.json", dir + "/merges.txt");
+        model = loadGPT2(dir);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\ndownload GPT-2 with: scripts/download_gpt2.sh " << dir << '\n';
+        return 2;
+    }
+    const double loadSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::cerr << "loaded GPT-2 (" << model.net.parameterCount() / 1000000 << "M parameters, " << model.config.layers
+              << " layers, dim " << model.config.dim << ") in " << std::fixed << std::setprecision(1) << loadSeconds
+              << " s" << std::defaultfloat << '\n';
+
+    std::vector<int> ids = tok->encode(prompt);
+    if (ids.empty()) ids.push_back(tok->endOfText());
+    if (check) {
+        std::cout << "prompt ids:";
+        for (int id : ids) std::cout << ' ' << id;
+        std::cout << '\n';
+        Matrix x(1, ids.size());
+        for (std::size_t i = 0; i < ids.size(); ++i) x(0, i) = static_cast<float>(ids[i]);
+        const Matrix logits = model.net.predict(x);
+        const float* last = logits.data() + (logits.rows() - 1) * logits.cols();
+        std::vector<int> order(logits.cols());
+        std::iota(order.begin(), order.end(), 0);
+        std::partial_sort(order.begin(), order.begin() + 5, order.end(), [&](int a, int b) { return last[a] > last[b]; });
+        std::cout << "top-5 next:" << std::fixed << std::setprecision(4);
+        for (int k = 0; k < 5; ++k) std::cout << ' ' << order[static_cast<std::size_t>(k)] << ':' << last[order[static_cast<std::size_t>(k)]];
+        std::cout << std::defaultfloat << '\n';
+        SamplingOptions greedy;
+        greedy.temperature = 0.0f;
+        const auto more = generate(model.net, ids, tokens, model.config.contextLength, greedy, model.context);
+        std::vector<int> all = ids;
+        all.insert(all.end(), more.begin(), more.end());
+        std::cout << "greedy: " << quoted(tok->decode(all)) << '\n';
+        return 0;
+    }
+
+    SamplingOptions sampling = base;
+    sampling.stopToken = tok->endOfText();
+    sampling.onToken = [&](int id) {
+        if (id != tok->endOfText()) std::cout << tok->decode({id}) << std::flush;
+    };
+    std::cout << prompt << std::flush;
+    const auto start = std::chrono::steady_clock::now();
+    const auto out = generate(model.net, ids, tokens, model.config.contextLength, sampling, model.context);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::cout << '\n';
+    std::cerr << out.size() << " tokens in " << std::fixed << std::setprecision(2) << seconds << " s ("
+              << std::setprecision(1) << static_cast<double>(out.size()) / seconds << " tokens/s, prompt "
+              << ids.size() << " tokens)" << std::defaultfloat << '\n';
+    return 0;
+}
+
 // Times `run` (one n x n x n product); returns GFLOPS.
 double timeGemm(std::size_t n, const std::function<void()>& run) {
     run();  // warm-up
@@ -597,6 +669,8 @@ void usage() {
               << "                               train a GPT on a text file (BPE or character tokens)\n"
               << "  NeuraCraft generate <text-file> [prompt] [length]\n"
               << "                               sample text from the trained GPT\n"
+              << "  NeuraCraft gpt2 <dir> [prompt] [tokens] [--temperature T] [--top-k K] [--greedy] [--check]\n"
+              << "                               run pretrained GPT-2 (scripts/download_gpt2.sh)\n"
               << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
               << "options:\n"
               << "  --gpu          run large matrix products on the GPU (Metal)\n"
@@ -694,6 +768,37 @@ int main(int argc, char** argv) {
                 }
             }
             return runGpt(args[1], o);
+        }
+        if (cmd == "gpt2") {
+            if (args.size() < 2) {
+                usage();
+                return 2;
+            }
+            std::string prompt = "The meaning of life is";
+            std::size_t tokens = 60;
+            bool check = false;
+            SamplingOptions sampling;
+            sampling.temperature = 0.8f;
+            sampling.topK = 40;
+            std::size_t positional = 0;
+            for (std::size_t i = 2; i < args.size(); ++i) {
+                const std::string& a = args[i];
+                auto value = [&]() -> std::string {
+                    if (i + 1 >= args.size()) throw std::invalid_argument(a + " needs a value");
+                    return args[++i];
+                };
+                if (a == "--temperature") sampling.temperature = std::stof(value());
+                else if (a == "--top-k") sampling.topK = std::stoul(value());
+                else if (a == "--greedy") sampling.temperature = 0.0f;
+                else if (a == "--check") check = true;
+                else if (positional == 0) { prompt = a; ++positional; }
+                else if (positional == 1) { tokens = std::stoul(a); ++positional; }
+                else {
+                    std::cerr << "unknown gpt2 option: " << a << "\n";
+                    return 2;
+                }
+            }
+            return runGpt2(args[1], prompt, tokens, sampling, check);
         }
         if (cmd == "generate") {
             if (args.size() < 2) {

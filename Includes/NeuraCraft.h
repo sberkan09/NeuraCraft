@@ -7,16 +7,19 @@
 #include "Conv.h"
 #include "Data.h"
 #include "Dense.h"
+#include "Json.h"
 #include "Layer.h"
 #include "Loss.h"
 #include "Matrix.h"
 #include "Network.h"
 #include "Optimizer.h"
 #include "Parallel.h"
+#include "Pretrained.h"
 #include "Random.h"
+#include "SafeTensors.h"
 #include "Text.h"
 #include "Transformer.h"
 
-#define NEURACRAFT_VERSION "1.2.0"
+#define NEURACRAFT_VERSION "1.3.0"
 
 #endif // NEURACRAFT_H

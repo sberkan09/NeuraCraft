@@ -3,8 +3,9 @@
 A small, dependency-free neural network library written from scratch in C++17:
 dense, convolutional and transformer layers with hand-written backpropagation,
 losses, optimizers, data and text utilities, a multi-threaded SIMD CPU backend,
-Apple Accelerate and Metal GPU support — plus demos (MNIST, a character-level
-GPT) and a gradient-checked test suite.
+Apple Accelerate and Metal GPU support — plus demos (MNIST, a GPT trained from
+scratch, and OpenAI's pretrained GPT-2 running on the library's own layers)
+and a gradient-checked test suite.
 
 ## Build and run
 
@@ -165,6 +166,34 @@ SamplingOptions s; s.temperature = 0.8f; s.topK = 20;
 std::string out = tok.decode(generate(net, tok.encode("ROMEO:"), 200, cfg.contextLength, s, ctx));  // ctx: KV cache
 ```
 
+### Pretrained GPT-2
+
+```
+$ scripts/download_gpt2.sh data/gpt2      # 124M-parameter GPT-2 from Hugging Face (~550 MB)
+$ ./build_and_run.sh gpt2 data/gpt2 "Once upon a time, in a small village by the sea," 120
+$ ./build_and_run.sh gpt2 data/gpt2 "The meaning of life is" 20 --check
+```
+
+`gpt2` loads OpenAI's GPT-2 weights (`model.safetensors`) and tokenizer
+(`vocab.json` + `merges.txt`) into the library's own layers and streams a
+sampled continuation (temperature 0.8, top-k 40; `--greedy`,
+`--temperature`, `--top-k` change that). Larger GPT-2 checkpoints
+(gpt2-medium, -large, -xl) load the same way.
+
+It matches the reference implementation exactly: `scripts/gpt2_reference.py`
+is an independent NumPy GPT-2 (no shared code). For the prompt above both
+print the same token ids, top-5 logits and greedy continuation (*"The meaning
+of life is not the same as the meaning of death. …"*); over a 55-token mixed
+English/Turkish/emoji/code prompt all 55 × 50257 logits agree within
+1.1e-4 with the same argmax at every position. The tokenizer produces the
+same ids as Hugging Face `tokenizers` on 20 tricky inputs (contractions,
+whitespace runs, Turkish, CJK, emoji, code, symbols).
+
+On the 2-core x86 sandbox it loads in ~6 s, uses 1.1 GB at peak and
+generates ~16 tokens/s (memory-bandwidth bound: every token reads all 500 MB
+of weights). Apple silicon has several times the bandwidth and uses
+Accelerate, so expect it to be considerably faster there.
+
 ## Performance and devices
 
 All matrix products in the library go through one `gemm()` dispatcher
@@ -256,7 +285,8 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Layers | `Dense.h`, `Activations.h`, `Conv.h` | `Dense` (Xavier / He / zero init), `Conv2D` (stride, padding; im2col + GEMM), `MaxPool2D`, `ReLU`, `LeakyReLU`, `Sigmoid`, `Tanh`, `Softmax`, `Dropout` |
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
 | Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
-| Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k) |
+| Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `Gpt2Tokenizer` (byte-level BPE, identical ids), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
+| Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k, streaming callback, stop token) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |
 | Network | `Network.h` | `add<Layer>(...)`, `fit` (mini-batches, shuffling, validation, accuracy, LR schedule, gradient clipping, step limits, callbacks), `predict`, `evaluate`, `accuracy`, `summary`, `save` / `load`, `saveCheckpoint` / `loadCheckpoint` (exact resume) |
 | Data | `Data.h` | One-hot / argmax, train/test split, standardization, CSV load/save, MNIST IDX loader, XOR / spiral / sine generators |
@@ -293,8 +323,10 @@ checks for convolution, pooling, LayerNorm, GELU, attention and a whole GPT,
 attention causality, KV-cached inference against the full forward pass,
 RMSNorm, SwiGLU, rotary attention and a whole modern GPT (gradient checks),
 RoPE's relative-position invariance, exact sliding-cache generation far past
-the window, exact checkpoint resume, and GPTs (both architectures) that
-memorize and regenerate a sequence. CI runs
+the window, exact checkpoint resume, GPTs (both architectures) that memorize
+and regenerate a sequence, the JSON parser, safetensors (incl. F16/BF16),
+GPT-2 pre-tokenization (checked against Hugging Face), the GPT-2 tokenizer and
+the GPT-2 loader on a synthetic checkpoint. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
 kernels).
 
@@ -304,5 +336,5 @@ kernels).
 Includes/   public headers (NeuraCraft.h includes everything)
 src/        library sources + Main.cpp (demo CLI -> bin/NeuraCraft)
 tests/      unit tests
-scripts/    download_mnist.sh, download_shakespeare.sh
+scripts/    download_mnist.sh, download_shakespeare.sh, download_gpt2.sh, gpt2_reference.py
 ```

@@ -178,6 +178,10 @@ std::vector<Param> Network::parameters() {
     return params;
 }
 
+void Network::releaseGradients() {
+    for (const auto& p : parameters()) *p.grad = Matrix();
+}
+
 std::size_t Network::parameterCount() {
     std::size_t n = 0;
     for (const auto& p : parameters()) n += p.value->size();

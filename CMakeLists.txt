@@ -26,12 +26,15 @@ add_library(neuracraft_lib STATIC
     src/Conv.cpp
     src/Data.cpp
     src/Dense.cpp
+    src/Json.cpp
     src/Loss.cpp
     src/Matrix.cpp
     src/Network.cpp
     src/Optimizer.cpp
     src/Parallel.cpp
+    src/Pretrained.cpp
     src/Random.cpp
+    src/SafeTensors.cpp
     src/Text.cpp
     src/Transformer.cpp
 )

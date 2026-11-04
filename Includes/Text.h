@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -86,6 +87,8 @@ Dataset makeNextTokenDataset(const std::vector<int>& tokens, std::size_t seqLen,
 struct SamplingOptions {
     float temperature = 1.0f;  // 0 = always pick the most likely token
     std::size_t topK = 0;      // 0 = sample from the whole vocabulary
+    std::function<void(int)> onToken;  // called with each new token as it is produced (streaming)
+    int stopToken = -1;        // stop after producing this token (e.g. <|endoftext|>), -1 = never
 };
 
 // Autoregressive sampling from a language model built with buildGPT (or any

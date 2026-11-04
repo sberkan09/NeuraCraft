@@ -413,7 +413,7 @@ SD-Turbo's pictures are best at its native 512. The animations above are
 ### Text to video: AnimateDiff-Lightning
 
 ```
-$ scripts/download_animatediff.sh data/animatediff     # epiCRealism (SD 1.5), AnimateDiff-Lightning 4-step, TAESD (~5 GB)
+$ scripts/download_animatediff.sh data/animatediff     # epiCRealism (SD 1.5), AnimateDiff-Lightning 4-step, TAESD (~4.7 GB)
 $ ./build_and_run.sh video data/animatediff t2v "a corgi running on the beach, golden hour, photo" --frames 16 --seed 1
 ```
 
@@ -432,7 +432,11 @@ ByteDance's AnimateDiff-Lightning is distilled for 1, 2, 4 or 8 steps
 (Euler, linear betas, trailing timesteps, no guidance), so a 16-frame clip
 takes 4 UNet passes over 16 frames. `scripts/animatediff_reference.py` (NumPy)
 agrees with it within 3e-6 on a synthetic model; with the real int8 weights
-the predicted noise correlates 0.9998 with the float32 reference. TIMING_LINE
+the predicted noise correlates 0.9998 with the float32 reference.
+On the 2-core test machine the clip above (16 frames, 512 x 512, 4 steps,
+int8) took 20 minutes: 4.4 minutes per denoising step over all 16 frames,
+87 s of TAESD decoding, 2.2 GB peak memory. AnimateDiff v1 modules (no mid block module)
+are refused; any SD 1.5 model in diffusers layout can replace epiCRealism.
 
 ## Performance and devices
 

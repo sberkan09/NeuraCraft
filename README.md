@@ -486,7 +486,11 @@ $ ./build_and_run.sh txt2img data/animatediff "portrait photo of an old fisherma
       --steps 4 --sampler lcm --lora data/loras/lcm-lora-sdv1-5.safetensors --tiny-vae data/animatediff/taesd
 ```
 
-LCM_SAMPLE
+<p><img src="docs/images/lcm_lora_fisherman.jpg" width="320"></p>
+
+Above: epiCRealism + LCM-LoRA, 4 steps, TAESD, 512 x 512 (shown smaller):
+4 UNet passes, 72 s in all on the 2-core machine including model loading.
+AnimateLCM-style motion modules use the same `--sampler lcm`.
 
 **Output formats**, all written by the library itself: `.gif` (`saveGif`,
 256 colours, plays everywhere), `.png` (`saveApng`, animated PNG, full

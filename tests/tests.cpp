@@ -2212,6 +2212,262 @@ TEST(clip_text_encoder_matches_reference_forward) {
     std::filesystem::remove_all(dir);
 }
 
+TEST(multi_head_attention_matches_naive_and_chunks) {
+    setSeed(96);
+    // 2100 queries x 2100 keys exceeds one 4M-float chunk of scores.
+    for (auto [N, M] : {std::pair<std::size_t, std::size_t>{5, 7}, {2100, 2100}}) {
+        const std::size_t C = 4, heads = 2, dh = 2;
+        const Matrix q = Matrix::uniform(N, C, -1, 1), k = Matrix::uniform(M, C, -1, 1), v = Matrix::uniform(M, C, -1, 1);
+        const Matrix got = multiHeadAttention(q, k, v, heads);
+        for (std::size_t i = 0; i < N; i += (N > 10 ? 211 : 1))
+            for (std::size_t h = 0; h < heads; ++h) {
+                std::vector<double> s(M);
+                double mx = -1e300, sum = 0;
+                for (std::size_t j = 0; j < M; ++j) {
+                    double d = 0;
+                    for (std::size_t e = 0; e < dh; ++e) d += q(i, h * dh + e) * k(j, h * dh + e);
+                    mx = std::max(mx, s[j] = d / std::sqrt(double(dh)));
+                }
+                for (double& e : s) sum += e = std::exp(e - mx);
+                for (std::size_t e = 0; e < dh; ++e) {
+                    double acc = 0;
+                    for (std::size_t j = 0; j < M; ++j) acc += s[j] / sum * v(j, h * dh + e);
+                    CHECK_NEAR(got(i, h * dh + e), acc, 1e-5);
+                }
+            }
+    }
+    CHECK_THROWS(multiHeadAttention(Matrix(2, 4), Matrix(3, 4), Matrix(3, 4), 3), std::invalid_argument);
+}
+
+TEST(timestep_embedding_and_euler_scheduler) {
+    // dim 4: frequencies 1 and 1e-2; flip_sin_to_cos puts the cosines first.
+    const Matrix e = timestepEmbedding(999.0f, 4);
+    CHECK_NEAR(e(0, 0), std::cos(999.0), 1e-5);
+    CHECK_NEAR(e(0, 1), std::cos(9.99), 1e-5);
+    CHECK_NEAR(e(0, 2), std::sin(999.0), 1e-5);
+    CHECK_NEAR(e(0, 3), std::sin(9.99), 1e-5);
+    CHECK_NEAR(timestepEmbedding(5.0f, 4, false)(0, 0), std::sin(5.0), 1e-5);
+
+    // Reference values from diffusers' formulas (scaled_linear betas, trailing spacing).
+    const EulerScheduler one = EulerScheduler::standard(1);
+    CHECK(one.timesteps == std::vector<double>({999.0}) && one.sigmas.size() == 2 && one.sigmas[1] == 0.0);
+    CHECK_NEAR(one.sigmas[0], 14.614641229333639, 1e-6);
+    CHECK_NEAR(one.initNoiseSigma, 14.614641229333639, 1e-6);  // trailing: the largest sigma itself
+    const EulerScheduler four = EulerScheduler::standard(4);
+    CHECK(four.timesteps == std::vector<double>({999, 749, 499, 249}));
+    const double expected[4] = {14.614641229333639, 4.081729363724308, 1.612886194303876, 0.6932048996386885};
+    for (int i = 0; i < 4; ++i) CHECK_NEAR(four.sigmas[static_cast<std::size_t>(i)], expected[i], 1e-6);
+    CHECK_NEAR(four.inputScale(1), 1.0 / std::sqrt(expected[1] * expected[1] + 1.0), 1e-9);
+    // Leading spacing with steps_offset 1 (SD 1.5-style config), init sigma sqrt(max^2 + 1).
+    const std::string cfg = tempPath("scheduler.json");
+    std::ofstream(cfg) << R"({"beta_start":0.00085,"beta_end":0.012,"beta_schedule":"scaled_linear","num_train_timesteps":1000,)"
+                       << R"("timestep_spacing":"leading","steps_offset":1,"prediction_type":"epsilon"})";
+    const EulerScheduler lead = EulerScheduler::fromConfig(cfg, 4);
+    CHECK(lead.timesteps == std::vector<double>({751, 501, 251, 1}));
+    CHECK_NEAR(lead.sigmas[0], 4.116696479276065, 1e-6);
+    CHECK_NEAR(lead.sigmas[3], 0.04131441199678309, 1e-8);
+    CHECK_NEAR(lead.initNoiseSigma, std::sqrt(4.116696479276065 * 4.116696479276065 + 1.0), 1e-6);
+    std::ofstream(cfg) << R"({"prediction_type":"v_prediction"})";
+    CHECK_THROWS(EulerScheduler::fromConfig(cfg, 4), std::runtime_error);
+    std::filesystem::remove(cfg);
+    // One step from sigma to 0 returns x - sigma * eps (the predicted clean latent).
+    Matrix x{{1.0f, -2.0f}};
+    one.step(0, Matrix{{0.5f, 0.25f}}, x);
+    CHECK_NEAR(x(0, 0), 1.0 - 14.614641229333639 * 0.5, 1e-4);
+    CHECK_NEAR(x(0, 1), -2.0 - 14.614641229333639 * 0.25, 1e-4);
+}
+
+namespace {
+void addTensor(std::map<std::string, Matrix>& w, const std::string& name, std::size_t n, float lo, float hi) {
+    w[name] = Matrix::uniform(1, n, lo, hi);
+}
+
+// A tiny diffusers UNet2DConditionModel: two levels, cross-attention in the first.
+std::map<std::string, Matrix> tinyUNetWeights(const std::vector<std::size_t>& ch, std::size_t L, std::size_t ctx) {
+    std::map<std::string, Matrix> w;
+    const std::size_t temb = 4 * ch[0];
+    auto conv = [&](const std::string& n, std::size_t o, std::size_t i, std::size_t k) {
+        addTensor(w, n + ".weight", o * i * k * k, -0.3f, 0.3f);
+        addTensor(w, n + ".bias", o, -0.1f, 0.1f);
+    };
+    auto lin = [&](const std::string& n, std::size_t o, std::size_t i, bool bias) {
+        addTensor(w, n + ".weight", o * i, -0.3f, 0.3f);
+        if (bias) addTensor(w, n + ".bias", o, -0.1f, 0.1f);
+    };
+    auto norm = [&](const std::string& n, std::size_t c) {
+        addTensor(w, n + ".weight", c, 0.8f, 1.2f);
+        addTensor(w, n + ".bias", c, -0.1f, 0.1f);
+    };
+    auto resnet = [&](const std::string& p, std::size_t in, std::size_t out) {
+        norm(p + ".norm1", in);
+        conv(p + ".conv1", out, in, 3);
+        lin(p + ".time_emb_proj", out, temb, true);
+        norm(p + ".norm2", out);
+        conv(p + ".conv2", out, out, 3);
+        if (in != out) conv(p + ".conv_shortcut", out, in, 1);
+    };
+    auto attention = [&](const std::string& p, std::size_t C) {
+        norm(p + ".norm", C);
+        lin(p + ".proj_in", C, C, true);
+        lin(p + ".proj_out", C, C, true);
+        const std::string b = p + ".transformer_blocks.0";
+        for (const char* n : {".norm1", ".norm2", ".norm3"}) norm(b + n, C);
+        for (const char* n : {".attn1.to_q", ".attn1.to_k", ".attn1.to_v", ".attn2.to_q"}) lin(b + n, C, C, false);
+        lin(b + ".attn2.to_k", C, ctx, false);
+        lin(b + ".attn2.to_v", C, ctx, false);
+        lin(b + ".attn1.to_out.0", C, C, true);
+        lin(b + ".attn2.to_out.0", C, C, true);
+        lin(b + ".ff.net.0.proj", 8 * C, C, true);
+        lin(b + ".ff.net.2", C, 4 * C, true);
+    };
+    lin("time_embedding.linear_1", temb, ch[0], true);
+    lin("time_embedding.linear_2", temb, temb, true);
+    conv("conv_in", ch[0], 4, 3);
+    std::vector<std::size_t> skips{ch[0]};
+    std::size_t c = ch[0];
+    for (std::size_t i = 0; i < ch.size(); ++i) {
+        for (std::size_t j = 0; j < L; ++j) {
+            resnet("down_blocks." + std::to_string(i) + ".resnets." + std::to_string(j), c, ch[i]);
+            c = ch[i];
+            if (i == 0) attention("down_blocks.0.attentions." + std::to_string(j), c);
+            skips.push_back(c);
+        }
+        if (i + 1 < ch.size()) {
+            conv("down_blocks." + std::to_string(i) + ".downsamplers.0.conv", c, c, 3);
+            skips.push_back(c);
+        }
+    }
+    resnet("mid_block.resnets.0", c, c);
+    attention("mid_block.attentions.0", c);
+    resnet("mid_block.resnets.1", c, c);
+    for (std::size_t i = 0; i < ch.size(); ++i) {
+        const std::size_t out = ch[ch.size() - 1 - i];
+        for (std::size_t j = 0; j <= L; ++j) {
+            resnet("up_blocks." + std::to_string(i) + ".resnets." + std::to_string(j), c + skips.back(), out);
+            skips.pop_back();
+            c = out;
+            if (i + 1 == ch.size()) attention("up_blocks." + std::to_string(i) + ".attentions." + std::to_string(j), c);
+        }
+        if (i + 1 < ch.size()) conv("up_blocks." + std::to_string(i) + ".upsamplers.0.conv", c, c, 3);
+    }
+    norm("conv_norm_out", ch[0]);
+    conv("conv_out", 4, ch[0], 3);
+    return w;
+}
+
+void saveAll(const std::string& file, const std::map<std::string, Matrix>& w) {
+    std::vector<std::pair<std::string, const Matrix*>> refs;
+    for (const auto& [n, m] : w) refs.emplace_back(n, &m);
+    saveSafeTensors(file, refs);
+}
+
+void writeTinyUNet(const std::string& dir, std::size_t ctx) {
+    std::filesystem::create_directories(dir + "/unet");
+    std::ofstream(dir + "/unet/config.json")
+        << R"({"_class_name":"UNet2DConditionModel","act_fn":"silu","attention_head_dim":[2,2],"block_out_channels":[8,16],)"
+        << R"("cross_attention_dim":)" << ctx << R"(,"down_block_types":["CrossAttnDownBlock2D","DownBlock2D"],"flip_sin_to_cos":true,)"
+        << R"("freq_shift":0,"in_channels":4,"layers_per_block":1,"mid_block_type":"UNetMidBlock2DCrossAttn","norm_eps":1e-5,)"
+        << R"("norm_num_groups":4,"out_channels":4,"up_block_types":["UpBlock2D","CrossAttnUpBlock2D"],"use_linear_projection":true,)"
+        << R"("time_embedding_type":"positional","resnet_time_scale_shift":"default","transformer_layers_per_block":1})";
+    saveAll(dir + "/unet/diffusion_pytorch_model.safetensors", tinyUNetWeights({8, 16}, 1, ctx));
+}
+} // namespace
+
+TEST(unet_loader_builds_and_conditions_on_text_and_time) {
+    setSeed(97);
+    const std::string dir = tempPath("unet_tiny");
+    writeTinyUNet(dir, 6);
+    UNet2DCondition unet = loadUNet(dir, 4, 6);
+    CHECK(unet.latentShape().channels == 4 && unet.latentShape().height == 6 && unet.contextDim() == 6 && unet.parameterCount() > 1000);
+    const Matrix z = Matrix::uniform(1, 4 * 6 * 4, -1, 1), ctxA = Matrix::uniform(5, 6, -1, 1), ctxB = Matrix::uniform(5, 6, -1, 1);
+    const Matrix a = unet.forward(z, 999.0f, ctxA);
+    CHECK(a.cols() == z.cols());
+    CHECK(unet.forward(z, 999.0f, ctxA).approxEquals(a, 0.0f));      // deterministic
+    CHECK(!unet.forward(z, 999.0f, ctxB).approxEquals(a, 1e-4f));    // the text matters (cross-attention)
+    CHECK(!unet.forward(z, 10.0f, ctxA).approxEquals(a, 1e-4f));     // the timestep matters
+    CHECK_THROWS(unet.forward(Matrix(1, 5), 1.0f, ctxA), std::invalid_argument);
+    CHECK_THROWS(unet.forward(z, 1.0f, Matrix(5, 7)), std::invalid_argument);
+    CHECK_THROWS(loadUNet(dir, 3, 6), std::invalid_argument);  // latent sides must be multiples of 2
+    std::string cfg = loadText(dir + "/unet/config.json");
+    cfg.insert(1, R"("addition_embed_type":"text_time",)");
+    std::ofstream(dir + "/unet/config.json") << cfg;
+    CHECK_THROWS(loadUNet(dir, 4, 6), std::runtime_error);  // SDXL-style conditioning is refused
+    std::filesystem::remove_all(dir);
+}
+
+TEST(text_to_image_pipeline_runs_end_to_end) {
+    // Tokenizer, text encoder, UNet, VAE and scheduler, all tiny, in one diffusers directory.
+    setSeed(98);
+    const std::string dir = tempPath("sd_tiny");
+    std::filesystem::create_directories(dir + "/tokenizer");
+    const std::string tok = tinyClipTokenizer();
+    for (const char* f : {"vocab.json", "merges.txt", "tokenizer_config.json"})
+        std::filesystem::copy_file(tok + "/" + f, dir + "/tokenizer/" + f, std::filesystem::copy_options::overwrite_existing);
+    std::ofstream(dir + "/tokenizer/tokenizer_config.json") << R"({"pad_token":"!","added_tokens_decoder":{"0":{"content":"!"}}})";
+    std::filesystem::create_directories(dir + "/text_encoder");
+    std::ofstream(dir + "/text_encoder/config.json")
+        << R"({"hidden_act":"gelu","vocab_size":518,"hidden_size":6,"num_attention_heads":2,"intermediate_size":12,)"
+        << R"("num_hidden_layers":1,"max_position_embeddings":8})";
+    {
+        std::map<std::string, Matrix> w;
+        const std::string p = "text_model.", l = p + "encoder.layers.0.";
+        addTensor(w, p + "embeddings.token_embedding.weight", 518 * 6, -1, 1);
+        addTensor(w, p + "embeddings.position_embedding.weight", 8 * 6, -1, 1);
+        for (const char* n : {"layer_norm1", "layer_norm2"}) {
+            addTensor(w, l + n + ".weight", 6, 0.8f, 1.2f);
+            addTensor(w, l + n + ".bias", 6, -0.1f, 0.1f);
+        }
+        for (const char* n : {"q_proj", "k_proj", "v_proj", "out_proj"}) {
+            addTensor(w, l + "self_attn." + n + ".weight", 36, -0.4f, 0.4f);
+            addTensor(w, l + "self_attn." + n + ".bias", 6, -0.1f, 0.1f);
+        }
+        addTensor(w, l + "mlp.fc1.weight", 72, -0.4f, 0.4f);
+        addTensor(w, l + "mlp.fc1.bias", 12, -0.1f, 0.1f);
+        addTensor(w, l + "mlp.fc2.weight", 72, -0.4f, 0.4f);
+        addTensor(w, l + "mlp.fc2.bias", 6, -0.1f, 0.1f);
+        addTensor(w, p + "final_layer_norm.weight", 6, 0.8f, 1.2f);
+        addTensor(w, p + "final_layer_norm.bias", 6, -0.1f, 0.1f);
+        saveAll(dir + "/text_encoder/model.safetensors", w);
+    }
+    writeTinyUNet(dir, 6);
+    std::filesystem::create_directories(dir + "/vae");
+    std::ofstream(dir + "/vae/config.json") << R"({"act_fn":"silu","block_out_channels":[4,4,8,8],"latent_channels":4,)"
+                                            << R"("layers_per_block":1,"norm_num_groups":4,"scaling_factor":0.18215})";
+    {
+        std::map<std::string, Matrix> w;
+        for (const auto& [name, shape] : vaeTensorShapes({4, 4, 8, 8}, 1, 4)) {
+            std::size_t n = 1;
+            for (std::size_t d : shape) n *= d;
+            addTensor(w, name, n, -0.2f, 0.2f);
+        }
+        saveAll(dir + "/vae/diffusion_pytorch_model.safetensors", w);
+    }
+    std::filesystem::create_directories(dir + "/scheduler");
+    std::ofstream(dir + "/scheduler/scheduler_config.json") << R"({"beta_schedule":"scaled_linear","timestep_spacing":"trailing"})";
+
+    TextToImageOptions o;
+    o.width = 64;
+    o.height = 128;
+    o.steps = 2;
+    o.seed = 3;
+    std::vector<std::string> stages;
+    o.progress = [&](const std::string& s, double) { stages.push_back(s); };
+    const Image a = textToImage(dir, "hello he", o);
+    CHECK(a.width == 64 && a.height == 128 && a.channels == 3 && a.pixels.size() == 64 * 128 * 3);
+    CHECK(stages == std::vector<std::string>({"text encoder", "load unet", "step 1/2", "step 2/2", "vae decode"}));
+    o.progress = nullptr;
+    CHECK(textToImage(dir, "hello he", o).pixels == a.pixels);   // same seed, same image
+    o.seed = 4;
+    CHECK(textToImage(dir, "hello he", o).pixels != a.pixels);   // another seed, another image
+    o.guidance = 3.0f;                                           // classifier-free guidance runs both prompts
+    o.negativePrompt = "he";
+    CHECK(textToImage(dir, "hello he", o).pixels.size() == a.pixels.size());
+    o.width = 60;
+    CHECK_THROWS(textToImage(dir, "hello", o), std::invalid_argument);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(tok);
+}
+
 // ---- Training robustness ------------------------------------------------------------------
 
 TEST(cosine_schedule_and_gradient_clipping) {

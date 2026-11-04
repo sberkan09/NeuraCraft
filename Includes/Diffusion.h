@@ -9,7 +9,10 @@
 #include "Network.h"
 #include "Transformer.h"
 
+#include <functional>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace nc {
 
@@ -49,6 +52,74 @@ struct ClipTextEncoder {
 // model(.fp16).safetensors. Supports hidden_act gelu (OpenCLIP, SD 2 / Turbo)
 // and quick_gelu (OpenAI CLIP, SD 1.x).
 ClipTextEncoder loadClipTextEncoder(const std::string& directory);
+
+// Multi-head scaled dot-product attention without a mask: q (N x C), k and v
+// (M x C) -> N x C, channels split into `heads` contiguous groups. Queries go
+// in chunks, so memory stays O((N + M) C) rather than O(N M).
+Matrix multiHeadAttention(const Matrix& q, const Matrix& k, const Matrix& v, std::size_t heads);
+
+// Sinusoidal timestep embedding (diffusers' get_timestep_embedding): 1 x dim.
+Matrix timestepEmbedding(float timestep, std::size_t dim, bool flipSinToCos = true, float freqShift = 0.0f);
+
+// Stable Diffusion's denoiser (diffusers UNet2DConditionModel, SD 1.x / 2.x /
+// Turbo layouts): predicts the noise in a latent at a timestep, conditioned
+// on text hidden states through cross-attention. Built for one latent size.
+// Inference only.
+class UNet2DCondition {
+public:
+    UNet2DCondition();
+    ~UNet2DCondition();
+    UNet2DCondition(UNet2DCondition&&) noexcept;
+    UNet2DCondition& operator=(UNet2DCondition&&) noexcept;
+
+    // latent: 1 x (C h w); context: tokens x contextDim. Returns 1 x (C h w).
+    Matrix forward(const Matrix& latent, float timestep, const Matrix& context);
+    ImageShape latentShape() const;
+    std::size_t contextDim() const;
+    std::size_t parameterCount() const;
+
+    struct Impl;
+
+private:
+    std::unique_ptr<Impl> impl_;
+    friend UNet2DCondition loadUNet(const std::string&, std::size_t, std::size_t);
+};
+
+// Loads `directory`/unet (or `directory` itself): config.json plus
+// diffusion_pytorch_model(.fp16).safetensors, for latents of the given size
+// (image size / 8).
+UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, std::size_t latentHeight);
+
+// diffusers' EulerDiscreteScheduler (epsilon prediction; "scaled_linear" or
+// "linear" betas; "trailing", "leading" or "linspace" timestep spacing).
+struct EulerScheduler {
+    std::vector<double> timesteps;  // model timesteps, from noisy to clean
+    std::vector<double> sigmas;     // one per timestep, plus a final 0
+    double initNoiseSigma = 1.0;    // scale of the initial Gaussian latent
+
+    static EulerScheduler fromConfig(const std::string& schedulerConfigPath, std::size_t steps);
+    // Uses the defaults of Stable Diffusion (1000 steps, scaled_linear 0.00085 .. 0.012, trailing).
+    static EulerScheduler standard(std::size_t steps);
+    double inputScale(std::size_t step) const;  // multiply the latent by this before the UNet
+    // One Euler step from timestep `step` to the next, given the predicted noise.
+    void step(std::size_t step, const Matrix& noise, Matrix& latent) const;
+};
+
+struct TextToImageOptions {
+    std::size_t width = 512, height = 512;  // multiples of 64 for SD's 4-level UNet
+    std::size_t steps = 1;                  // SD-Turbo: 1 to 4
+    unsigned seed = 0;
+    float guidance = 0.0f;                  // classifier-free guidance scale; <= 1 = off (SD-Turbo)
+    std::string negativePrompt;             // used with guidance > 1
+    std::function<void(const std::string& stage, double seconds)> progress;  // after each stage / step
+};
+
+// The whole Stable Diffusion text-to-image pipeline on a diffusers directory
+// (tokenizer, text_encoder, unet, vae, scheduler): CLIP encodes the prompt,
+// the UNet denoises a seeded Gaussian latent with the Euler scheduler, the
+// VAE decodes it. Each model is loaded only for its stage, so peak memory is
+// about the UNet's.
+Image textToImage(const std::string& directory, const std::string& prompt, const TextToImageOptions& options = {});
 
 } // namespace nc
 

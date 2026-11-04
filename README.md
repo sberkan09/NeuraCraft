@@ -7,13 +7,16 @@ optimizers and data utilities — plus demos and a gradient-checked test suite.
 
 ## Build and run
 
-Requires CMake ≥ 3.10 (3.20+ for `ctest --test-dir`) and a C++17 compiler
-(GCC, Clang or Apple Clang).
+Requires CMake ≥ 3.16 (3.20+ for `ctest --test-dir`) and a C++17 compiler
+(GCC, Clang or Apple Clang). On macOS the Accelerate and Metal backends are
+built automatically; no other dependencies.
 
 ```
 $ ./build_and_run.sh            # XOR, spiral and sine demos
 $ ./build_and_run.sh spiral     # a single demo
 $ ./build_and_run.sh --test     # unit tests + demos via ctest
+$ ./build_and_run.sh bench      # matrix-multiply speed of every backend
+$ ./build_and_run.sh --gpu spiral   # run large products on the GPU
 ```
 
 Or with CMake directly:
@@ -35,6 +38,43 @@ $ ./build_and_run.sh mnist data/mnist 5     # 5 epochs
 Trains a 784-128-64-10 ReLU network with dropout and Adam, reports validation
 accuracy on the 10k test set every epoch and saves the weights to
 `data/mnist/mnist.weights`. An epoch takes a few seconds on a laptop CPU.
+
+## Performance and devices
+
+All matrix products in the library go through one `gemm()` dispatcher
+(`Backend.h`), which picks an implementation:
+
+| Backend | When | Notes |
+|---|---|---|
+| NeuraCraft blocked kernel | default CPU path on Linux / Windows | packed, register-tiled SIMD kernel (SSE/AVX/NEON via vector extensions), multi-threaded; results don't depend on the thread count |
+| Apple Accelerate | default CPU path on macOS | uses the AMX matrix units on Apple silicon |
+| Metal | `setDevice(Device::GPU)` / `--gpu` on Apple silicon | simdgroup-matrix kernel on M1 and later, tiled fallback elsewhere; shaders compile at runtime (no full Xcode needed) |
+
+```cpp
+nc::setThreadCount(8);                 // CPU threads (default: all cores)
+if (nc::setDevice(nc::Device::GPU))    // false -> stays on the CPU
+    std::cout << nc::deviceDescription() << "\n";
+nc::setGpuMinWork(1 << 22);            // smaller products stay on the CPU
+```
+
+The GPU only pays off for large products (big batches, wide layers): data
+lives in host memory and is copied to the GPU per product, so small ones run
+faster on the CPU. Accelerate is very strong on Apple silicon; run
+`./build_and_run.sh bench` to see which backend wins on your machine. Setting
+`NEURACRAFT_METAL_KERNEL=tiled` or `=simdgroup` overrides the Metal kernel choice.
+
+Measured matrix-multiply throughput (GFLOPS, square n×n):
+
+| n | old loop (v1.0) | blocked, 2-core x86, portable | blocked, same CPU, `-march=native` |
+|---:|---:|---:|---:|
+| 256 | 12.4 | 35 | 91 |
+| 1024 | 8.4 | 45 | 108 |
+| 2048 | – | 44 | 119 |
+
+`build_and_run.sh` builds with `NEURACRAFT_NATIVE=ON` (all instructions the CPU
+supports); plain CMake builds stay portable unless you pass
+`-DNEURACRAFT_NATIVE=ON`. On the same 2-core machine an MNIST epoch went from
+6.8 s to 2.3 s with identical results.
 
 ## Example
 
@@ -84,6 +124,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay) |
 | Network | `Network.h` | `add<Layer>(...)`, `fit` (mini-batches, shuffling, validation, accuracy, callbacks), `predict`, `evaluate`, `accuracy`, `summary`, `save` / `load` |
 | Data | `Data.h` | One-hot / argmax, train/test split, standardization, CSV load/save, MNIST IDX loader, XOR / spiral / sine generators |
+| Backends | `Backend.h`, `Parallel.h` | `gemm()` dispatch, CPU / Accelerate / Metal, `setDevice`, `setThreadCount`, `parallelFor` |
 | Random | `Random.h` | `setSeed()` makes initialization, shuffling and dropout reproducible |
 
 Conventions: a batch is a `(samples × features)` matrix, one sample per row.
@@ -103,8 +144,11 @@ match.
 
 `tests/tests.cpp` checks matrix operations, every layer's backward pass against
 numerical gradients (central differences), loss values, optimizer convergence,
-dropout statistics, XOR training, save/load, CSV and IDX loading. CI runs the
-tests and demos on Ubuntu and macOS.
+dropout statistics, XOR training, save/load, CSV and IDX loading, every GEMM
+backend against a double-precision reference (all transpose combinations,
+ragged sizes), CPU-vs-GPU training equivalence and the thread pool. CI runs
+the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
+kernels).
 
 ## Layout
 

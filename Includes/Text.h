@@ -87,10 +87,20 @@ Dataset makeNextTokenDataset(const std::vector<int>& tokens, std::size_t seqLen,
 struct SamplingOptions {
     float temperature = 1.0f;  // 0 = always pick the most likely token
     std::size_t topK = 0;      // 0 = sample from the whole vocabulary
+    float topP = 1.0f;         // nucleus sampling: smallest set of tokens with this much probability (1 = off)
+    // Tokens seen in the last `repetitionWindow` positions get their logits
+    // divided (if positive) or multiplied (if negative) by this; 1 = off.
+    float repetitionPenalty = 1.0f;
+    std::size_t repetitionWindow = 64;
     std::function<void(int)> onToken;  // called with each new token as it is produced (streaming)
     int stopToken = -1;        // stop after producing this token (e.g. <|endoftext|>), -1 = never
     std::vector<int> stopTokens;  // further stop tokens (Llama 3 ends turns with <|eot_id|> or <|eom_id|>)
 };
+
+// Picks the next token from one row of logits; `history` (the context so far)
+// is only used for the repetition penalty.
+int sampleToken(const float* logits, std::size_t vocab, const SamplingOptions& options,
+                const std::vector<int>& history = {});
 
 // Autoregressive sampling from a language model built with buildGPT (or any
 // network mapping 1 x L token ids to L x vocab logits). Uses at most the last
@@ -105,6 +115,33 @@ struct SamplingOptions {
 std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::size_t newTokens,
                           std::size_t contextLength, const SamplingOptions& options = SamplingOptions{},
                           const std::shared_ptr<SequenceContext>& kvCache = nullptr);
+
+// Generation that keeps its KV cache between calls, for multi-turn chat: each
+// call feeds only tokens the model has not seen yet (the new input, plus the
+// previous reply's last token), then samples until a stop token or maxTokens.
+// The network must not run other incremental passes in between (attention
+// layers check this and throw).
+class Generator {
+public:
+    Generator(Network& net, SequenceContextPtr context, std::size_t contextLength);
+
+    // Appends `input` to the conversation and returns the continuation.
+    std::vector<int> generate(const std::vector<int>& input, std::size_t maxTokens, const SamplingOptions& options);
+    void reset();  // forget the conversation
+    const std::vector<int>& history() const { return tokens_; }  // every token so far, prompts and replies
+    std::size_t cachedTokens() const { return fed_ - start_; }   // positions currently held by the KV cache
+
+private:
+    std::vector<float> feed(std::size_t from);  // runs tokens_[from..] on top of the cache; returns the last logits
+
+    Network& net_;
+    SequenceContextPtr context_;
+    std::size_t contextLength_;
+    std::vector<int> tokens_;
+    std::size_t fed_ = 0;     // tokens_[0..fed_) have been through the network
+    std::size_t start_ = 0;   // first token still covered by the cache (after a rebuild)
+    std::size_t offset_ = 0;  // the cache's next position
+};
 
 } // namespace nc
 

@@ -912,6 +912,10 @@ PretrainedModel loadLlama(const std::string& directory, bool int8) {
     if (std::ifstream(directory + "/generation_config.json")) {
         const json::Value g = json::parse(readFile(directory + "/generation_config.json"));
         addStops(g.find("eos_token_id"));
+        if (g.find("do_sample") && g.at("do_sample").boolean) {
+            model.temperature = static_cast<float>(g.numberOr("temperature", -1.0));
+            model.topP = static_cast<float>(g.numberOr("top_p", -1.0));
+        }
     }
     if (model.stopTokens.empty()) addStops(c.find("eos_token_id"));
     return model;

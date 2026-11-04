@@ -979,6 +979,70 @@ TEST(modern_kv_cache_slides) {
     CHECK(ctx->window == 0 && !ctx->incremental);
 }
 
+TEST(generator_keeps_the_cache_across_turns) {
+    // Greedy multi-turn generation equals generating from the whole transcript at once.
+    SamplingOptions greedy;
+    greedy.temperature = 0.0f;
+    for (bool rotary : {false, true}) {
+        setSeed(42);
+        SequenceContextPtr ctx;
+        Network net = rotary ? modernGpt(ctx, 64) : smallGpt(ctx, 64);
+        Generator chat(net, ctx, 64);
+        const std::vector<int> turn1{1, 2, 3}, turn2{4, 5};
+        const auto reply1 = chat.generate(turn1, 6, greedy);
+        CHECK(reply1 == generate(net, turn1, 6, 64, greedy));
+        CHECK(chat.cachedTokens() == turn1.size() + reply1.size() - 1);  // the last reply token is fed next turn
+        std::vector<int> transcript = turn1;
+        transcript.insert(transcript.end(), reply1.begin(), reply1.end());
+        transcript.insert(transcript.end(), turn2.begin(), turn2.end());
+        const auto reply2 = chat.generate(turn2, 6, greedy);
+        CHECK(reply2 == generate(net, transcript, 6, 64, greedy));
+        CHECK(chat.history().size() == transcript.size() + reply2.size());
+        CHECK(!ctx->incremental);
+        // Stop tokens end a turn early; reset() starts over.
+        SamplingOptions stop = greedy;
+        stop.stopTokens = {reply2[0]};
+        chat.reset();
+        CHECK(chat.history().empty() && chat.cachedTokens() == 0);
+        CHECK(chat.generate(transcript, 6, stop).size() == 1);
+    }
+    // Learned positions: a conversation longer than the context rebuilds the cache and keeps going.
+    setSeed(43);
+    SequenceContextPtr ctx;
+    Network net = smallGpt(ctx, 16);
+    Generator chat(net, ctx, 16);
+    for (int turn = 0; turn < 6; ++turn) CHECK(chat.generate({1, 2, 3}, 5, greedy).size() == 5);
+    CHECK(chat.cachedTokens() <= 16);
+}
+
+TEST(top_p_and_repetition_penalty) {
+    setSeed(44);
+    const float logits[4] = {std::log(0.5f), std::log(0.3f), std::log(0.15f), std::log(0.05f)};
+    SamplingOptions o;
+    o.temperature = 1.0f;
+    o.topP = 0.7f;  // keeps 0.5 + 0.3
+    int counts[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 4000; ++i) ++counts[sampleToken(logits, 4, o)];
+    CHECK(counts[2] == 0 && counts[3] == 0);
+    CHECK_NEAR(counts[0] / 4000.0, 0.625, 0.03);  // 0.5 / 0.8
+    o.topP = 0.4f;  // the most likely token alone covers it
+    for (int i = 0; i < 100; ++i) CHECK(sampleToken(logits, 4, o) == 0);
+    o.topP = 1.0f;
+    for (int i = 0; i < 4000; ++i) ++counts[sampleToken(logits, 4, o)];
+    CHECK(counts[3] > 100);  // off: every token can come up
+
+    // A strong penalty steers greedy decoding away from recent tokens, within the window only.
+    const float l2[3] = {2.0f, 1.5f, -1.0f};
+    SamplingOptions g;
+    g.temperature = 0.0f;
+    CHECK(sampleToken(l2, 3, g, {0}) == 0);
+    g.repetitionPenalty = 2.0f;
+    CHECK(sampleToken(l2, 3, g, {0}) == 1);
+    CHECK(sampleToken(l2, 3, g, {0, 1}) == 0);  // both penalized: 1.0 vs 0.75
+    g.repetitionWindow = 1;
+    CHECK(sampleToken(l2, 3, g, {0, 2}) == 0);  // token 0 is outside the window
+}
+
 TEST(modern_gpt_learns_and_config_roundtrip) {
     setSeed(65);
     const std::string text = "abcdefgh abcdefgh abcdefgh abcdefgh abcdefgh abcdefgh ";
@@ -1045,9 +1109,41 @@ TEST(int8_weights_error_bounds_and_outliers) {
 
     const Matrix x = Matrix::uniform(3, 200, -1, 1);
     const Matrix exact = x * back;  // the product with the dequantized weights
-    CHECK(q.multiply(x).approxEquals(exact, 1e-3f));
+    CHECK(q.multiplyFloat(x).approxEquals(exact, 1e-3f));
+    // Integer products round each input to 1/127 of its 32-column block's
+    // largest magnitude (here <= 1), so the error is at most sum_k |w_kj| / 254.
+    const Matrix fast = q.multiply(x);
+    for (std::size_t j = 0; j < 70; ++j) {
+        double bound = 1e-4;
+        for (std::size_t k = 0; k < 200; ++k) bound += std::fabs(back(k, j)) / 254.0;
+        for (std::size_t i = 0; i < 3; ++i) CHECK(std::fabs(fast(i, j) - exact(i, j)) <= bound);
+    }
+    setInt8Inputs(false);
+    CHECK(q.multiply(x).approxEquals(q.multiplyFloat(x), 0.0f));
+    setInt8Inputs(true);
     const QuantizedWeights fromRows = QuantizedWeights::fromOutIn(w.transpose());
     CHECK(fromRows.dequantize().approxEquals(back, 0.0f));
+}
+
+TEST(int8_kernel_paths_agree) {
+    // Single rows (token-by-token) and batches (prompts, four weight rows at a
+    // time) give the same numbers, for ragged sizes and block layouts.
+    setSeed(82);
+    for (auto [out, in] : {std::pair<std::size_t, std::size_t>{37, 200}, {9, 70}, {6, 40}, {130, 64}, {5, 1000}}) {
+        const QuantizedWeights q = QuantizedWeights::fromOutIn(Matrix::uniform(out, in, -1, 1));
+        const Matrix x = Matrix::uniform(5, in, -3, 3);
+        const Matrix all = q.multiply(x), ref = q.multiplyFloat(x);
+        double scale = 0;
+        for (std::size_t i = 0; i < ref.size(); ++i) scale = std::max(scale, static_cast<double>(std::fabs(ref.data()[i])));
+        for (std::size_t i = 0; i < 5; ++i) {
+            const Matrix one = q.multiply(x.sliceRows(i, i + 1));
+            for (std::size_t j = 0; j < out; ++j) {
+                CHECK_NEAR(one(0, j), all(i, j), 1e-4 * scale);
+                CHECK_NEAR(all(i, j), ref(i, j), 0.02 * scale);
+            }
+        }
+    }
+    CHECK(std::string(QuantizedWeights::kernelName()).rfind("int8", 0) == 0);
 }
 
 TEST(dense_and_network_quantization) {

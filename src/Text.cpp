@@ -265,25 +265,50 @@ Dataset makeNextTokenDataset(const std::vector<int>& tokens, std::size_t seqLen,
     return d;
 }
 
-namespace {
-int sampleToken(const float* logits, std::size_t vocab, const SamplingOptions& options) {
+int sampleToken(const float* raw, std::size_t vocab, const SamplingOptions& options, const std::vector<int>& history) {
+    const float* logits = raw;
+    std::vector<float> penalized;
+    if (options.repetitionPenalty != 1.0f && !history.empty()) {
+        penalized.assign(raw, raw + vocab);
+        const std::size_t from = history.size() > options.repetitionWindow ? history.size() - options.repetitionWindow : 0;
+        std::vector<bool> seen(vocab, false);
+        for (std::size_t i = from; i < history.size(); ++i) {
+            const int id = history[i];
+            if (id < 0 || static_cast<std::size_t>(id) >= vocab || seen[static_cast<std::size_t>(id)]) continue;
+            seen[static_cast<std::size_t>(id)] = true;
+            float& v = penalized[static_cast<std::size_t>(id)];
+            v = v > 0.0f ? v / options.repetitionPenalty : v * options.repetitionPenalty;
+        }
+        logits = penalized.data();
+    }
     if (options.temperature <= 0.0f) return static_cast<int>(std::max_element(logits, logits + vocab) - logits);
     std::vector<std::size_t> order(vocab);
     std::iota(order.begin(), order.end(), 0);
     std::size_t keep = vocab;
+    auto byLogit = [&](std::size_t a, std::size_t b) { return logits[a] > logits[b]; };
     if (options.topK > 0 && options.topK < vocab) {
         keep = options.topK;
-        std::partial_sort(order.begin(), order.begin() + static_cast<long>(keep), order.end(),
-                          [&](std::size_t a, std::size_t b) { return logits[a] > logits[b]; });
+        std::partial_sort(order.begin(), order.begin() + static_cast<long>(keep), order.end(), byLogit);
+    } else if (options.topP < 1.0f) {
+        std::sort(order.begin(), order.end(), byLogit);
     }
     float maxVal = -std::numeric_limits<float>::infinity();
     for (std::size_t i = 0; i < keep; ++i) maxVal = std::max(maxVal, logits[order[i]]);
-    std::vector<float> probs(keep);
-    for (std::size_t i = 0; i < keep; ++i) probs[i] = std::exp((logits[order[i]] - maxVal) / options.temperature);
+    std::vector<double> probs(keep);
+    double total = 0.0;
+    for (std::size_t i = 0; i < keep; ++i) total += probs[i] = std::exp((logits[order[i]] - maxVal) / options.temperature);
+    if (options.topP < 1.0f) {
+        // `order` is sorted here: keep the most likely tokens until their mass reaches topP.
+        double mass = 0.0;
+        std::size_t n = 0;
+        while (n < keep && (n == 0 || mass < options.topP * total)) mass += probs[n++];
+        probs.resize(n);
+    }
     std::discrete_distribution<std::size_t> pick(probs.begin(), probs.end());
     return static_cast<int>(order[pick(rng())]);
 }
 
+namespace {
 Matrix tokensRow(const std::vector<int>& tokens, std::size_t from) {
     Matrix x(1, tokens.size() - from);
     for (std::size_t t = from; t < tokens.size(); ++t) x(0, t - from) = static_cast<float>(tokens[t]);
@@ -315,47 +340,72 @@ std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::siz
                           const std::shared_ptr<SequenceContext>& kvCache) {
     if (prompt.empty()) throw std::invalid_argument("generate: prompt must contain at least one token");
     if (contextLength == 0) throw std::invalid_argument("generate: contextLength must be > 0");
+    if (newTokens == 0) return {};
+    if (kvCache) {
+        Generator g(net, kvCache, contextLength);
+        return g.generate(prompt, newTokens, options);
+    }
     std::vector<int> tokens = prompt, produced;
     produced.reserve(newTokens);
-    if (newTokens == 0) return produced;
-
-    if (!kvCache) {
-        for (std::size_t step = 0; step < newTokens; ++step) {
-            const std::size_t len = std::min(contextLength, tokens.size());
-            const Matrix logits = net.predict(tokensRow(tokens, tokens.size() - len));
-            const int next = sampleToken(logits.data() + (logits.rows() - 1) * logits.cols(), logits.cols(), options);
-            tokens.push_back(next);
-            produced.push_back(next);
-            if (options.onToken) options.onToken(next);
-            if (isStop(next, options)) break;
-        }
-        return produced;
-    }
-
-    IncrementalScope scope(*kvCache);
-    // Rotary models slide the cache by one token per step (exactly like the
-    // uncached sliding window); learned positions need a rebuild when full.
-    const bool sliding = kvCache->slidingCacheSupported;
-    kvCache->window = sliding ? contextLength : 0;
-    // Runs tokens[from..] through the network on top of the cache; returns the last logits row.
-    auto feed = [&](std::size_t from) {
-        const Matrix logits = net.predict(tokensRow(tokens, from));
-        kvCache->offset += tokens.size() - from;
-        return std::vector<float>(logits.data() + (logits.rows() - 1) * logits.cols(), logits.data() + logits.size());
-    };
-    std::vector<float> last = feed(tokens.size() - std::min(contextLength, tokens.size()));
     for (std::size_t step = 0; step < newTokens; ++step) {
-        const int next = sampleToken(last.data(), last.size(), options);
+        const std::size_t len = std::min(contextLength, tokens.size());
+        const Matrix logits = net.predict(tokensRow(tokens, tokens.size() - len));
+        const int next = sampleToken(logits.data() + (logits.rows() - 1) * logits.cols(), logits.cols(), options, tokens);
         tokens.push_back(next);
         produced.push_back(next);
         if (options.onToken) options.onToken(next);
-        if (step + 1 == newTokens || isStop(next, options)) break;
-        if (!sliding && kvCache->offset >= contextLength) {
-            kvCache->offset = 0;  // cache full: rebuild from the most recent half window
-            last = feed(tokens.size() - std::max<std::size_t>(1, contextLength / 2));
-        } else {
-            last = feed(tokens.size() - 1);
-        }
+        if (isStop(next, options)) break;
+    }
+    return produced;
+}
+
+Generator::Generator(Network& net, SequenceContextPtr context, std::size_t contextLength)
+    : net_(net), context_(std::move(context)), contextLength_(contextLength) {
+    if (!context_) throw std::invalid_argument("Generator: a SequenceContext (from buildGPT) is required");
+    if (contextLength_ == 0) throw std::invalid_argument("Generator: contextLength must be > 0");
+}
+
+void Generator::reset() {
+    tokens_.clear();
+    fed_ = start_ = offset_ = 0;
+}
+
+std::vector<float> Generator::feed(std::size_t from) {
+    context_->offset = offset_;
+    const Matrix logits = net_.predict(tokensRow(tokens_, from));
+    offset_ += tokens_.size() - from;
+    fed_ = tokens_.size();
+    return std::vector<float>(logits.data() + (logits.rows() - 1) * logits.cols(), logits.data() + logits.size());
+}
+
+std::vector<int> Generator::generate(const std::vector<int>& input, std::size_t maxTokens, const SamplingOptions& options) {
+    tokens_.insert(tokens_.end(), input.begin(), input.end());
+    if (tokens_.size() == fed_) throw std::invalid_argument("Generator: nothing new to feed");
+    std::vector<int> produced;
+    if (maxTokens == 0) return produced;
+
+    IncrementalScope scope(*context_);
+    // Rotary models slide the cache by one token per step (exactly like the
+    // uncached sliding window); learned positions need a rebuild when full.
+    const bool sliding = context_->slidingCacheSupported;
+    context_->window = sliding ? contextLength_ : 0;
+    auto rebuild = [&](std::size_t keep) {  // restart the cache from the last `keep` tokens
+        start_ = tokens_.size() - std::min(keep, tokens_.size());
+        offset_ = 0;
+        return feed(start_);
+    };
+    std::vector<float> last;
+    if (fed_ == 0) last = rebuild(contextLength_);
+    else if (!sliding && offset_ + (tokens_.size() - fed_) > contextLength_) last = rebuild(std::max<std::size_t>(1, contextLength_ / 2));
+    else last = feed(fed_);
+    for (std::size_t step = 0; step < maxTokens; ++step) {
+        const int next = sampleToken(last.data(), last.size(), options, tokens_);
+        tokens_.push_back(next);
+        produced.push_back(next);
+        if (options.onToken) options.onToken(next);
+        if (step + 1 == maxTokens || isStop(next, options)) break;
+        if (!sliding && offset_ >= contextLength_) last = rebuild(std::max<std::size_t>(1, contextLength_ / 2));
+        else last = feed(tokens_.size() - 1);
     }
     return produced;
 }

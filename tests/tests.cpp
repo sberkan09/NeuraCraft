@@ -3146,6 +3146,91 @@ TEST(animatediff_motion_modules_and_text_to_video) {
     std::filesystem::remove_all(tok);
 }
 
+TEST(lora_merging_and_lcm_sampler) {
+    // LoraMerger: kohya and PEFT names, alpha / rank scaling, user scale.
+    const std::string file = tempPath("lora_k.safetensors"), peft = tempPath("lora_p.safetensors");
+    {
+        std::map<std::string, Matrix> w;
+        w["lora_unet_down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_q.lora_down.weight"] = Matrix::uniform(2, 8, -1, 1);
+        w["lora_unet_down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_q.lora_up.weight"] = Matrix::uniform(8, 2, -1, 1);
+        w["lora_unet_down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_q.alpha"] = Matrix(1, 1, std::vector<float>{1.0f});
+        w["lora_te_text_model_encoder_layers_0_mlp_fc1.lora_down.weight"] = Matrix::uniform(2, 6, -1, 1);
+        w["lora_te_text_model_encoder_layers_0_mlp_fc1.lora_up.weight"] = Matrix::uniform(12, 2, -1, 1);
+        saveAll(file, w);
+        std::map<std::string, Matrix> p;
+        p["unet.mid_block.attentions.0.proj_in.lora_A.weight"] = Matrix::uniform(3, 16, -1, 1);
+        p["unet.mid_block.attentions.0.proj_in.lora_B.weight"] = Matrix::uniform(16, 3, -1, 1);
+        saveAll(peft, p);
+    }
+    LoraMerger m({{file, 0.5f}}, "unet");
+    CHECK(m.layers() == 1 && m.merged() == 0);
+    Matrix weight = Matrix::uniform(8, 8, -1, 1), expected = weight;
+    {
+        const SafeTensors st(file);
+        const Matrix down = st.load("lora_unet_down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_q.lora_down.weight");
+        const Matrix up = st.load("lora_unet_down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_q.lora_up.weight");
+        for (std::size_t o = 0; o < 8; ++o)
+            for (std::size_t i = 0; i < 8; ++i)
+                for (std::size_t r = 0; r < 2; ++r) expected(o, i) += 0.5f * (1.0f / 2.0f) * up(o, r) * down(r, i);
+    }
+    m.apply("down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.weight", weight);
+    for (std::size_t k = 0; k < 64; ++k) CHECK_NEAR(weight.data()[k], expected.data()[k], 1e-5);
+    CHECK(m.merged() == 1 && m.unmerged().empty());
+    Matrix untouched = Matrix::uniform(8, 8, -1, 1), copy = untouched;
+    m.apply("down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_k.weight", untouched);
+    CHECK(untouched.values() == copy.values());
+    Matrix wrong(4, 4);
+    CHECK_THROWS(m.apply("down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.weight", wrong), std::runtime_error);
+    CHECK(LoraMerger({{file, 1.0f}}, "text_encoder").layers() == 1);
+
+    // Loaders: a LoRA changes the UNet's output, scale 0 does not; one for no layer is refused.
+    std::string tok;
+    const std::string dir = writeTinyStableDiffusion("sd_lora", tok);
+    const Matrix latent = Matrix::normal(1, 4 * 8 * 8, 0.0f, 1.0f), ctx = Matrix::uniform(8, 6, -1.0f, 1.0f);
+    const Matrix base = loadUNet(dir, 8, 8).forward(latent, 300.0f, ctx);
+    CHECK(loadUNet(dir, 8, 8, false, {{file, 0.0f}}).forward(latent, 300.0f, ctx).values() == base.values());
+    const Matrix adapted = loadUNet(dir, 8, 8, false, {{file, 1.0f}, {peft, 1.0f}}).forward(latent, 300.0f, ctx);
+    double d = 0;
+    for (std::size_t k = 0; k < base.size(); ++k) d += std::abs(adapted.data()[k] - base.data()[k]);
+    CHECK(d > 1e-3);
+    {
+        std::map<std::string, Matrix> w;
+        w["lora_unet_no_such_layer.lora_down.weight"] = Matrix::uniform(2, 8, -1, 1);
+        w["lora_unet_no_such_layer.lora_up.weight"] = Matrix::uniform(8, 2, -1, 1);
+        saveAll(tempPath("lora_bad.safetensors"), w);
+    }
+    CHECK_THROWS(loadUNet(dir, 8, 8, false, {{tempPath("lora_bad.safetensors"), 1.0f}}), std::runtime_error);
+    // The text encoder half (lora_te_*) changes the text hidden states.
+    const std::vector<int> ids{1, 2, 3, 4, 5, 0, 0, 0};
+    CHECK(loadClipTextEncoder(dir, false, {{file, 1.0f}}).encode(ids).values() != loadClipTextEncoder(dir).encode(ids).values());
+
+    // LCM scheduler: diffusers' timesteps, unit noise in VP space, the last step returns the denoised latent.
+    const EulerScheduler s = EulerScheduler::lcm(4);
+    CHECK(s.consistency && s.timesteps == std::vector<double>({999, 759, 519, 279}) && s.sigmas.back() == 0.0);
+    CHECK(std::abs(s.initNoiseSigma - std::sqrt(s.sigmas[0] * s.sigmas[0] + 1.0)) < 1e-9);
+    Matrix x(1, 3, std::vector<float>{1.0f, -2.0f, 0.5f});
+    const Matrix eps(1, 3, std::vector<float>{0.1f, 0.2f, -0.3f});
+    const Matrix x0 = x;
+    s.step(3, eps, x);
+    const double ts = 2790.0, cSkip = 0.25 / (ts * ts + 0.25), cOut = ts / std::sqrt(ts * ts + 0.25);
+    const double vp = 1.0 / std::sqrt(s.sigmas[3] * s.sigmas[3] + 1.0);
+    for (std::size_t k = 0; k < 3; ++k)
+        CHECK_NEAR(x.data()[k], cOut * (x0.data()[k] - s.sigmas[3] * eps.data()[k]) + cSkip * x0.data()[k] * vp, 1e-5);
+    // The pipeline with the LCM sampler and a LoRA.
+    TextToImageOptions o;
+    o.width = o.height = 64;
+    o.steps = 2;
+    o.sampler = "lcm";
+    o.loras = {{file, 1.0f}};
+    const Image a = textToImage(dir, "hello", o);
+    CHECK(a.width == 64 && textToImage(dir, "hello", o).pixels == a.pixels);
+    o.sampler = "ddim";
+    CHECK_THROWS(textToImage(dir, "hello", o), std::invalid_argument);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(tok);
+    for (const std::string& f : {file, peft, tempPath("lora_bad.safetensors")}) std::filesystem::remove(f);
+}
+
 // ---- Training robustness ------------------------------------------------------------------
 
 TEST(cosine_schedule_and_gradient_clipping) {

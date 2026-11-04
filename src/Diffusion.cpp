@@ -318,7 +318,7 @@ Matrix ClipTextEncoder::encode(const std::vector<int>& ids) {
     return net.predict(x);
 }
 
-ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8) {
+ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8, const std::vector<Lora>& loras) {
     const std::string dir = exists(directory + "/config.json") ? directory : directory + "/text_encoder";
     const json::Value c = json::parse(readFile(dir + "/config.json"));
     std::string file = dir + "/model.safetensors";
@@ -340,8 +340,10 @@ ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8) {
     enc.dim = D;
     const float eps = static_cast<float>(c.numberOr("layer_norm_eps", 1e-5));
     SafeTensors st(file);
+    LoraMerger lora(loras, "text_encoder");
     auto load = [&](const std::string& name, std::size_t rows, std::size_t cols) {
         Matrix m = st.load(name);
+        lora.apply(name, m);
         if (m.size() != rows * cols)
             throw std::runtime_error("loadClipTextEncoder: " + name + " has " + std::to_string(m.size()) + " values, expected " +
                                      std::to_string(rows * cols));

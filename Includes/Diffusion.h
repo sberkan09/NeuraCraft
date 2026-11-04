@@ -6,6 +6,7 @@
 
 #include "Conv.h"
 #include "Image.h"
+#include "Lora.h"
 #include "Network.h"
 #include "Transformer.h"
 
@@ -68,7 +69,7 @@ struct ClipTextEncoder {
 // Loads `directory`/text_encoder (or `directory` itself): config.json plus
 // model(.fp16).safetensors. Supports hidden_act gelu (OpenCLIP, SD 2 / Turbo)
 // and quick_gelu (OpenAI CLIP, SD 1.x). int8 quantizes its matrices.
-ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8 = false);
+ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8 = false, const std::vector<Lora>& loras = {});
 
 // Multi-head scaled dot-product attention without a mask: q (N x C), k and v
 // (M x C) -> N x C, channels split into `heads` contiguous groups. Queries go
@@ -107,7 +108,7 @@ public:
 
 private:
     std::unique_ptr<Impl> impl_;
-    friend UNet2DCondition loadUNet(const std::string&, std::size_t, std::size_t, bool);
+    friend UNet2DCondition loadUNet(const std::string&, std::size_t, std::size_t, bool, const std::vector<Lora>&);
     friend void loadMotionModules(UNet2DCondition&, const std::string&, bool);
 };
 
@@ -122,7 +123,9 @@ void loadMotionModules(UNet2DCondition& unet, const std::string& file, bool int8
 // diffusion_pytorch_model(.fp16).safetensors, for latents of the given size
 // (image size / 8). With int8, every convolution and linear layer is
 // quantized as soon as it is loaded (about a quarter of the memory).
-UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, std::size_t latentHeight, bool int8 = false);
+// LoRA files in `loras` are merged into the weights first (before int8).
+UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, std::size_t latentHeight, bool int8 = false,
+                         const std::vector<Lora>& loras = {});
 
 // diffusers' EulerDiscreteScheduler (epsilon prediction; "scaled_linear" or
 // "linear" betas; "trailing", "leading" or "linspace" timestep spacing).
@@ -130,8 +133,17 @@ struct EulerScheduler {
     std::vector<double> timesteps;  // model timesteps, from noisy to clean
     std::vector<double> sigmas;     // one per timestep, plus a final 0
     double initNoiseSigma = 1.0;    // scale of the initial Gaussian latent
+    // Latent consistency (LCMScheduler, for LCM / LCM-LoRA / AnimateLCM
+    // models): each step predicts the clean latent through the consistency
+    // boundary condition and re-noises it to the next timestep with fresh
+    // noise from the library's random generator.
+    bool consistency = false;
 
     static EulerScheduler fromConfig(const std::string& schedulerConfigPath, std::size_t steps);
+    // diffusers' LCMScheduler timesteps (from 50 original steps) and step rule.
+    static EulerScheduler lcm(std::size_t steps, const std::string& betaSchedule = "scaled_linear", double betaStart = 0.00085,
+                              double betaEnd = 0.012, std::size_t originalSteps = 50, std::size_t trainSteps = 1000);
+    static EulerScheduler lcmFromConfig(const std::string& schedulerConfigPath, std::size_t steps);
     // Explicit settings (diffusers names: "scaled_linear" / "linear", "trailing" / "leading" / "linspace").
     static EulerScheduler make(std::size_t steps, const std::string& betaSchedule, const std::string& spacing,
                                double betaStart = 0.00085, double betaEnd = 0.012, std::size_t trainSteps = 1000,
@@ -151,7 +163,9 @@ struct TextToImageOptions {
     std::string negativePrompt;             // used with guidance > 1
     std::string tinyVae;                    // TAESD directory: decode with it instead of the full VAE
     bool int8 = true;                       // int8 UNet and text encoder weights (false: float32)
+    std::string sampler = "euler";          // "euler", or "lcm" for LCM models / LCM-LoRA (4 to 8 steps, guidance 1)
     float strength = 0.5f;                  // image to image: how much of the schedule runs (0 keeps the input)
+    std::vector<Lora> loras;                // LoRA files merged into the UNet and text encoder
     std::function<void(const std::string& stage, double seconds)> progress;  // after each stage / step
 };
 
@@ -264,6 +278,7 @@ struct TextToVideoOptions {
     // 0); each frame's text condition is interpolated between the keyframes
     // around it, so the scene changes over the clip.
     std::vector<std::pair<std::size_t, std::string>> promptAt;
+    std::vector<Lora> loras;  // merged into the UNet and text encoder (not the motion module)
     std::size_t steps = 4;                  // AnimateDiff-Lightning: the step count the module was distilled for
     unsigned seed = 0;
     float guidance = 1.0f;                  // <= 1: off (Lightning); else classifier-free guidance
@@ -274,6 +289,7 @@ struct TextToVideoOptions {
     // Lightning's schedule: Euler, linear betas, trailing timesteps. "config"
     // uses DIR/scheduler/scheduler_config.json instead (other motion modules).
     std::string betaSchedule = "linear";
+    std::string sampler = "euler";  // "lcm" for AnimateLCM / LCM-LoRA (uses the model's scheduler config betas)
     std::function<void(const std::string& stage, double seconds)> progress;
 };
 

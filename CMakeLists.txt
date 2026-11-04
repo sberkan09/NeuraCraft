@@ -30,6 +30,7 @@ add_library(neuracraft_lib STATIC
     src/Image.cpp
     src/Json.cpp
     src/Layer.cpp
+    src/Lora.cpp
     src/Loss.cpp
     src/Matrix.cpp
     src/Network.cpp

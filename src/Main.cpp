@@ -1265,7 +1265,9 @@ int main(int argc, char** argv) {
                 std::cerr << e.what() << "\ndownload SD-Turbo with: scripts/download_sd_turbo.sh " << args[1] << '\n';
                 return 2;
             }
-            saveGif(output, video, fps);
+            const bool apng = output.size() >= 4 && output.compare(output.size() - 4, 4, ".png") == 0;
+            if (apng) saveApng(output, video, fps);  // full colour
+            else saveGif(output, video, fps);
             if (!framesDir.empty()) {
                 std::filesystem::create_directories(framesDir);
                 for (std::size_t i = 0; i < video.size(); ++i) {

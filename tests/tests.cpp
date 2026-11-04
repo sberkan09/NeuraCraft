@@ -1901,13 +1901,13 @@ TEST(spatial_attention_matches_naive_and_chunks) {
 
 TEST(png_and_ppm_files) {
     Image img;
-    img.width = 300;  // a scanline of 900 bytes; 240 rows span two stored deflate blocks
+    img.width = 300;  // a scanline of 900 bytes
     img.height = 240;
     img.pixels.resize(300 * 240 * 3);
     for (std::size_t i = 0; i < img.pixels.size(); ++i) img.pixels[i] = static_cast<std::uint8_t>(i * 7 % 251);
     const std::string png = tempPath("t.png"), ppm = tempPath("t.ppm");
     savePng(png, img);
-    // Parse it back: chunks with valid CRCs, IHDR fields, and the stored zlib blocks.
+    // Parse it back: chunks with valid CRCs, IHDR fields, a zlib stream that decodes to the pixels.
     std::ifstream f(png, std::ios::binary);
     std::vector<std::uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     CHECK(d.size() > 8 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G');
@@ -1926,21 +1926,8 @@ TEST(png_and_ppm_files) {
         if (type == "IDAT") zlib.insert(zlib.end(), d.begin() + static_cast<long>(at + 8), d.begin() + static_cast<long>(at + 8 + len));
         at += 12 + len;
     }
-    std::vector<std::uint8_t> raw;
-    for (std::size_t at = 2;;) {
-        const bool last = zlib[at] & 1;
-        const std::size_t len = zlib[at + 1] | (zlib[at + 2] << 8);
-        CHECK(((zlib[at + 3] | (zlib[at + 4] << 8)) ^ 0xFFFF) == len);
-        raw.insert(raw.end(), zlib.begin() + static_cast<long>(at + 5), zlib.begin() + static_cast<long>(at + 5 + len));
-        at += 5 + len;
-        if (last) break;
-    }
-    CHECK(raw.size() == 240 * 901);
-    for (std::size_t y = 0; y < 240; ++y) {
-        CHECK(raw[y * 901] == 0);
-        CHECK(std::equal(img.pixels.begin() + static_cast<long>(y * 900), img.pixels.begin() + static_cast<long>((y + 1) * 900),
-                         raw.begin() + static_cast<long>(y * 901 + 1)));
-    }
+    CHECK(zlib.size() > 2 && zlib[0] == 0x78 && (zlib[0] * 256 + zlib[1]) % 31 == 0);  // zlib header
+    CHECK(loadPng(png).pixels == img.pixels);
     savePpm(ppm, img);
     const Image back = loadPpm(ppm);
     CHECK(back.width == 300 && back.height == 240 && back.pixels == img.pixels);
@@ -2670,6 +2657,70 @@ TEST(transform_image_and_animated_gif) {
     CHECK(n.frames.size() == 2 && !n.loops && n.delays[0] == 10 && n.frames[0].pixels == n.frames[1].pixels);
     CHECK_THROWS(saveGif(path, {}, 8.0f), std::invalid_argument);
     CHECK_THROWS(saveGif(path, {img, noise}, 8.0f), std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST(compressed_png_and_animated_png) {
+    // savePng compresses (filters + own deflate) and loadPng (own inflate) reads it back exactly.
+    std::mt19937 rng(11);
+    const std::string path = tempPath("c.png");
+    auto fileSize = [&] { return static_cast<std::size_t>(std::filesystem::file_size(path)); };
+    for (std::size_t channels : {1u, 3u, 4u}) {
+        Image noise;
+        noise.width = 97;
+        noise.height = 61;
+        noise.channels = channels;
+        for (std::size_t i = 0; i < 97 * 61 * channels; ++i) noise.pixels.push_back(static_cast<std::uint8_t>(rng() % 256));
+        savePng(path, noise);
+        CHECK(loadPng(path).pixels == noise.pixels);
+        CHECK(fileSize() < noise.pixels.size() + 200);  // incompressible data falls back to stored blocks
+    }
+    Image smooth;
+    smooth.width = 256;
+    smooth.height = 200;
+    for (std::size_t y = 0; y < 200; ++y)
+        for (std::size_t x = 0; x < 256; ++x)
+            for (int c = 0; c < 3; ++c) smooth.pixels.push_back(static_cast<std::uint8_t>((x + 2 * y + 40 * c) % 256));
+    savePng(path, smooth);
+    CHECK(loadPng(path).pixels == smooth.pixels);
+    CHECK(fileSize() < smooth.pixels.size() / 20);  // gradients filter to near-constant rows
+    Image flat = smooth;
+    std::fill(flat.pixels.begin(), flat.pixels.end(), static_cast<std::uint8_t>(77));
+    savePng(path, flat);
+    CHECK(loadPng(path).pixels == flat.pixels && fileSize() < 1000);
+    // Long repeats and every match length / distance code.
+    std::vector<std::uint8_t> data;
+    for (int i = 0; i < 200000; ++i) data.push_back(static_cast<std::uint8_t>((i % 7 == 0 ? rng() % 4 : 0) + (i / 1000) % 3));
+    const auto z = deflateCompress(data);
+    CHECK(z.size() < data.size() / 4 && z[0] == 0x78);
+
+    // APNG: acTL with the frame count, one fcTL per frame, fdAT after the first,
+    // sequence numbers in order; the first frame is the still image.
+    std::vector<Image> frames{smooth, flat, smooth};
+    saveApng(path, frames, 10.0f);
+    CHECK(loadPng(path).pixels == smooth.pixels);
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<std::uint8_t> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    auto be32 = [&](std::size_t p) {
+        return (std::uint32_t{d[p]} << 24) | (std::uint32_t{d[p + 1]} << 16) | (std::uint32_t{d[p + 2]} << 8) | d[p + 3];
+    };
+    std::vector<std::string> types;
+    std::vector<std::uint32_t> sequence;
+    std::uint32_t frameCount = 0, delay = 0;
+    for (std::size_t p = 8; p + 8 <= d.size();) {
+        const std::uint32_t len = be32(p);
+        const std::string type(d.begin() + static_cast<long>(p + 4), d.begin() + static_cast<long>(p + 8));
+        types.push_back(type);
+        if (type == "acTL") frameCount = be32(p + 8);
+        if (type == "fcTL" || type == "fdAT") sequence.push_back(be32(p + 8));
+        if (type == "fcTL") delay = (std::uint32_t{d[p + 8 + 20]} << 8) | d[p + 8 + 21];
+        p += 12 + len;
+    }
+    CHECK(frameCount == 3 && delay == 100);
+    CHECK(types == std::vector<std::string>({"IHDR", "acTL", "fcTL", "IDAT", "fcTL", "fdAT", "fcTL", "fdAT", "IEND"}));
+    CHECK(sequence == std::vector<std::uint32_t>({0, 1, 2, 3, 4}));
+    CHECK_THROWS(saveApng(path, {}, 8.0f), std::invalid_argument);
+    CHECK_THROWS(saveApng(path, {smooth, Image{}}, 8.0f), std::invalid_argument);
     std::filesystem::remove(path);
 }
 

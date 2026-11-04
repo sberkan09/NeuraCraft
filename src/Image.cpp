@@ -400,17 +400,338 @@ void checkImage(const Image& image, const char* who) {
 }
 } // namespace
 
-void savePng(const std::string& path, const Image& image) {
-    checkImage(image, "savePng");
-    std::uint8_t colorType = 0;
-    switch (image.channels) {
-    case 1: colorType = 0; break;
-    case 3: colorType = 2; break;
-    case 4: colorType = 6; break;
-    default: throw std::invalid_argument("savePng: 1, 3 or 4 channels");
+namespace {
+// ---- Deflate compressor (LZ77 + dynamic Huffman blocks) -----------------------------------------
+
+struct BitWriter {
+    std::vector<std::uint8_t>& out;
+    std::uint32_t acc = 0;
+    int n = 0;
+    void put(std::uint32_t bits, int count) {  // LSB first
+        acc |= bits << n;
+        n += count;
+        while (n >= 8) {
+            out.push_back(static_cast<std::uint8_t>(acc & 0xFF));
+            acc >>= 8;
+            n -= 8;
+        }
     }
-    std::ofstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("savePng: cannot open " + path);
+    void flush() {
+        if (n > 0) out.push_back(static_cast<std::uint8_t>(acc & 0xFF));
+        acc = 0;
+        n = 0;
+    }
+};
+
+// Code lengths (at most maxLen bits) for the given frequencies by package-merge;
+// unused symbols get 0. At least two symbols get a code, as decoders expect.
+std::vector<int> limitedLengths(std::vector<std::uint32_t> freq, int maxLen) {
+    std::vector<int> used;
+    for (std::size_t i = 0; i < freq.size(); ++i)
+        if (freq[i]) used.push_back(static_cast<int>(i));
+    for (std::size_t i = 0; used.size() < 2 && i < freq.size(); ++i)
+        if (!freq[i]) {
+            freq[i] = 1;
+            used.push_back(static_cast<int>(i));
+        }
+    struct Item {
+        std::uint64_t weight;
+        std::vector<int> symbols;
+    };
+    std::vector<Item> leaves;
+    for (int s : used) leaves.push_back({freq[static_cast<std::size_t>(s)], {s}});
+    std::sort(leaves.begin(), leaves.end(), [](const Item& a, const Item& b) { return a.weight < b.weight; });
+    std::vector<Item> current = leaves;
+    for (int level = 1; level < maxLen; ++level) {
+        std::vector<Item> packages;
+        for (std::size_t i = 0; i + 1 < current.size(); i += 2) {
+            Item p{current[i].weight + current[i + 1].weight, current[i].symbols};
+            p.symbols.insert(p.symbols.end(), current[i + 1].symbols.begin(), current[i + 1].symbols.end());
+            packages.push_back(std::move(p));
+        }
+        std::vector<Item> merged;
+        std::merge(leaves.begin(), leaves.end(), packages.begin(), packages.end(), std::back_inserter(merged),
+                   [](const Item& a, const Item& b) { return a.weight < b.weight; });
+        current = std::move(merged);
+    }
+    std::vector<int> len(freq.size(), 0);
+    for (std::size_t i = 0; i < 2 * used.size() - 2; ++i)
+        for (int s : current[i].symbols) ++len[static_cast<std::size_t>(s)];
+    return len;
+}
+
+// Canonical codes, bit-reversed for LSB-first output.
+std::vector<std::uint32_t> canonicalCodes(const std::vector<int>& len) {
+    int maxLen = 0;
+    for (int l : len) maxLen = std::max(maxLen, l);
+    std::vector<int> count(static_cast<std::size_t>(maxLen) + 1, 0);
+    for (int l : len)
+        if (l) ++count[static_cast<std::size_t>(l)];
+    std::vector<std::uint32_t> next(static_cast<std::size_t>(maxLen) + 2, 0);
+    std::uint32_t code = 0;
+    for (int b = 1; b <= maxLen; ++b) {
+        code = (code + static_cast<std::uint32_t>(count[static_cast<std::size_t>(b) - 1])) << 1;
+        next[static_cast<std::size_t>(b)] = code;
+    }
+    std::vector<std::uint32_t> codes(len.size(), 0);
+    for (std::size_t s = 0; s < len.size(); ++s) {
+        const int l = len[s];
+        if (!l) continue;
+        std::uint32_t c = next[static_cast<std::size_t>(l)]++, r = 0;
+        for (int i = 0; i < l; ++i) r |= ((c >> i) & 1u) << (l - 1 - i);
+        codes[s] = r;
+    }
+    return codes;
+}
+
+const std::uint16_t kLenBase[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+const std::uint8_t kLenExtra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+const std::uint16_t kDistBase[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+const std::uint8_t kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+
+struct Token {
+    std::uint16_t lenOrLiteral;  // < 256 literal, else match length (3..258) + 256
+    std::uint16_t distance;
+};
+
+int lengthCode(int len) {
+    int c = 0;
+    while (c < 28 && kLenBase[c + 1] <= len) ++c;
+    return c;
+}
+int distanceCode(int d) {
+    int c = 0;
+    while (c < 29 && kDistBase[c + 1] <= d) ++c;
+    return c;
+}
+
+void writeBlock(BitWriter& bw, const std::vector<Token>& tokens, bool last) {
+    std::vector<std::uint32_t> lf(286, 0), df(30, 0);
+    for (const Token& t : tokens) {
+        if (t.lenOrLiteral < 256) ++lf[t.lenOrLiteral];
+        else {
+            ++lf[257 + static_cast<std::size_t>(lengthCode(t.lenOrLiteral - 256))];
+            ++df[static_cast<std::size_t>(distanceCode(t.distance))];
+        }
+    }
+    lf[256] = 1;
+    const std::vector<int> ll = limitedLengths(lf, 15), dl = limitedLengths(df, 15);
+    std::size_t hlit = 286, hdist = 30;
+    while (hlit > 257 && ll[hlit - 1] == 0) --hlit;
+    while (hdist > 1 && dl[hdist - 1] == 0) --hdist;
+    std::vector<int> all(ll.begin(), ll.begin() + static_cast<long>(hlit));
+    all.insert(all.end(), dl.begin(), dl.begin() + static_cast<long>(hdist));
+    // Run-length encode the code lengths (16: repeat previous, 17 / 18: zeros).
+    std::vector<std::pair<int, int>> rle;  // (symbol, extra value)
+    for (std::size_t i = 0; i < all.size();) {
+        std::size_t run = 1;
+        while (i + run < all.size() && all[i + run] == all[i]) ++run;
+        if (all[i] == 0 && run >= 3) {
+            const std::size_t r = std::min<std::size_t>(run, 138);
+            rle.push_back(r >= 11 ? std::make_pair(18, static_cast<int>(r - 11)) : std::make_pair(17, static_cast<int>(r - 3)));
+            i += r;
+        } else if (all[i] != 0 && run >= 4) {
+            rle.push_back({all[i], 0});
+            const std::size_t r = std::min<std::size_t>(run - 1, 6);
+            rle.push_back({16, static_cast<int>(r - 3)});
+            i += 1 + r;
+        } else {
+            rle.push_back({all[i], 0});
+            ++i;
+        }
+    }
+    std::vector<std::uint32_t> cf(19, 0);
+    for (const auto& r : rle) ++cf[static_cast<std::size_t>(r.first)];
+    const std::vector<int> cl = limitedLengths(cf, 7);
+    static const int order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+    std::size_t hclen = 19;
+    while (hclen > 4 && cl[static_cast<std::size_t>(order[hclen - 1])] == 0) --hclen;
+    const std::vector<std::uint32_t> lc = canonicalCodes(ll), dc = canonicalCodes(dl), cc = canonicalCodes(cl);
+    bw.put(last ? 1 : 0, 1);
+    bw.put(2, 2);
+    bw.put(static_cast<std::uint32_t>(hlit - 257), 5);
+    bw.put(static_cast<std::uint32_t>(hdist - 1), 5);
+    bw.put(static_cast<std::uint32_t>(hclen - 4), 4);
+    for (std::size_t i = 0; i < hclen; ++i) bw.put(static_cast<std::uint32_t>(cl[static_cast<std::size_t>(order[i])]), 3);
+    for (const auto& r : rle) {
+        bw.put(cc[static_cast<std::size_t>(r.first)], cl[static_cast<std::size_t>(r.first)]);
+        if (r.first == 16) bw.put(static_cast<std::uint32_t>(r.second), 2);
+        else if (r.first == 17) bw.put(static_cast<std::uint32_t>(r.second), 3);
+        else if (r.first == 18) bw.put(static_cast<std::uint32_t>(r.second), 7);
+    }
+    for (const Token& t : tokens) {
+        if (t.lenOrLiteral < 256) {
+            bw.put(lc[t.lenOrLiteral], ll[t.lenOrLiteral]);
+            continue;
+        }
+        const int len = t.lenOrLiteral - 256, c = lengthCode(len), d = distanceCode(t.distance);
+        bw.put(lc[257 + static_cast<std::size_t>(c)], ll[257 + static_cast<std::size_t>(c)]);
+        if (kLenExtra[c]) bw.put(static_cast<std::uint32_t>(len - kLenBase[c]), kLenExtra[c]);
+        bw.put(dc[static_cast<std::size_t>(d)], dl[static_cast<std::size_t>(d)]);
+        if (kDistExtra[d]) bw.put(static_cast<std::uint32_t>(t.distance - kDistBase[d]), kDistExtra[d]);
+    }
+    bw.put(lc[256], ll[256]);
+}
+
+// zlib stream: LZ77 with hash chains and one-step lazy matching, dynamic Huffman blocks.
+std::vector<std::uint8_t> zlibCompress(const std::vector<std::uint8_t>& data) {
+    std::vector<std::uint8_t> out{0x78, 0x9C};
+    BitWriter bw{out};
+    constexpr std::size_t kWindow = 32768, kMaxChain = 48, kNice = 128, kBlock = 1 << 16;
+    std::vector<std::int32_t> head(1 << 15, -1), prev(kWindow, -1);
+    const std::size_t n = data.size();
+    auto hash = [&](std::size_t i) {
+        return ((static_cast<std::uint32_t>(data[i]) << 10) ^ (static_cast<std::uint32_t>(data[i + 1]) << 5) ^ data[i + 2]) & 0x7FFF;
+    };
+    auto insert = [&](std::size_t i) {
+        if (i + 2 >= n) return;
+        const std::uint32_t h = hash(i);
+        prev[i % kWindow] = head[h];
+        head[h] = static_cast<std::int32_t>(i);
+    };
+    auto longest = [&](std::size_t i, std::size_t& dist) {
+        std::size_t best = 0;
+        if (i + 2 >= n) return best;
+        std::int32_t cand = head[hash(i)];
+        const std::size_t maxLen = std::min<std::size_t>(258, n - i);
+        for (std::size_t chain = 0; cand >= 0 && chain < kMaxChain; ++chain) {
+            const std::size_t c = static_cast<std::size_t>(cand);
+            if (i - c > kWindow - 1 || c >= i) break;
+            if (data[c + best] == data[i + best]) {
+                std::size_t l = 0;
+                while (l < maxLen && data[c + l] == data[i + l]) ++l;
+                if (l > best) {
+                    best = l;
+                    dist = i - c;
+                    if (l >= kNice) break;
+                }
+            }
+            const std::int32_t p = prev[c % kWindow];
+            if (p >= cand) break;  // stale entry from an older window
+            cand = p;
+        }
+        return best >= 3 ? best : 0;
+    };
+    std::vector<Token> tokens;
+    std::size_t i = 0;
+    while (i < n) {
+        std::size_t dist = 0, len = longest(i, dist);
+        if (len && len < kNice && i + 1 < n) {  // lazy: a longer match one byte later wins
+            std::size_t d2 = 0;
+            insert(i);
+            const std::size_t l2 = longest(i + 1, d2);
+            if (l2 > len) {
+                tokens.push_back({data[i], 0});
+                ++i;
+                len = l2;
+                dist = d2;
+            } else {
+                for (std::size_t k = 1; k < len; ++k) insert(i + k);
+                tokens.push_back({static_cast<std::uint16_t>(256 + len), static_cast<std::uint16_t>(dist)});
+                i += len;
+                len = 0;
+            }
+            if (len) {
+                for (std::size_t k = 0; k < len; ++k) insert(i + k);
+                tokens.push_back({static_cast<std::uint16_t>(256 + len), static_cast<std::uint16_t>(dist)});
+                i += len;
+            }
+        } else if (len) {
+            for (std::size_t k = 0; k < len; ++k) insert(i + k);
+            tokens.push_back({static_cast<std::uint16_t>(256 + len), static_cast<std::uint16_t>(dist)});
+            i += len;
+        } else {
+            insert(i);
+            tokens.push_back({data[i], 0});
+            ++i;
+        }
+        if (tokens.size() >= kBlock) {
+            writeBlock(bw, tokens, false);
+            tokens.clear();
+        }
+    }
+    writeBlock(bw, tokens, true);
+    bw.flush();
+    if (out.size() > n + n / 65535 * 5 + 7) {  // incompressible: stored blocks are smaller
+        out.assign({0x78, 0x01});
+        for (std::size_t pos = 0;;) {
+            const std::size_t len = std::min<std::size_t>(65535, n - pos);
+            const bool last = pos + len == n;
+            out.insert(out.end(), {static_cast<std::uint8_t>(last ? 1 : 0), static_cast<std::uint8_t>(len & 0xFF),
+                                   static_cast<std::uint8_t>(len >> 8), static_cast<std::uint8_t>(~len & 0xFF),
+                                   static_cast<std::uint8_t>((~len >> 8) & 0xFF)});
+            out.insert(out.end(), data.begin() + static_cast<long>(pos), data.begin() + static_cast<long>(pos + len));
+            pos += len;
+            if (last) break;
+        }
+    }
+    std::uint32_t a = 1, b = 0;  // Adler-32
+    for (std::size_t k = 0; k < n;) {
+        const std::size_t end = std::min(n, k + 5552);
+        for (; k < end; ++k) {
+            a += data[k];
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
+    }
+    putBE32(out, (b << 16) | a);
+    return out;
+}
+
+// Scanlines with a per-row filter (the one with the smallest sum of absolute
+// signed bytes, the usual heuristic), compressed.
+std::vector<std::uint8_t> pngImageData(const Image& image) {
+    const std::size_t C = image.channels, stride = image.width * C;
+    std::vector<std::uint8_t> raw;
+    raw.reserve((stride + 1) * image.height);
+    std::vector<std::uint8_t> zero(stride, 0), best(stride), trial(stride);
+    for (std::size_t y = 0; y < image.height; ++y) {
+        const std::uint8_t* row = image.pixels.data() + y * stride;
+        const std::uint8_t* up = y ? row - stride : zero.data();
+        std::uint64_t bestScore = ~std::uint64_t{0};
+        std::uint8_t bestType = 0;
+        for (std::uint8_t type = 0; type < 5; ++type) {
+            std::uint64_t score = 0;
+            for (std::size_t x = 0; x < stride; ++x) {
+                const int a = x >= C ? row[x - C] : 0, b = up[x], c = x >= C ? up[x - C] : 0;
+                int pred = 0;
+                switch (type) {
+                case 1: pred = a; break;
+                case 2: pred = b; break;
+                case 3: pred = (a + b) / 2; break;
+                case 4: {
+                    const int p = a + b - c, pa = std::abs(p - a), pb = std::abs(p - b), pc = std::abs(p - c);
+                    pred = pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+                    break;
+                }
+                default: break;
+                }
+                trial[x] = static_cast<std::uint8_t>(row[x] - pred);
+                score += static_cast<std::uint64_t>(std::abs(static_cast<int>(static_cast<std::int8_t>(trial[x]))));
+            }
+            if (score < bestScore) {
+                bestScore = score;
+                bestType = type;
+                best.swap(trial);
+            }
+        }
+        raw.push_back(bestType);
+        raw.insert(raw.end(), best.begin(), best.end());
+    }
+    return zlibCompress(raw);
+}
+
+std::uint8_t pngColorType(const Image& image, const char* who) {
+    switch (image.channels) {
+    case 1: return 0;
+    case 3: return 2;
+    case 4: return 6;
+    default: throw std::invalid_argument(std::string(who) + ": 1, 3 or 4 channels");
+    }
+}
+
+void writePngHeader(std::ofstream& f, const Image& image, std::uint8_t colorType) {
     const std::uint8_t signature[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
     f.write(reinterpret_cast<const char*>(signature), 8);
     std::vector<std::uint8_t> ihdr;
@@ -418,38 +739,62 @@ void savePng(const std::string& path, const Image& image) {
     putBE32(ihdr, static_cast<std::uint32_t>(image.height));
     ihdr.insert(ihdr.end(), {8, colorType, 0, 0, 0});
     writeChunk(f, "IHDR", ihdr);
+}
+} // namespace
 
-    // Raw scanlines (filter byte 0) in a zlib stream of stored deflate blocks.
-    const std::size_t stride = image.width * image.channels;
-    std::vector<std::uint8_t> raw;
-    raw.reserve((stride + 1) * image.height);
-    for (std::size_t y = 0; y < image.height; ++y) {
-        raw.push_back(0);
-        raw.insert(raw.end(), image.pixels.begin() + static_cast<long>(y * stride),
-                   image.pixels.begin() + static_cast<long>((y + 1) * stride));
-    }
-    std::vector<std::uint8_t> z{0x78, 0x01};
-    for (std::size_t pos = 0; pos < raw.size() || pos == 0;) {
-        const std::size_t len = std::min<std::size_t>(65535, raw.size() - pos);
-        const bool last = pos + len == raw.size();
-        z.push_back(last ? 1 : 0);
-        z.push_back(static_cast<std::uint8_t>(len & 0xFF));
-        z.push_back(static_cast<std::uint8_t>(len >> 8));
-        z.push_back(static_cast<std::uint8_t>(~len & 0xFF));
-        z.push_back(static_cast<std::uint8_t>((~len >> 8) & 0xFF));
-        z.insert(z.end(), raw.begin() + static_cast<long>(pos), raw.begin() + static_cast<long>(pos + len));
-        pos += len;
-        if (last) break;
-    }
-    std::uint32_t a = 1, b = 0;  // Adler-32
-    for (std::uint8_t v : raw) {
-        a = (a + v) % 65521;
-        b = (b + a) % 65521;
-    }
-    putBE32(z, (b << 16) | a);
-    writeChunk(f, "IDAT", z);
+std::vector<std::uint8_t> deflateCompress(const std::vector<std::uint8_t>& data) { return zlibCompress(data); }
+
+void savePng(const std::string& path, const Image& image) {
+    checkImage(image, "savePng");
+    const std::uint8_t colorType = pngColorType(image, "savePng");
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("savePng: cannot open " + path);
+    writePngHeader(f, image, colorType);
+    writeChunk(f, "IDAT", pngImageData(image));
     writeChunk(f, "IEND", {});
     if (!f) throw std::runtime_error("savePng: write failed for " + path);
+}
+
+void saveApng(const std::string& path, const std::vector<Image>& frames, float framesPerSecond, bool loop) {
+    if (frames.empty()) throw std::invalid_argument("saveApng: no frames");
+    if (framesPerSecond <= 0.0f) throw std::invalid_argument("saveApng: frames per second must be > 0");
+    const Image& first = frames.front();
+    checkImage(first, "saveApng");
+    const std::uint8_t colorType = pngColorType(first, "saveApng");
+    for (const Image& im : frames)
+        if (im.width != first.width || im.height != first.height || im.channels != first.channels)
+            throw std::invalid_argument("saveApng: frames must have one size and channel count");
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("saveApng: cannot open " + path);
+    writePngHeader(f, first, colorType);
+    std::vector<std::uint8_t> actl;
+    putBE32(actl, static_cast<std::uint32_t>(frames.size()));
+    putBE32(actl, loop ? 0 : 1);
+    writeChunk(f, "acTL", actl);
+    // Delay as a fraction: round(1000 / fps) / 1000 s.
+    const std::uint16_t delayNum = static_cast<std::uint16_t>(std::max(1L, std::lround(1000.0 / framesPerSecond))), delayDen = 1000;
+    std::uint32_t sequence = 0;
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        std::vector<std::uint8_t> fctl;
+        putBE32(fctl, sequence++);
+        putBE32(fctl, static_cast<std::uint32_t>(first.width));
+        putBE32(fctl, static_cast<std::uint32_t>(first.height));
+        putBE32(fctl, 0);
+        putBE32(fctl, 0);
+        fctl.insert(fctl.end(), {static_cast<std::uint8_t>(delayNum >> 8), static_cast<std::uint8_t>(delayNum & 0xFF),
+                                 static_cast<std::uint8_t>(delayDen >> 8), static_cast<std::uint8_t>(delayDen & 0xFF), 0, 0});
+        writeChunk(f, "fcTL", fctl);
+        const std::vector<std::uint8_t> z = pngImageData(frames[i]);
+        if (i == 0) writeChunk(f, "IDAT", z);  // the first frame is also the still image
+        else {
+            std::vector<std::uint8_t> fdat;
+            putBE32(fdat, sequence++);
+            fdat.insert(fdat.end(), z.begin(), z.end());
+            writeChunk(f, "fdAT", fdat);
+        }
+    }
+    writeChunk(f, "IEND", {});
+    if (!f) throw std::runtime_error("saveApng: write failed for " + path);
 }
 
 void savePpm(const std::string& path, const Image& image) {

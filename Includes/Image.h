@@ -151,8 +151,14 @@ struct Image {
     std::vector<std::uint8_t> pixels;
 };
 
-// Uncompressed-deflate PNG (any viewer opens it; files are about raw size).
+// PNG with adaptive per-row filters and its own deflate compressor (LZ77 +
+// dynamic Huffman blocks).
 void savePng(const std::string& path, const Image& image);
+// Animated PNG (APNG): full-colour frames of one size, no palette or dither;
+// browsers and most viewers play it, others show the first frame.
+void saveApng(const std::string& path, const std::vector<Image>& frames, float framesPerSecond = 8.0f, bool loop = true);
+// A zlib stream (RFC 1950 / 1951) of `data`.
+std::vector<std::uint8_t> deflateCompress(const std::vector<std::uint8_t>& data);
 // PNG reader: 8-bit grey, grey + alpha, RGB, RGBA and palette images (also
 // 1/2/4-bit palette and grey, 16-bit by keeping the high byte), all filters,
 // with its own inflate; interlaced files are refused. Returns the stored

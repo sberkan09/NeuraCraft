@@ -459,6 +459,35 @@ Above: the snowy cabin from the morph animation (left, saved with
 `saveJpeg`) animated with falling snow at strength 0.75 (right; 16 frames,
 512 x 512, 17 minutes on the 2-core machine).
 
+**Prompt travel.** `--prompt-at FRAME:prompt` (`promptAt`) adds keyframes
+after the main prompt; every frame's text condition is interpolated between
+the keyframes around it, and the motion module keeps the change continuous:
+
+```
+$ ./build_and_run.sh video data/animatediff t2v "a lone oak tree on a green hill, spring, blooming flowers, photo" \
+      --prompt-at "15:a lone oak tree on a hill in autumn, orange leaves falling, photo" --frames 16
+```
+
+PT_SAMPLE
+
+**LoRA and LCM.** `--lora file.safetensors[:scale]` merges LoRA adapters
+(kohya / A1111 `lora_unet_*` / `lora_te_*` and diffusers / PEFT `lora_A` /
+`lora_B` files, linear and convolution layers) into the UNet and text encoder
+while they load, before int8 quantization, for every image and video command
+(`LoraMerger`, `TextToImageOptions::loras`). `--sampler lcm` switches to
+diffusers' `LCMScheduler` (latent consistency: predict the clean latent,
+re-noise to the next timestep), so an ordinary SD 1.5 model with
+[LCM-LoRA](https://huggingface.co/latent-consistency/lcm-lora-sdv1-5) draws in
+4 steps without guidance:
+
+```
+$ scripts/download_lcm_lora.sh data/loras
+$ ./build_and_run.sh txt2img data/animatediff "portrait photo of an old fisherman, golden hour" out.jpg \
+      --steps 4 --sampler lcm --lora data/loras/lcm-lora-sdv1-5.safetensors --tiny-vae data/animatediff/taesd
+```
+
+LCM_SAMPLE
+
 **Output formats**, all written by the library itself: `.gif` (`saveGif`,
 256 colours, plays everywhere), `.png` (`saveApng`, animated PNG, full
 colour and lossless, plays in browsers), `.mov` (`saveMjpegMov`, a QuickTime

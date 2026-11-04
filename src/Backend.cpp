@@ -153,6 +153,57 @@ inline void microKernel(std::size_t kc, const float* a, const float* b, float (&
 }
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+float dotProduct(const float* NC_RESTRICT a, const float* NC_RESTRICT b, std::size_t n) {
+    vfloat acc0{}, acc1{};
+    std::size_t k = 0;
+    for (; k + 2 * VW <= n; k += 2 * VW) {
+        acc0 += loadv(a + k) * loadv(b + k);
+        acc1 += loadv(a + k + VW) * loadv(b + k + VW);
+    }
+    acc0 += acc1;
+    float lanes[VW];
+    std::memcpy(lanes, &acc0, sizeof(lanes));
+    float sum = 0.0f;
+    for (std::size_t l = 0; l < VW; ++l) sum += lanes[l];
+    for (; k < n; ++k) sum += a[k] * b[k];
+    return sum;
+}
+#else
+float dotProduct(const float* a, const float* b, std::size_t n) {
+    float sum = 0.0f;
+    for (std::size_t k = 0; k < n; ++k) sum += a[k] * b[k];
+    return sum;
+}
+#endif
+
+// A few rows of A (token-by-token inference): stream B once, no packing.
+void gemmFewRows(bool transB, std::size_t M, std::size_t N, std::size_t K, const float* A, std::size_t lda,
+                 const float* B, std::size_t ldb, float* C, std::size_t ldc) {
+    const std::size_t grain = std::max<std::size_t>(16, (std::size_t(1) << 15) / std::max<std::size_t>(1, K * M));
+    if (transB) {
+        // C[i][j] += <A[i,:], B[j,:]>: both rows are contiguous.
+        parallelFor(0, N, grain, [&](std::size_t j0, std::size_t j1) {
+            for (std::size_t j = j0; j < j1; ++j)
+                for (std::size_t i = 0; i < M; ++i) C[i * ldc + j] += dotProduct(A + i * lda, B + j * ldb, K);
+        });
+        return;
+    }
+    // C[i][j0..j1) += sum_k A[i][k] * B[k][j0..j1): each B row segment feeds all M rows.
+    parallelFor(0, N, std::max<std::size_t>(grain, 64), [&](std::size_t j0, std::size_t j1) {
+        const std::size_t width = j1 - j0;
+        for (std::size_t k = 0; k < K; ++k) {
+            const float* NC_RESTRICT b = B + k * ldb + j0;
+            for (std::size_t i = 0; i < M; ++i) {
+                const float a = A[i * lda + k];
+                if (a == 0.0f) continue;
+                float* NC_RESTRICT c = C + i * ldc + j0;
+                for (std::size_t j = 0; j < width; ++j) c[j] += a * b[j];
+            }
+        }
+    });
+}
+
 void checkDims(std::size_t M, std::size_t N, std::size_t K, bool transA, bool transB,
                std::size_t lda, std::size_t ldb, std::size_t ldc) {
     if ((transA ? lda < M : lda < K) || (transB ? ldb < K : ldb < N) || ldc < N)
@@ -169,6 +220,10 @@ void gemmBlocked(bool transA, bool transB, std::size_t M, std::size_t N, std::si
     if (!accumulate)
         for (std::size_t i = 0; i < M; ++i) std::fill(C + i * ldc, C + i * ldc + N, 0.0f);
     if (K == 0) return;
+    if (!transA && M <= 4) {
+        gemmFewRows(transB, M, N, K, A, lda, B, ldb, C, ldc);
+        return;
+    }
 
     const std::size_t aPanels = (M + MR - 1) / MR;
     const std::size_t bPanels = (N + NR - 1) / NR;

@@ -74,8 +74,9 @@ Matrix TokenEmbedding::forward(const Matrix& input, bool) {
 Matrix TokenEmbedding::backward(const Matrix& gradOutput) {
     if (gradOutput.rows() != ids_.size() || gradOutput.cols() != dim_)
         throw std::invalid_argument("TokenEmbedding::backward: gradient shape does not match the last forward");
-    if (!tied_) tokenGrad_.fill(0.0f);  // tied: TiedOutput already wrote its share
-    if (learnedPositions_) positionGrad_.fill(0.0f);
+    // Tied: TiedOutput already wrote its share. Buffers may have been released.
+    if (!tied_ || !tokenGrad_.sameShape(tokens_)) tokenGrad_ = Matrix(vocab_, dim_);
+    if (learnedPositions_) positionGrad_ = Matrix(maxContext_, dim_);
     for (std::size_t r = 0; r < ids_.size(); ++r) {
         const float* g = gradOutput.data() + r * dim_;
         float* tg = tokenGrad_.data() + ids_[r] * dim_;

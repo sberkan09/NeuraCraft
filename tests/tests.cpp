@@ -1021,6 +1021,164 @@ TEST(modern_gpt_learns_and_config_roundtrip) {
     std::remove(weights.c_str());
 }
 
+// ---- Pretrained models ----------------------------------------------------------------------
+
+TEST(json_parser) {
+    const auto v = json::parse(R"({"a": [1, 2.5, -3e2], "b": {"c": "x\"y\\nç🚀"}, "t": true, "n": null})");
+    CHECK(v.isObject() && v.at("a").array.size() == 3);
+    CHECK_NEAR(v.at("a").array[2].number, -300.0, 1e-9);
+    CHECK(v.at("b").at("c").string == "x\"y\\n\xc3\xa7\xf0\x9f\x9a\x80");
+    CHECK(v.at("t").boolean && v.at("n").type == json::Value::Type::Null);
+    CHECK_NEAR(v.numberOr("missing", 7.0), 7.0, 0);
+    CHECK_THROWS(json::parse("{\"a\": }"), std::runtime_error);
+    CHECK_THROWS(json::parse("[1, 2"), std::runtime_error);
+    CHECK_THROWS(v.at("zzz"), std::runtime_error);
+}
+
+TEST(safetensors_roundtrip_and_half_precision) {
+    const std::string path = tempPath("t.safetensors");
+    const Matrix a{{1, 2, 3}, {4, 5, 6}}, b{{-0.5f}};
+    saveSafeTensors(path, {{"a", &a}, {"b", &b}});
+    const SafeTensors st(path);
+    CHECK(st.has("a") && st.has("b") && !st.has("c"));
+    CHECK(st.load("a").approxEquals(a) && st.load("b").approxEquals(b));
+    CHECK(st.info("a").shape == std::vector<std::size_t>({2, 3}));
+    CHECK_THROWS(st.load("c"), std::runtime_error);
+
+    // Hand-written F16 / BF16 tensors: 1.0, -2.0, 0.5 and a subnormal half.
+    const std::string header = R"({"h":{"dtype":"F16","shape":[4],"data_offsets":[0,8]},"g":{"dtype":"BF16","shape":[2],"data_offsets":[8,12]}})";
+    {
+        std::ofstream out(path, std::ios::binary);
+        const std::uint64_t n = header.size();
+        for (int i = 0; i < 8; ++i) out.put(static_cast<char>((n >> (8 * i)) & 0xFF));
+        out << header;
+        const std::uint16_t halves[] = {0x3C00, 0xC000, 0x3800, 0x0001, 0x3F80, 0x4049};  // ..., bf16 1.0, 3.140625
+        out.write(reinterpret_cast<const char*>(halves), sizeof(halves));
+    }
+    const SafeTensors hs(path);
+    const Matrix h = hs.load("h"), g = hs.load("g");
+    CHECK(h.rows() == 1 && h.cols() == 4);
+    CHECK_NEAR(h(0, 0), 1.0, 0);
+    CHECK_NEAR(h(0, 1), -2.0, 0);
+    CHECK_NEAR(h(0, 2), 0.5, 0);
+    CHECK_NEAR(h(0, 3), 5.9604645e-8, 1e-12);
+    CHECK_NEAR(g(0, 0), 1.0, 0);
+    CHECK_NEAR(g(0, 1), 3.140625, 0);
+    std::remove(path.c_str());
+}
+
+TEST(gpt2_pretokenizer_matches_regex_semantics) {
+    using V = std::vector<std::string>;
+    CHECK(Gpt2Tokenizer::splitWords("Hello world") == V({"Hello", " world"}));
+    CHECK(Gpt2Tokenizer::splitWords("don't I'LL") == V({"don", "'t", " I", "'", "LL"}));
+    CHECK(Gpt2Tokenizer::splitWords("a  b") == V({"a", " ", " b"}));
+    CHECK(Gpt2Tokenizer::splitWords("x\n\ny") == V({"x", "\n", "\n", "y"}));
+    CHECK(Gpt2Tokenizer::splitWords("end   ") == V({"end", "   "}));
+    CHECK(Gpt2Tokenizer::splitWords("v2.0!!") == V({"v", "2", ".", "0", "!!"}));
+    CHECK(Gpt2Tokenizer::splitWords(" g\xc3\xbczel \xf0\x9f\x9a\x80") == V({" g\xc3\xbczel", " \xf0\x9f\x9a\x80"}));
+    std::string joined;
+    for (const auto& w : Gpt2Tokenizer::splitWords("Mixed\t text\r\n with 123 and \xe2\x80\x9cquotes\xe2\x80\x9d")) joined += w;
+    CHECK(joined == "Mixed\t text\r\n with 123 and \xe2\x80\x9cquotes\xe2\x80\x9d");
+}
+
+namespace {
+// GPT-2's bytes_to_unicode, written independently of the library.
+std::string gpt2ByteSymbol(int b) {
+    auto printable = [](int x) { return (x >= '!' && x <= '~') || (x >= 0xA1 && x <= 0xAC) || (x >= 0xAE && x <= 0xFF); };
+    unsigned cp = static_cast<unsigned>(b);
+    if (!printable(b)) {
+        unsigned n = 0;
+        for (int x = 0; x < b; ++x) n += !printable(x);
+        cp = 256 + n;
+    }
+    std::string s;
+    if (cp < 0x80) s += static_cast<char>(cp);
+    else {
+        s += static_cast<char>(0xC0 | (cp >> 6));
+        s += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+    return s;
+}
+
+std::string tinyGpt2Tokenizer() {
+    const std::string dir = tempPath("gpt2tok");
+    std::filesystem::create_directories(dir);
+    std::ofstream vocab(dir + "/vocab.json");
+    vocab << '{';
+    for (int b = 0; b < 256; ++b) {
+        std::string sym = gpt2ByteSymbol(b);
+        if (sym == "\"" || sym == "\\") sym = "\\" + sym;
+        vocab << '"' << sym << "\":" << b << ',';
+    }
+    const std::string G = gpt2ByteSymbol(' ');  // "Ġ"
+    vocab << '"' << G << "t\":256,\"he\":257,\"" << G << "the\":258,\"<|endoftext|>\":259}";
+    std::ofstream merges(dir + "/merges.txt");
+    merges << "#version: 0.2\n" << G << " t\nh e\n" << G << "t he\n";
+    return dir;
+}
+} // namespace
+
+TEST(gpt2_tokenizer_merges_and_bytes) {
+    const std::string dir = tinyGpt2Tokenizer();
+    const Gpt2Tokenizer tok(dir + "/vocab.json", dir + "/merges.txt");
+    CHECK(tok.vocabSize() == 260 && tok.endOfText() == 259);
+    CHECK(tok.encode(" the") == std::vector<int>({258}));
+    CHECK(tok.encode("the") == std::vector<int>({'t', 257}));
+    CHECK(tok.encode(" the the") == std::vector<int>({258, 258}));
+    const std::string binary("\x00\x01\x7f\xff sp\xc3\xa7", 9);
+    CHECK(tok.decode(tok.encode(binary)) == binary);
+    CHECK(tok.decode({258, 259}) == " the<|endoftext|>");
+    std::filesystem::remove_all(dir);
+}
+
+TEST(gpt2_loader_maps_huggingface_tensors) {
+    setSeed(70);
+    const std::string dir = tempPath("gpt2tiny");
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream cfg(dir + "/config.json");
+        cfg << R"({"model_type":"gpt2","vocab_size":20,"n_positions":16,"n_embd":8,"n_head":2,"n_layer":1,)"
+            << R"("layer_norm_epsilon":1e-5,"activation_function":"gelu_new"})";
+    }
+    std::vector<std::pair<std::string, Matrix>> owned;
+    auto add = [&](const std::string& name, std::size_t r, std::size_t c) { owned.emplace_back(name, Matrix::uniform(r, c, -1, 1)); };
+    add("wte.weight", 20, 8);
+    add("wpe.weight", 16, 8);
+    for (const char* n : {"h.0.ln_1.weight", "h.0.ln_1.bias", "h.0.ln_2.weight", "h.0.ln_2.bias", "h.0.attn.c_proj.bias",
+                          "h.0.mlp.c_proj.bias", "ln_f.weight", "ln_f.bias"})
+        add(n, 1, 8);
+    add("h.0.attn.c_attn.weight", 8, 24);
+    add("h.0.attn.c_attn.bias", 1, 24);
+    add("h.0.attn.c_proj.weight", 8, 8);
+    add("h.0.mlp.c_fc.weight", 8, 32);
+    add("h.0.mlp.c_fc.bias", 1, 32);
+    add("h.0.mlp.c_proj.weight", 32, 8);
+    std::vector<std::pair<std::string, const Matrix*>> refs;
+    for (const auto& [n, m] : owned) refs.emplace_back(n, &m);
+    saveSafeTensors(dir + "/model.safetensors", refs);
+
+    PretrainedModel model = loadGPT2(dir);
+    CHECK(model.config.layers == 1 && model.config.dim == 8 && model.config.tieEmbeddings);
+    auto& emb = dynamic_cast<TokenEmbedding&>(model.net.layer(0));
+    CHECK(emb.tokenTable().approxEquals(owned[0].second, 0));
+    auto& att = dynamic_cast<CausalSelfAttention&>(dynamic_cast<Residual&>(model.net.layer(1)).inner().layer(1));
+    CHECK(att.qkvWeight().approxEquals(owned[10].second, 0));
+    // Tied output: 20 logits per position; the model still trains after releasing gradients.
+    const Matrix x{{1, 5, 19}};
+    CHECK(model.net.predict(x).cols() == 20);
+    SparseSoftmaxCrossEntropy loss;
+    Adam opt(1e-3f);
+    CHECK(std::isfinite(model.net.trainBatch(x, Matrix{{5, 19, 2}}, loss, opt)));
+
+    // Wrong shape / missing tensor are reported.
+    owned[10].second = Matrix(8, 23);
+    refs.clear();
+    for (const auto& [n, m] : owned) refs.emplace_back(n, &m);
+    saveSafeTensors(dir + "/model.safetensors", refs);
+    CHECK_THROWS(loadGPT2(dir), std::runtime_error);
+    std::filesystem::remove_all(dir);
+}
+
 // ---- Training robustness ------------------------------------------------------------------
 
 TEST(cosine_schedule_and_gradient_clipping) {
@@ -1158,7 +1316,8 @@ namespace {
 template <typename Fn>
 void checkGemmImplementation(Fn fn, const char* name) {
     setSeed(11);
-    const std::size_t shapes[][3] = {{1, 1, 1}, {3, 5, 7}, {17, 33, 9}, {64, 64, 64}, {70, 129, 45}, {5, 300, 260}};
+    const std::size_t shapes[][3] = {{1, 1, 1}, {3, 5, 7}, {17, 33, 9}, {64, 64, 64}, {70, 129, 45}, {5, 300, 260},
+                                     {1, 777, 300}, {4, 129, 513}};  // last two: few-row (GEMV) path
     for (const auto& s : shapes) {
         const std::size_t M = s[0], N = s[1], K = s[2];
         for (int ta = 0; ta < 2; ++ta)

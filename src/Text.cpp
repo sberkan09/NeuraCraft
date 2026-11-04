@@ -320,6 +320,8 @@ std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::siz
             const int next = sampleToken(logits.data() + (logits.rows() - 1) * logits.cols(), logits.cols(), options);
             tokens.push_back(next);
             produced.push_back(next);
+            if (options.onToken) options.onToken(next);
+            if (next == options.stopToken) break;
         }
         return produced;
     }
@@ -340,7 +342,8 @@ std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::siz
         const int next = sampleToken(last.data(), last.size(), options);
         tokens.push_back(next);
         produced.push_back(next);
-        if (step + 1 == newTokens) break;
+        if (options.onToken) options.onToken(next);
+        if (step + 1 == newTokens || next == options.stopToken) break;
         if (!sliding && kvCache->offset >= contextLength) {
             kvCache->offset = 0;  // cache full: rebuild from the most recent half window
             last = feed(tokens.size() - std::max<std::size_t>(1, contextLength / 2));

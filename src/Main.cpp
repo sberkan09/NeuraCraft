@@ -316,7 +316,7 @@ void printSample(Network& net, const CharTokenizer& tok, const std::string& prom
     sampling.temperature = 0.8f;
     sampling.topK = 20;
     std::cout << "----- sample -----\n" << prompt << tok.decode(generate(net, tok.encode(prompt), length, context, sampling))
-              << "\n------------------\n";
+              << "\n------------------" << std::endl;
 }
 
 int runGpt(const std::string& path, std::size_t epochs) {
@@ -348,6 +348,7 @@ int runGpt(const std::string& path, std::size_t epochs) {
     FitOptions opts;
     opts.epochs = epochs;
     opts.batchSize = 32;
+    opts.printEveryBatches = 50;
     opts.validationX = &val.x;
     opts.validationY = &val.y;
     const std::string prompt(1, text[0]);

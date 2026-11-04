@@ -31,6 +31,7 @@ struct FitOptions {
     bool trackAccuracy = false;     // classification accuracy per epoch
     bool verbose = true;            // print a line every `printEvery` epochs
     std::size_t printEvery = 1;
+    std::size_t printEveryBatches = 0;  // also print running loss every N batches (0 = off)
     const Matrix* validationX = nullptr;
     const Matrix* validationY = nullptr;
     std::function<void(const EpochStats&)> onEpochEnd;  // optional callback

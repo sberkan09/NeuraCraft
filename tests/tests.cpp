@@ -822,6 +822,135 @@ TEST(gpt_memorizes_a_sequence_and_generates_it) {
     CHECK(generate(net, tok.encode("a"), 20, cfg.contextLength, sampled).size() == 20);
 }
 
+// ---- Training robustness ------------------------------------------------------------------
+
+TEST(cosine_schedule_and_gradient_clipping) {
+    CosineSchedule s;
+    s.base = 1.0f;
+    s.warmupSteps = 10;
+    s.totalSteps = 110;
+    s.minRatio = 0.1f;
+    CHECK_NEAR(s(0), 0.1, 1e-6);   // warmup starts small
+    CHECK_NEAR(s(9), 1.0, 1e-6);   // reaches the base rate
+    CHECK_NEAR(s(60), 0.55, 1e-4); // halfway through the cosine
+    CHECK_NEAR(s(110), 0.1, 1e-6);
+    CHECK_NEAR(s(500), 0.1, 1e-6);
+
+    Matrix w(1, 2), g{{3, 4}};
+    std::vector<Param> params{{&w, &g}};
+    CHECK_NEAR(clipGradientNorm(params, 1.0f), 5.0, 1e-5);
+    CHECK_NEAR(gradientNorm(params), 1.0, 1e-4);
+    CHECK_NEAR(clipGradientNorm(params, 10.0f), 1.0, 1e-4);  // below the limit: unchanged
+    CHECK_NEAR(g(0, 0), 0.6, 1e-4);
+}
+
+namespace {
+Network resumeNet() {
+    Network net;
+    net.add<Dense>(2, 16, Init::He);
+    net.add<ReLU>();
+    net.add<Dropout>(0.1f);
+    net.add<Dense>(16, 3);
+    return net;
+}
+} // namespace
+
+TEST(checkpoint_resume_is_exact) {
+    const Dataset d = [] { setSeed(50); return makeSpiral(30, 3, 0.1f); }();
+    CosineSchedule schedule;
+    schedule.base = 0.02f;
+    schedule.warmupSteps = 3;
+    schedule.totalSteps = 24;
+    auto options = [&](std::size_t epochs, std::size_t startStep) {
+        FitOptions o;
+        o.epochs = epochs;
+        o.batchSize = 8;
+        o.verbose = false;
+        o.learningRate = schedule;
+        o.clipGradNorm = 0.5f;
+        o.startStep = startStep;
+        return o;
+    };
+    SoftmaxCrossEntropy loss;
+
+    setSeed(51);
+    Network straight = resumeNet();
+    Adam optA(0.02f);
+    straight.fit(d.x, d.y, loss, optA, options(2, 0));
+
+    setSeed(51);
+    Network first = resumeNet();
+    Adam optB(0.02f);
+    const History h = first.fit(d.x, d.y, loss, optB, options(1, 0));
+    CHECK(h.back().step == 12);
+    const std::string path = tempPath("resume.ckpt");
+    saveCheckpoint(path, first, optB, h.back().step);
+
+    setSeed(999);  // different init and random state: everything must come from the checkpoint
+    Network resumed = resumeNet();
+    Adam optC(0.02f);
+    const std::size_t step = loadCheckpoint(path, resumed, optC);
+    CHECK(step == 12);
+    resumed.fit(d.x, d.y, loss, optC, options(1, step));
+
+    const auto a = straight.parameters(), b = resumed.parameters();
+    for (std::size_t i = 0; i < a.size(); ++i) CHECK(a[i].value->approxEquals(*b[i].value, 0.0f));
+    CHECK(optA.stepCount() == optC.stepCount());
+
+    Network other;
+    other.add<Dense>(2, 3);
+    Adam optD;
+    CHECK_THROWS(loadCheckpoint(path, other, optD), std::runtime_error);
+    SGD sgd(0.1f, 0.9f);
+    CHECK_THROWS(loadCheckpoint(path, resumed, sgd), std::runtime_error);  // Adam state into SGD
+    std::remove(path.c_str());
+}
+
+TEST(sgd_state_roundtrip_and_max_steps) {
+    setSeed(52);
+    const Dataset d = makeSpiral(20, 3, 0.1f);  // 60 rows: 6 steps per epoch
+    Network net = resumeNet();
+    SGD opt(0.05f, 0.9f);
+    FitOptions o;
+    o.epochs = 100;
+    o.batchSize = 10;
+    o.verbose = false;
+    o.maxSteps = 7;
+    std::size_t calls = 0;
+    o.onStep = [&](std::size_t) { ++calls; };
+    SoftmaxCrossEntropy loss;
+    const History h = net.fit(d.x, d.y, loss, opt, o);
+    CHECK(calls == 7 && h.back().step == 7 && h.size() == 2);
+
+    std::stringstream state;
+    opt.saveState(state, net.parameters());
+    SGD copy(0.05f, 0.9f);
+    copy.loadState(state, net.parameters());
+    std::stringstream again;
+    copy.saveState(again, net.parameters());
+    std::stringstream first;
+    opt.saveState(first, net.parameters());
+    CHECK(first.str() == again.str());
+}
+
+TEST(gpt_config_roundtrip) {
+    GPTConfig c;
+    c.vocabSize = 77;
+    c.contextLength = 32;
+    c.dim = 48;
+    c.heads = 6;
+    c.layers = 3;
+    c.mlpRatio = 2;
+    c.dropout = 0.25f;
+    const std::string path = tempPath("gpt.config");
+    saveGPTConfig(path, c);
+    const GPTConfig r = loadGPTConfig(path);
+    CHECK(r.vocabSize == 77 && r.contextLength == 32 && r.dim == 48 && r.heads == 6 && r.layers == 3 &&
+          r.mlpRatio == 2);
+    CHECK_NEAR(r.dropout, 0.25, 1e-6);
+    std::remove(path.c_str());
+}
+
 // ---- Backends & threading -----------------------------------------------------------
 
 namespace {

@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -313,6 +314,25 @@ GPTConfig textModelConfig(std::size_t vocab) {
 
 std::string gptWeightsPath(const std::string& textPath) { return textPath + ".gpt.weights"; }
 std::string gptTokenizerPath(const std::string& textPath) { return textPath + ".gpt.tokenizer"; }
+std::string gptConfigPath(const std::string& textPath) { return textPath + ".gpt.config"; }
+std::string gptCheckpointPath(const std::string& textPath) { return textPath + ".gpt.checkpoint"; }
+
+// Model built for generation/resume: the saved config wins over the defaults.
+GPTConfig savedOrDefaultConfig(const std::string& textPath, std::size_t vocab) {
+    std::ifstream probe(gptConfigPath(textPath));
+    GPTConfig cfg = probe ? loadGPTConfig(gptConfigPath(textPath)) : textModelConfig(vocab);
+    cfg.vocabSize = vocab;
+    return cfg;
+}
+
+struct GptOptions {
+    std::size_t epochs = 1;
+    std::string tokenizer = "bpe";
+    bool resume = false;
+    bool cosine = false;  // warmup + cosine decay (helps long runs; constant is better for a few epochs)
+    float learningRate = 1e-3f;
+    std::size_t dim = 0, layers = 0, heads = 0, context = 0;  // 0 = default / saved
+};
 constexpr std::size_t kBpeVocab = 512;
 
 // The tokenizer file records which tokenizer the weights were trained with:
@@ -344,7 +364,8 @@ void printSample(Network& net, const SequenceContextPtr& ctx, const Tokenizer& t
               << "\n------------------" << std::endl;
 }
 
-int runGpt(const std::string& path, std::size_t epochs, const std::string& tokenizerKind) {
+int runGpt(const std::string& path, const GptOptions& o) {
+    const std::string& tokenizerKind = o.tokenizer;
     banner("GPT language model (" + tokenizerKind + " tokens)");
     if (tokenizerKind != "char" && tokenizerKind != "bpe") {
         std::cerr << "unknown tokenizer '" << tokenizerKind << "' (use char or bpe)\n";
@@ -358,7 +379,9 @@ int runGpt(const std::string& path, std::size_t epochs, const std::string& token
         return 2;
     }
     std::unique_ptr<Tokenizer> tok;
-    if (tokenizerKind == "bpe") {
+    if (o.resume) {
+        tok = loadTokenizer(path, text);  // must match the checkpoint
+    } else if (tokenizerKind == "bpe") {
         const auto t0 = std::chrono::steady_clock::now();
         tok = std::make_unique<BpeTokenizer>(BpeTokenizer::train(text, kBpeVocab));
         std::cout << "trained BPE (" << tok->vocabSize() << " tokens) in " << std::fixed << std::setprecision(2)
@@ -374,7 +397,13 @@ int runGpt(const std::string& path, std::size_t epochs, const std::string& token
     // Loss per character makes runs with different tokenizers comparable.
     const double tokensPerChar = static_cast<double>(valIds.size()) / static_cast<double>(tok->decode(valIds).size());
 
-    const GPTConfig cfg = textModelConfig(tok->vocabSize());
+    GPTConfig cfg = o.resume ? savedOrDefaultConfig(path, tok->vocabSize()) : textModelConfig(tok->vocabSize());
+    if (!o.resume) {
+        if (o.dim) cfg.dim = o.dim;
+        if (o.layers) cfg.layers = o.layers;
+        if (o.heads) cfg.heads = o.heads;
+        if (o.context) cfg.contextLength = o.context;
+    }
     const Dataset train = makeNextTokenDataset(trainIds, cfg.contextLength);
     const Dataset val = makeNextTokenDataset(valIds, cfg.contextLength);
     std::cout << path << ": " << text.size() << " characters -> " << ids.size() << " tokens ("
@@ -386,17 +415,48 @@ int runGpt(const std::string& path, std::size_t epochs, const std::string& token
     const SequenceContextPtr ctx = buildGPT(net, cfg);
     net.summary();
     SparseSoftmaxCrossEntropy loss;
-    Adam optimizer(0.001f);
+    Adam optimizer(o.learningRate);
+
+    const std::size_t batchSize = 32;
+    const std::size_t stepsPerEpoch = (train.x.rows() + batchSize - 1) / batchSize;
+    std::size_t startStep = 0;
+    if (o.resume) {
+        try {
+            startStep = loadCheckpoint(gptCheckpointPath(path), net, optimizer);
+        } catch (const std::exception& e) {
+            std::cerr << e.what() << "\n(start a new run without --resume)\n";
+            return 2;
+        }
+        std::cout << "resumed from step " << startStep << " (epoch " << startStep / stepsPerEpoch << ")\n";
+    } else {
+        saveTokenizer(path, *tok);
+        saveGPTConfig(gptConfigPath(path), cfg);
+    }
+    // The schedule spans all epochs of the run, counted from the first step, so a
+    // resumed run continues the same curve (--resume with N epochs extends it).
+    const std::size_t doneEpochs = startStep / stepsPerEpoch;
+    CosineSchedule schedule;
+    schedule.base = o.learningRate;
+    schedule.totalSteps = (doneEpochs + o.epochs) * stepsPerEpoch;
+    schedule.warmupSteps = std::min<std::size_t>(200, schedule.totalSteps / 10);
+    schedule.minRatio = 0.1f;
+
     FitOptions opts;
-    opts.epochs = epochs;
-    opts.batchSize = 32;
+    opts.epochs = o.epochs;
+    opts.batchSize = batchSize;
     opts.printEveryBatches = 50;
     opts.validationX = &val.x;
     opts.validationY = &val.y;
+    if (o.cosine) opts.learningRate = schedule;
+    opts.clipGradNorm = 1.0f;
+    opts.startStep = startStep;
     const std::string prompt(1, text[0]);
     opts.onEpochEnd = [&](const EpochStats& s) {
         std::cout << "validation loss per character: " << std::fixed << std::setprecision(4)
-                  << s.validationLoss * tokensPerChar << std::defaultfloat << '\n';
+                  << s.validationLoss * tokensPerChar << "  (step " << s.step << ", lr " << std::scientific
+                  << std::setprecision(2) << s.learningRate << ", grad norm " << std::fixed << std::setprecision(2)
+                  << s.gradientNorm << ")" << std::defaultfloat << '\n';
+        saveCheckpoint(gptCheckpointPath(path), net, optimizer, s.step);
         printSample(net, ctx, *tok, prompt, 300 / (tokenizerKind == "bpe" ? 2 : 1), cfg.contextLength);
     };
     const auto start = std::chrono::steady_clock::now();
@@ -404,11 +464,11 @@ int runGpt(const std::string& path, std::size_t epochs, const std::string& token
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
     net.save(gptWeightsPath(path));
-    saveTokenizer(path, *tok);
     std::cout << "trained in " << std::fixed << std::setprecision(1) << seconds << " s ("
-              << seconds / static_cast<double>(epochs) << " s/epoch, incl. samples)\n" << std::defaultfloat
-              << "weights saved to " << gptWeightsPath(path) << ", tokenizer to " << gptTokenizerPath(path)
-              << "\ngenerate more with: NeuraCraft generate " << path << " \"PROMPT\" 500\n";
+              << seconds / static_cast<double>(o.epochs) << " s/epoch, incl. samples)\n" << std::defaultfloat
+              << "saved " << gptWeightsPath(path) << ", " << gptConfigPath(path) << ", " << gptTokenizerPath(path)
+              << " and " << gptCheckpointPath(path) << "\ncontinue training with: NeuraCraft gpt " << path
+              << " N --resume\ngenerate text with: NeuraCraft generate " << path << " \"PROMPT\" 500\n";
     return 0;
 }
 
@@ -422,7 +482,7 @@ int runGenerate(const std::string& path, const std::string& prompt, std::size_t 
         std::cerr << e.what() << '\n';
         return 2;
     }
-    const GPTConfig cfg = textModelConfig(tok->vocabSize());
+    const GPTConfig cfg = savedOrDefaultConfig(path, tok->vocabSize());
     Network net;
     const SequenceContextPtr ctx = buildGPT(net, cfg);
     try {
@@ -530,7 +590,8 @@ void usage() {
               << "                               train on MNIST IDX files in <dir>, save weights\n"
               << "  NeuraCraft eval <dir> [mlp|cnn]\n"
               << "                               evaluate saved MNIST weights on the test set\n"
-              << "  NeuraCraft gpt <text-file> [epochs] [bpe|char]\n"
+              << "  NeuraCraft gpt <text-file> [epochs] [bpe|char] [--resume] [--lr X] [--cosine]\n"
+              << "                 [--dim N] [--layers N] [--heads N] [--context N]\n"
               << "                               train a GPT on a text file (BPE or character tokens)\n"
               << "  NeuraCraft generate <text-file> [prompt] [length]\n"
               << "                               sample text from the trained GPT\n"
@@ -598,8 +659,32 @@ int main(int argc, char** argv) {
                 usage();
                 return 2;
             }
-            const std::size_t epochs = args.size() > 2 ? static_cast<std::size_t>(std::strtoul(args[2].c_str(), nullptr, 10)) : 1;
-            return runGpt(args[1], epochs == 0 ? 1 : epochs, args.size() > 3 ? args[3] : "bpe");
+            GptOptions o;
+            std::size_t positional = 0;
+            for (std::size_t i = 2; i < args.size(); ++i) {
+                const std::string& a = args[i];
+                auto value = [&]() -> std::string {
+                    if (i + 1 >= args.size()) throw std::invalid_argument(a + " needs a value");
+                    return args[++i];
+                };
+                if (a == "--resume") o.resume = true;
+                else if (a == "--cosine") o.cosine = true;
+                else if (a == "--lr") o.learningRate = std::stof(value());
+                else if (a == "--dim") o.dim = std::stoul(value());
+                else if (a == "--layers") o.layers = std::stoul(value());
+                else if (a == "--heads") o.heads = std::stoul(value());
+                else if (a == "--context") o.context = std::stoul(value());
+                else if (positional == 0 && std::isdigit(static_cast<unsigned char>(a[0]))) {
+                    o.epochs = std::max<std::size_t>(1, std::stoul(a));
+                    ++positional;
+                } else if (a == "bpe" || a == "char") {
+                    o.tokenizer = a;
+                } else {
+                    std::cerr << "unknown gpt option: " << a << "\n";
+                    return 2;
+                }
+            }
+            return runGpt(args[1], o);
         }
         if (cmd == "generate") {
             if (args.size() < 2) {

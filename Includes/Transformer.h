@@ -5,6 +5,7 @@
 #include "Network.h"
 
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace nc {
@@ -139,6 +140,10 @@ struct GPTConfig {
     std::size_t mlpRatio = 4;
     float dropout = 0.0f;
 };
+
+// key = value text files, so a saved model can be rebuilt without code changes.
+void saveGPTConfig(const std::string& path, const GPTConfig& config);
+GPTConfig loadGPTConfig(const std::string& path);
 
 // Appends a GPT-style decoder (pre-norm blocks) to `net`. The network maps
 // (batch x seqLen) token ids to (batch * seqLen) x vocab logits; train it with

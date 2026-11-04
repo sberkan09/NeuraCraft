@@ -71,13 +71,23 @@ $ ./build_and_run.sh eval data/mnist cnn      # reload, per-digit accuracy, show
 $ scripts/download_shakespeare.sh                     # data/shakespeare.txt (1.1 MB)
 $ ./build_and_run.sh gpt data/shakespeare.txt 2       # BPE tokens (default)
 $ ./build_and_run.sh gpt data/shakespeare.txt 2 char  # character tokens
+$ ./build_and_run.sh gpt data/shakespeare.txt 3 --resume   # 3 more epochs from the checkpoint
+$ ./build_and_run.sh gpt data/shakespeare.txt 6 --cosine --dim 192 --layers 6 --heads 6 --context 128
 $ ./build_and_run.sh generate data/shakespeare.txt "ROMEO:" 200
 ```
 
-`gpt` trains a 4-layer, 4-head, 128-dim decoder (context 64 tokens) on any
-text file, prints a sample after every epoch and saves `<file>.gpt.weights`
-plus `<file>.gpt.tokenizer`; `generate` reloads both and samples with
-temperature 0.8, top-k 20. The default tokenizer is byte-level BPE with 512
+`gpt` trains a decoder (default: 4 layers, 4 heads, dim 128, context 64
+tokens) on any text file, prints a sample after every epoch and saves
+`<file>.gpt.weights`, `.gpt.config`, `.gpt.tokenizer` and a
+`.gpt.checkpoint` (weights + Adam state + step + random state, written after
+every epoch); `generate` rebuilds the model from the config and samples with
+temperature 0.8, top-k 20. Training clips the global gradient norm to 1;
+`--cosine` adds linear warmup and cosine decay of the learning rate over the
+whole run (`--lr` is the peak). For a short run a constant rate is better:
+over 2 epochs it reaches 1.817 per character, cosine 1.894 (peak 1e-3) or 1.842
+(peak 2e-3), because the rate decays before the model has learned enough. `--resume` continues from the checkpoint, and a resumed run
+is bit-for-bit identical to one that never stopped; asking for more epochs
+than originally planned stretches the cosine curve from that point. The default tokenizer is byte-level BPE with 512
 tokens (learned from the file in under a second); `char` uses one token per
 character. Validation loss is also reported per character, so the two are
 comparable.
@@ -224,8 +234,8 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
 | Transformer | `Transformer.h` | `TokenEmbedding` (token + learned positions), `LayerNorm`, `GELU`, multi-head `CausalSelfAttention`, `Residual` blocks, `buildGPT()` |
 | Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k) |
-| Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay) |
-| Network | `Network.h` | `add<Layer>(...)`, `fit` (mini-batches, shuffling, validation, accuracy, callbacks), `predict`, `evaluate`, `accuracy`, `summary`, `save` / `load` |
+| Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |
+| Network | `Network.h` | `add<Layer>(...)`, `fit` (mini-batches, shuffling, validation, accuracy, LR schedule, gradient clipping, step limits, callbacks), `predict`, `evaluate`, `accuracy`, `summary`, `save` / `load`, `saveCheckpoint` / `loadCheckpoint` (exact resume) |
 | Data | `Data.h` | One-hot / argmax, train/test split, standardization, CSV load/save, MNIST IDX loader, XOR / spiral / sine generators |
 | Backends | `Backend.h`, `Parallel.h` | `gemm()` / `matmul()` dispatch, CPU / Accelerate / Metal (zero-copy on unified memory), `setDevice`, `setThreadCount`, `parallelFor` |
 | Random | `Random.h` | `setSeed()` makes initialization, shuffling and dropout reproducible |

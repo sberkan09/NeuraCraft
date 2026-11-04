@@ -2,6 +2,7 @@
 #include "Random.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -68,12 +69,18 @@ History Network::fit(const Matrix& x, const Matrix& y, Loss& loss, Optimizer& op
     History history;
     std::vector<std::size_t> order(x.rows());
     std::iota(order.begin(), order.end(), 0);
+    std::size_t step = options.startStep;
+    float lastLr = optimizer.learningRate();
+    bool stop = options.maxSteps > 0 && step >= options.maxSteps;
 
-    for (std::size_t epoch = 1; epoch <= options.epochs; ++epoch) {
+    for (std::size_t epoch = 1; epoch <= options.epochs && !stop; ++epoch) {
+        // Shuffle from the identity each epoch, so the order depends only on the
+        // random state (which checkpoints save) and not on earlier epochs.
+        std::iota(order.begin(), order.end(), 0);
         if (options.shuffle) std::shuffle(order.begin(), order.end(), rng());
 
-        double lossSum = 0.0;
-        std::size_t correct = 0;
+        double lossSum = 0.0, normSum = 0.0;
+        std::size_t correct = 0, seen = 0, batches = 0;
         for (std::size_t start = 0; start < order.size(); start += options.batchSize) {
             const std::size_t end = std::min(start + options.batchSize, order.size());
             const std::vector<std::size_t> idx(order.begin() + start, order.begin() + end);
@@ -86,21 +93,36 @@ History Network::fit(const Matrix& x, const Matrix& y, Loss& loss, Optimizer& op
                 correct += static_cast<std::size_t>(accuracyScore(out, by) * static_cast<float>(idx.size()) + 0.5f);
             }
             backward(loss.gradient());
-            optimizer.step(parameters());
+            const auto params = parameters();
+            normSum += options.clipGradNorm > 0.0f ? clipGradientNorm(params, options.clipGradNorm) : gradientNorm(params);
+            if (options.learningRate) optimizer.setLearningRate(options.learningRate(step));
+            lastLr = optimizer.learningRate();
+            optimizer.step(params);
+            ++step;
+            ++batches;
+            seen = end;
+            if (options.onStep) options.onStep(step);
 
             const std::size_t batchIndex = start / options.batchSize + 1;
             if (options.verbose && options.printEveryBatches > 0 && batchIndex % options.printEveryBatches == 0) {
-                const std::size_t batches = (order.size() + options.batchSize - 1) / options.batchSize;
-                std::cout << "  epoch " << epoch << " batch " << batchIndex << "/" << batches << "  loss "
-                          << std::fixed << std::setprecision(5) << lossSum / static_cast<double>(end)
-                          << std::defaultfloat << std::endl;
+                const std::size_t total = (order.size() + options.batchSize - 1) / options.batchSize;
+                std::cout << "  epoch " << epoch << " batch " << batchIndex << "/" << total << "  loss "
+                          << std::fixed << std::setprecision(5) << lossSum / static_cast<double>(end) << "  lr "
+                          << std::scientific << std::setprecision(2) << lastLr << std::defaultfloat << std::endl;
+            }
+            if (options.maxSteps > 0 && step >= options.maxSteps) {
+                stop = true;
+                break;
             }
         }
 
         EpochStats stats;
         stats.epoch = epoch;
-        stats.loss = static_cast<float>(lossSum / static_cast<double>(x.rows()));
-        if (options.trackAccuracy) stats.accuracy = static_cast<float>(correct) / static_cast<float>(x.rows());
+        stats.loss = static_cast<float>(lossSum / static_cast<double>(seen));
+        if (options.trackAccuracy) stats.accuracy = static_cast<float>(correct) / static_cast<float>(seen);
+        stats.step = step;
+        stats.learningRate = lastLr;
+        stats.gradientNorm = static_cast<float>(normSum / static_cast<double>(std::max<std::size_t>(1, batches)));
         if (options.validationX) {
             stats.validationLoss = evaluate(*options.validationX, *options.validationY, loss);
             if (options.trackAccuracy) stats.validationAccuracy = accuracy(*options.validationX, *options.validationY);
@@ -108,7 +130,7 @@ History Network::fit(const Matrix& x, const Matrix& y, Loss& loss, Optimizer& op
         history.push_back(stats);
 
         const std::size_t every = std::max<std::size_t>(1, options.printEvery);
-        if (options.verbose && (epoch % every == 0 || epoch == 1 || epoch == options.epochs)) {
+        if (options.verbose && (epoch % every == 0 || epoch == 1 || epoch == options.epochs || stop)) {
             std::cout << "epoch " << std::setw(4) << epoch << "/" << options.epochs
                       << "  loss " << std::fixed << std::setprecision(5) << stats.loss;
             if (stats.accuracy >= 0) std::cout << "  acc " << std::setprecision(4) << stats.accuracy;
@@ -177,9 +199,7 @@ void Network::summary(std::ostream& os) const {
 
 void Network::summary() const { summary(std::cout); }
 
-void Network::save(const std::string& path) {
-    std::ofstream out(path);
-    if (!out) throw std::runtime_error("Network::save: cannot open " + path);
+void Network::saveParameters(std::ostream& out) {
     const auto params = parameters();
     out << kMagic << ' ' << kFormatVersion << '\n' << params.size() << '\n';
     out << std::setprecision(9);
@@ -188,17 +208,14 @@ void Network::save(const std::string& path) {
         const auto& values = p.value->values();
         for (std::size_t i = 0; i < values.size(); ++i) out << values[i] << (i + 1 < values.size() ? ' ' : '\n');
     }
-    if (!out) throw std::runtime_error("Network::save: write failed for " + path);
 }
 
-void Network::load(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error("Network::load: cannot open " + path);
+void Network::loadParameters(std::istream& in, const std::string& source) {
     std::string magic;
     int version = 0;
     std::size_t count = 0;
     if (!(in >> magic >> version >> count) || magic != kMagic)
-        throw std::runtime_error("Network::load: " + path + " is not a NeuraCraft weights file");
+        throw std::runtime_error("Network::load: " + source + " is not a NeuraCraft weights file");
     if (version != kFormatVersion)
         throw std::runtime_error("Network::load: unsupported format version " + std::to_string(version));
 
@@ -225,6 +242,53 @@ void Network::load(const std::string& path) {
         loaded.push_back(std::move(m));
     }
     for (std::size_t k = 0; k < count; ++k) *params[k].value = std::move(loaded[k]);
+}
+
+void Network::save(const std::string& path) {
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("Network::save: cannot open " + path);
+    saveParameters(out);
+    if (!out) throw std::runtime_error("Network::save: write failed for " + path);
+}
+
+void Network::load(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("Network::load: cannot open " + path);
+    loadParameters(in, path);
+}
+
+namespace {
+constexpr const char* kCheckpointMagic = "NEURACRAFT-CHECKPOINT";
+} // namespace
+
+void saveCheckpoint(const std::string& path, Network& net, const Optimizer& optimizer, std::size_t step) {
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp);
+        if (!out) throw std::runtime_error("saveCheckpoint: cannot open " + tmp);
+        out << kCheckpointMagic << " 1\n" << step << '\n' << rng() << '\n';
+        net.saveParameters(out);
+        optimizer.saveState(out, net.parameters());
+        if (!out) throw std::runtime_error("saveCheckpoint: write failed for " + tmp);
+    }
+    // Replace the old checkpoint only once the new one is complete.
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) throw std::runtime_error("saveCheckpoint: cannot write " + path);
+}
+
+std::size_t loadCheckpoint(const std::string& path, Network& net, Optimizer& optimizer) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("loadCheckpoint: cannot open " + path);
+    std::string magic;
+    int version = 0;
+    std::size_t step = 0;
+    if (!(in >> magic >> version >> step) || magic != kCheckpointMagic || version != 1)
+        throw std::runtime_error("loadCheckpoint: " + path + " is not a NeuraCraft checkpoint");
+    std::mt19937 generator;
+    if (!(in >> generator)) throw std::runtime_error("loadCheckpoint: bad random state in " + path);
+    net.loadParameters(in, path);
+    optimizer.loadState(in, net.parameters());
+    rng() = generator;
+    return step;
 }
 
 } // namespace nc

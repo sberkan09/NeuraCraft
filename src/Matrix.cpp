@@ -1,51 +1,309 @@
 #include "Matrix.h"
+#include "Random.h"
 
-Matrix::Matrix(int rows, int cols) : rows(rows), cols(cols), mat(rows, std::vector<int>(cols, 0)) {}
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
 
-void Matrix::setElement(int row, int col, int value) {
-    if (row >= 0 && row < this->rows && col >= 0 && col < this->cols) {
-        mat[row][col] = value;
-    } else {
-        std::cerr << "Error: Index out of bounds" << std::endl;
-    }
+namespace nc {
+
+namespace {
+std::string shapeOf(std::size_t r, std::size_t c) {
+    std::ostringstream os;
+    os << "(" << r << "x" << c << ")";
+    return os.str();
 }
+} // namespace
 
-int Matrix::getElement(int row, int col) const {
-    if (row >= 0 && row < this->rows && col >= 0 && col < this->cols) {
-        return mat[row][col];
-    } else {
-        std::cerr << "Error: Index out of bounds" << std::endl;
-        return -1;
-    }
-}
+Matrix::Matrix(std::size_t rows, std::size_t cols, float fill)
+    : rows_(rows), cols_(cols), data_(rows * cols, fill) {}
 
-void Matrix::print() const {
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < cols; j++) {
-            std::cout << mat[i][j] << " ";
+Matrix::Matrix(std::initializer_list<std::initializer_list<float>> values) {
+    rows_ = values.size();
+    cols_ = rows_ ? values.begin()->size() : 0;
+    data_.reserve(rows_ * cols_);
+    for (const auto& r : values) {
+        if (r.size() != cols_) {
+            throw std::invalid_argument("Matrix: all rows must have the same length");
         }
-        std::cout << std::endl;
+        data_.insert(data_.end(), r.begin(), r.end());
+    }
+}
+
+Matrix::Matrix(std::size_t rows, std::size_t cols, std::vector<float> data)
+    : rows_(rows), cols_(cols), data_(std::move(data)) {
+    if (data_.size() != rows_ * cols_) {
+        throw std::invalid_argument("Matrix: data size does not match " + shapeOf(rows, cols));
+    }
+}
+
+Matrix Matrix::zeros(std::size_t rows, std::size_t cols) { return Matrix(rows, cols, 0.0f); }
+Matrix Matrix::ones(std::size_t rows, std::size_t cols) { return Matrix(rows, cols, 1.0f); }
+
+Matrix Matrix::uniform(std::size_t rows, std::size_t cols, float low, float high) {
+    Matrix m(rows, cols);
+    std::uniform_real_distribution<float> dist(low, high);
+    for (auto& v : m.data_) v = dist(rng());
+    return m;
+}
+
+Matrix Matrix::normal(std::size_t rows, std::size_t cols, float mean, float stddev) {
+    Matrix m(rows, cols);
+    std::normal_distribution<float> dist(mean, stddev);
+    for (auto& v : m.data_) v = dist(rng());
+    return m;
+}
+
+float& Matrix::at(std::size_t r, std::size_t c) {
+    if (r >= rows_ || c >= cols_) throw std::out_of_range("Matrix::at index out of bounds");
+    return (*this)(r, c);
+}
+
+float Matrix::at(std::size_t r, std::size_t c) const {
+    if (r >= rows_ || c >= cols_) throw std::out_of_range("Matrix::at index out of bounds");
+    return (*this)(r, c);
+}
+
+void Matrix::setElement(int row, int col, float value) {
+    if (row < 0 || col < 0) throw std::out_of_range("Matrix::setElement negative index");
+    at(static_cast<std::size_t>(row), static_cast<std::size_t>(col)) = value;
+}
+
+float Matrix::getElement(int row, int col) const {
+    if (row < 0 || col < 0) throw std::out_of_range("Matrix::getElement negative index");
+    return at(static_cast<std::size_t>(row), static_cast<std::size_t>(col));
+}
+
+void Matrix::print() const { print(std::cout); }
+
+void Matrix::print(std::ostream& os) const {
+    for (std::size_t i = 0; i < rows_; ++i) {
+        for (std::size_t j = 0; j < cols_; ++j) {
+            os << std::setw(10) << std::setprecision(4) << (*this)(i, j) << (j + 1 < cols_ ? " " : "");
+        }
+        os << '\n';
+    }
+}
+
+void Matrix::requireSameShape(const Matrix& other, const char* op) const {
+    if (!sameShape(other)) {
+        throw std::invalid_argument(std::string("Matrix ") + op + ": shape mismatch " +
+                                    shapeOf(rows_, cols_) + " vs " + shapeOf(other.rows_, other.cols_));
     }
 }
 
 Matrix Matrix::operator*(const Matrix& rhs) const {
-    if (this->cols != rhs.rows) {
-        std::cerr << "Error: Matrix dimensions do not match for multiplication" << std::endl;
-        return Matrix(0, 0); // Returning an empty matrix as an error state
+    if (cols_ != rhs.rows_) {
+        throw std::invalid_argument("Matrix multiply: shape mismatch " + shapeOf(rows_, cols_) +
+                                    " * " + shapeOf(rhs.rows_, rhs.cols_));
     }
-
-    Matrix result(this->rows, rhs.cols);
-    for (int i = 0; i < this->rows; i++) {
-        for (int j = 0; j < rhs.cols; j++) {
-            int sum = 0;
-            for (int k = 0; k < this->cols; k++) {
-                sum += this->mat[i][k] * rhs.mat[k][j];
-            }
-            result.setElement(i, j, sum);
+    Matrix result(rows_, rhs.cols_);
+    // i-k-j order keeps the inner loop contiguous for both operands.
+    for (std::size_t i = 0; i < rows_; ++i) {
+        float* out = result.data_.data() + i * rhs.cols_;
+        const float* a = data_.data() + i * cols_;
+        for (std::size_t k = 0; k < cols_; ++k) {
+            const float aik = a[k];
+            if (aik == 0.0f) continue;
+            const float* b = rhs.data_.data() + k * rhs.cols_;
+            for (std::size_t j = 0; j < rhs.cols_; ++j) out[j] += aik * b[j];
         }
     }
     return result;
 }
 
-int Matrix::getRows() const { return rows; }
-int Matrix::getCols() const { return cols; }
+Matrix Matrix::transposeMatmul(const Matrix& rhs) const {
+    // (this^T)(rhs): this is (n x a), rhs is (n x b) -> (a x b)
+    if (rows_ != rhs.rows_) {
+        throw std::invalid_argument("Matrix transposeMatmul: shape mismatch " + shapeOf(rows_, cols_) +
+                                    "^T * " + shapeOf(rhs.rows_, rhs.cols_));
+    }
+    Matrix result(cols_, rhs.cols_);
+    for (std::size_t n = 0; n < rows_; ++n) {
+        const float* a = data_.data() + n * cols_;
+        const float* b = rhs.data_.data() + n * rhs.cols_;
+        for (std::size_t i = 0; i < cols_; ++i) {
+            const float ai = a[i];
+            if (ai == 0.0f) continue;
+            float* out = result.data_.data() + i * rhs.cols_;
+            for (std::size_t j = 0; j < rhs.cols_; ++j) out[j] += ai * b[j];
+        }
+    }
+    return result;
+}
+
+Matrix Matrix::matmulTranspose(const Matrix& rhs) const {
+    // this * rhs^T: this is (n x k), rhs is (m x k) -> (n x m)
+    if (cols_ != rhs.cols_) {
+        throw std::invalid_argument("Matrix matmulTranspose: shape mismatch " + shapeOf(rows_, cols_) +
+                                    " * " + shapeOf(rhs.rows_, rhs.cols_) + "^T");
+    }
+    Matrix result(rows_, rhs.rows_);
+    for (std::size_t i = 0; i < rows_; ++i) {
+        const float* a = data_.data() + i * cols_;
+        for (std::size_t j = 0; j < rhs.rows_; ++j) {
+            const float* b = rhs.data_.data() + j * rhs.cols_;
+            float acc = 0.0f;
+            for (std::size_t k = 0; k < cols_; ++k) acc += a[k] * b[k];
+            result.data_[i * rhs.rows_ + j] = acc;
+        }
+    }
+    return result;
+}
+
+Matrix Matrix::transpose() const {
+    Matrix result(cols_, rows_);
+    for (std::size_t i = 0; i < rows_; ++i)
+        for (std::size_t j = 0; j < cols_; ++j) result(j, i) = (*this)(i, j);
+    return result;
+}
+
+Matrix Matrix::operator+(const Matrix& rhs) const {
+    Matrix result(*this);
+    result += rhs;
+    return result;
+}
+
+Matrix Matrix::operator-(const Matrix& rhs) const {
+    Matrix result(*this);
+    result -= rhs;
+    return result;
+}
+
+Matrix Matrix::hadamard(const Matrix& rhs) const {
+    requireSameShape(rhs, "hadamard");
+    Matrix result(*this);
+    for (std::size_t i = 0; i < data_.size(); ++i) result.data_[i] *= rhs.data_[i];
+    return result;
+}
+
+Matrix& Matrix::operator+=(const Matrix& rhs) {
+    requireSameShape(rhs, "+");
+    for (std::size_t i = 0; i < data_.size(); ++i) data_[i] += rhs.data_[i];
+    return *this;
+}
+
+Matrix& Matrix::operator-=(const Matrix& rhs) {
+    requireSameShape(rhs, "-");
+    for (std::size_t i = 0; i < data_.size(); ++i) data_[i] -= rhs.data_[i];
+    return *this;
+}
+
+Matrix Matrix::operator*(float s) const {
+    Matrix result(*this);
+    result *= s;
+    return result;
+}
+
+Matrix Matrix::operator/(float s) const { return *this * (1.0f / s); }
+
+Matrix Matrix::operator+(float s) const {
+    Matrix result(*this);
+    for (auto& v : result.data_) v += s;
+    return result;
+}
+
+Matrix Matrix::operator-(float s) const { return *this + (-s); }
+
+Matrix& Matrix::operator*=(float s) {
+    for (auto& v : data_) v *= s;
+    return *this;
+}
+
+Matrix Matrix::operator-() const { return *this * -1.0f; }
+
+Matrix Matrix::addRowVector(const Matrix& row) const {
+    if (row.rows_ != 1 || row.cols_ != cols_) {
+        throw std::invalid_argument("Matrix addRowVector: expected (1x" + std::to_string(cols_) +
+                                    ") got " + shapeOf(row.rows_, row.cols_));
+    }
+    Matrix result(*this);
+    for (std::size_t i = 0; i < rows_; ++i)
+        for (std::size_t j = 0; j < cols_; ++j) result(i, j) += row.data_[j];
+    return result;
+}
+
+Matrix Matrix::sumRows() const {
+    Matrix result(1, cols_);
+    for (std::size_t i = 0; i < rows_; ++i)
+        for (std::size_t j = 0; j < cols_; ++j) result.data_[j] += (*this)(i, j);
+    return result;
+}
+
+Matrix Matrix::sumCols() const {
+    Matrix result(rows_, 1);
+    for (std::size_t i = 0; i < rows_; ++i) {
+        float acc = 0.0f;
+        for (std::size_t j = 0; j < cols_; ++j) acc += (*this)(i, j);
+        result.data_[i] = acc;
+    }
+    return result;
+}
+
+Matrix Matrix::apply(const std::function<float(float)>& fn) const {
+    Matrix result(*this);
+    for (auto& v : result.data_) v = fn(v);
+    return result;
+}
+
+void Matrix::fill(float value) { std::fill(data_.begin(), data_.end(), value); }
+
+Matrix Matrix::row(std::size_t r) const { return sliceRows(r, r + 1); }
+
+Matrix Matrix::gatherRows(const std::vector<std::size_t>& indices) const {
+    Matrix result(indices.size(), cols_);
+    for (std::size_t i = 0; i < indices.size(); ++i) {
+        if (indices[i] >= rows_) throw std::out_of_range("Matrix gatherRows index out of bounds");
+        std::copy_n(data_.begin() + indices[i] * cols_, cols_, result.data_.begin() + i * cols_);
+    }
+    return result;
+}
+
+Matrix Matrix::sliceRows(std::size_t begin, std::size_t end) const {
+    if (begin > end || end > rows_) throw std::out_of_range("Matrix sliceRows range out of bounds");
+    return Matrix(end - begin, cols_,
+                  std::vector<float>(data_.begin() + begin * cols_, data_.begin() + end * cols_));
+}
+
+float Matrix::sum() const {
+    double acc = 0.0;
+    for (float v : data_) acc += v;
+    return static_cast<float>(acc);
+}
+
+float Matrix::mean() const { return data_.empty() ? 0.0f : sum() / static_cast<float>(data_.size()); }
+
+float Matrix::max() const {
+    if (data_.empty()) throw std::logic_error("Matrix::max on empty matrix");
+    return *std::max_element(data_.begin(), data_.end());
+}
+
+float Matrix::min() const {
+    if (data_.empty()) throw std::logic_error("Matrix::min on empty matrix");
+    return *std::min_element(data_.begin(), data_.end());
+}
+
+std::size_t Matrix::argmaxRow(std::size_t r) const {
+    if (r >= rows_ || cols_ == 0) throw std::out_of_range("Matrix::argmaxRow out of bounds");
+    const float* begin = data_.data() + r * cols_;
+    return static_cast<std::size_t>(std::max_element(begin, begin + cols_) - begin);
+}
+
+bool Matrix::approxEquals(const Matrix& other, float tolerance) const {
+    if (!sameShape(other)) return false;
+    for (std::size_t i = 0; i < data_.size(); ++i)
+        if (std::fabs(data_[i] - other.data_[i]) > tolerance) return false;
+    return true;
+}
+
+Matrix operator*(float s, const Matrix& m) { return m * s; }
+
+std::ostream& operator<<(std::ostream& os, const Matrix& m) {
+    m.print(os);
+    return os;
+}
+
+} // namespace nc

@@ -1,3 +1,6 @@
 build
 bin
 .vscode/
+data/
+*.weights
+.DS_Store

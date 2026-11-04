@@ -37,7 +37,20 @@ $ ./build_and_run.sh mnist data/mnist 5     # 5 epochs
 
 Trains a 784-128-64-10 ReLU network with dropout and Adam, reports validation
 accuracy on the 10k test set every epoch and saves the weights to
-`data/mnist/mnist.weights`. An epoch takes a few seconds on a laptop CPU.
+`data/mnist/mnist.weights`.
+
+Reference run (10 epochs, seed 42): **97.97 % test accuracy**. With the v1.0
+single-threaded kernel an epoch took ~7 s; the current backends take ~2.3 s on
+the same 2-core machine (see below).
+
+| epoch | train loss | train acc | test loss | test acc |
+|---:|---:|---:|---:|---:|
+| 1 | 0.3162 | 90.75 % | 0.1399 | 95.94 % |
+| 2 | 0.1429 | 95.71 % | 0.0950 | 96.98 % |
+| 4 | 0.0894 | 97.22 % | 0.0704 | 97.74 % |
+| 6 | 0.0702 | 97.75 % | 0.0712 | 97.81 % |
+| 8 | 0.0536 | 98.26 % | 0.0631 | 98.04 % |
+| 10 | 0.0469 | 98.39 % | 0.0696 | 97.97 % |
 
 A convolutional network (2× Conv3×3 + MaxPool, then Dense) does better:
 

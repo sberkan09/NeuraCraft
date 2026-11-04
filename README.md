@@ -511,6 +511,10 @@ All matrix products in the library go through one `gemm()` dispatcher
 | Apple Accelerate | default CPU path on macOS | uses the AMX matrix units on Apple silicon |
 | Metal | `setDevice(Device::GPU)` / `--gpu` on Apple silicon | simdgroup-matrix kernel on M1 and later, tiled fallback elsewhere; shaders compile at runtime (no full Xcode needed) |
 
+`scripts/mac_benchmark.sh` times SD-Turbo on the CPU and the GPU (int8 and
+float32) and a short animation, pausing between runs so a laptop stays
+cool, and writes `benchmark_results.txt`.
+
 ```cpp
 nc::setThreadCount(8);                 // CPU threads (default: all cores)
 if (nc::setDevice(nc::Device::GPU))    // false -> stays on the CPU

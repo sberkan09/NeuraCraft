@@ -333,12 +333,13 @@ std::unique_ptr<Tokenizer> loadTokenizer(const std::string& textPath, const std:
     return std::make_unique<BpeTokenizer>(BpeTokenizer::load(gptTokenizerPath(textPath)));
 }
 
-void printSample(Network& net, const Tokenizer& tok, const std::string& prompt, std::size_t length,
-                 std::size_t context) {
+void printSample(Network& net, const SequenceContextPtr& ctx, const Tokenizer& tok, const std::string& prompt,
+                 std::size_t length, std::size_t context) {
     SamplingOptions sampling;
     sampling.temperature = 0.8f;
     sampling.topK = 20;
-    std::cout << "----- sample -----\n" << prompt << tok.decode(generate(net, tok.encode(prompt), length, context, sampling))
+    std::cout << "----- sample -----\n"
+              << prompt << tok.decode(generate(net, tok.encode(prompt), length, context, sampling, ctx))
               << "\n------------------" << std::endl;
 }
 
@@ -381,7 +382,7 @@ int runGpt(const std::string& path, std::size_t epochs, const std::string& token
               << " validation sequences of " << cfg.contextLength << " tokens\n";
 
     Network net;
-    buildGPT(net, cfg);
+    const SequenceContextPtr ctx = buildGPT(net, cfg);
     net.summary();
     SparseSoftmaxCrossEntropy loss;
     Adam optimizer(0.001f);
@@ -395,7 +396,7 @@ int runGpt(const std::string& path, std::size_t epochs, const std::string& token
     opts.onEpochEnd = [&](const EpochStats& s) {
         std::cout << "validation loss per character: " << std::fixed << std::setprecision(4)
                   << s.validationLoss * tokensPerChar << std::defaultfloat << '\n';
-        printSample(net, *tok, prompt, 300 / (tokenizerKind == "bpe" ? 2 : 1), cfg.contextLength);
+        printSample(net, ctx, *tok, prompt, 300 / (tokenizerKind == "bpe" ? 2 : 1), cfg.contextLength);
     };
     const auto start = std::chrono::steady_clock::now();
     net.fit(train.x, train.y, loss, optimizer, opts);
@@ -422,7 +423,7 @@ int runGenerate(const std::string& path, const std::string& prompt, std::size_t 
     }
     const GPTConfig cfg = textModelConfig(tok->vocabSize());
     Network net;
-    buildGPT(net, cfg);
+    const SequenceContextPtr ctx = buildGPT(net, cfg);
     try {
         net.load(gptWeightsPath(path));
     } catch (const std::exception& e) {
@@ -440,7 +441,12 @@ int runGenerate(const std::string& path, const std::string& prompt, std::size_t 
     sampling.temperature = 0.8f;
     sampling.topK = 20;
     // `length` counts tokens; with BPE a token is ~2 characters.
-    std::cout << prompt << tok->decode(generate(net, promptIds, length, cfg.contextLength, sampling)) << '\n';
+    const auto start = std::chrono::steady_clock::now();
+    const std::vector<int> out = generate(net, promptIds, length, cfg.contextLength, sampling, ctx);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::cout << prompt << tok->decode(out) << '\n';
+    std::cerr << out.size() << " tokens in " << std::fixed << std::setprecision(2) << seconds << " s ("
+              << std::setprecision(0) << static_cast<double>(out.size()) / seconds << " tokens/s, KV cache)\n";
     return 0;
 }
 

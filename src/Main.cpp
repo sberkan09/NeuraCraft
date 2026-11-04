@@ -528,7 +528,7 @@ std::string quoted(const std::string& s) {  // Python-repr-like, for --check out
 }
 
 int runGpt2(const std::string& dir, const std::string& prompt, std::size_t tokens, const SamplingOptions& base,
-            bool check) {
+            bool check, bool int8) {
     const auto t0 = std::chrono::steady_clock::now();
     PretrainedModel model;
     std::unique_ptr<Gpt2Tokenizer> tok;
@@ -539,8 +539,10 @@ int runGpt2(const std::string& dir, const std::string& prompt, std::size_t token
         std::cerr << e.what() << "\ndownload GPT-2 with: scripts/download_gpt2.sh " << dir << '\n';
         return 2;
     }
+    if (int8) model.net.quantize();
     const double loadSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::cerr << "loaded GPT-2 (" << model.net.parameterCount() / 1000000 << "M parameters, " << model.config.layers
+    std::cerr << (int8 ? "loaded GPT-2, int8 weights (" : "loaded GPT-2 (");
+    std::cerr << "" << model.config.layers
               << " layers, dim " << model.config.dim << ") in " << std::fixed << std::setprecision(1) << loadSeconds
               << " s" << std::defaultfloat << '\n';
 
@@ -669,7 +671,7 @@ void usage() {
               << "                               train a GPT on a text file (BPE or character tokens)\n"
               << "  NeuraCraft generate <text-file> [prompt] [length]\n"
               << "                               sample text from the trained GPT\n"
-              << "  NeuraCraft gpt2 <dir> [prompt] [tokens] [--temperature T] [--top-k K] [--greedy] [--check]\n"
+              << "  NeuraCraft gpt2 <dir> [prompt] [tokens] [--temperature T] [--top-k K] [--greedy] [--int8] [--check]\n"
               << "                               run pretrained GPT-2 (scripts/download_gpt2.sh)\n"
               << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
               << "options:\n"
@@ -776,7 +778,7 @@ int main(int argc, char** argv) {
             }
             std::string prompt = "The meaning of life is";
             std::size_t tokens = 60;
-            bool check = false;
+            bool check = false, int8 = false;
             SamplingOptions sampling;
             sampling.temperature = 0.8f;
             sampling.topK = 40;
@@ -791,6 +793,7 @@ int main(int argc, char** argv) {
                 else if (a == "--top-k") sampling.topK = std::stoul(value());
                 else if (a == "--greedy") sampling.temperature = 0.0f;
                 else if (a == "--check") check = true;
+                else if (a == "--int8") int8 = true;
                 else if (positional == 0) { prompt = a; ++positional; }
                 else if (positional == 1) { tokens = std::stoul(a); ++positional; }
                 else {
@@ -798,7 +801,7 @@ int main(int argc, char** argv) {
                     return 2;
                 }
             }
-            return runGpt2(args[1], prompt, tokens, sampling, check);
+            return runGpt2(args[1], prompt, tokens, sampling, check, int8);
         }
         if (cmd == "generate") {
             if (args.size() < 2) {

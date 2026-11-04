@@ -189,10 +189,20 @@ English/Turkish/emoji/code prompt all 55 × 50257 logits agree within
 same ids as Hugging Face `tokenizers` on 20 tricky inputs (contractions,
 whitespace runs, Turkish, CJK, emoji, code, symbols).
 
-On the 2-core x86 sandbox it loads in ~6 s, uses 1.1 GB at peak and
-generates ~16 tokens/s (memory-bandwidth bound: every token reads all 500 MB
-of weights). Apple silicon has several times the bandwidth and uses
-Accelerate, so expect it to be considerably faster there.
+`--int8` converts the weights to 8-bit integers after loading (one float
+scale per 64 inputs of every output, so a single outlier cannot coarsen a
+whole row). Generation is memory-bandwidth bound — every token reads all the
+weights — so a quarter of the bytes is much faster, at almost no cost:
+
+| GPT-2 124M, 2-core x86 | float32 | int8 |
+|---|---:|---:|
+| generation | 15.5 tokens/s | **39 tokens/s** |
+| perplexity (4096 Shakespeare tokens) | 106.8 | 107.2 (+0.4 %) |
+| greedy continuation above | — | identical |
+
+(With one scale per row instead of per 64 inputs, perplexity rose 4.2 %.)
+Loading takes 1.5 s: layers are built without allocating weights or gradient
+buffers (`SkipParameterInit`), and the checkpoint fills them directly.
 
 ## Performance and devices
 
@@ -284,7 +294,8 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Matrix | `Matrix.h` | Row-major float matrix: products (incl. `AᵀB`, `ABᵀ`), element-wise ops, broadcasting, reductions, row gather/slice |
 | Layers | `Dense.h`, `Activations.h`, `Conv.h` | `Dense` (Xavier / He / zero init), `Conv2D` (stride, padding; im2col + GEMM), `MaxPool2D`, `ReLU`, `LeakyReLU`, `Sigmoid`, `Tanh`, `Softmax`, `Dropout` |
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
-| Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
+| Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE, grouped-query attention, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
+| Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales), `Network::quantize()` for Dense, attention and tied outputs |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `Gpt2Tokenizer` (byte-level BPE, identical ids), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
 | Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k, streaming callback, stop token) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |

@@ -2,6 +2,7 @@
 #define DENSE_H
 
 #include "Layer.h"
+#include "Quantized.h"
 
 namespace nc {
 
@@ -22,6 +23,12 @@ public:
     std::string name() const override { return "Dense"; }
     std::string describe() const override;
     std::size_t outputSize(std::size_t) const override { return outputSize_; }
+    // Int8 weights for inference: forward uses them, backward then throws and
+    // parameters() lists nothing (save a network before quantizing it).
+    std::size_t quantize() override;
+    bool quantized() const { return !quantized_.empty(); }
+    // Installs ready-made int8 weights (inputs x outputs must match).
+    void setQuantized(QuantizedWeights weights);
 
     std::size_t inputSize() const { return inputSize_; }
     std::size_t outputSize() const { return outputSize_; }
@@ -40,6 +47,7 @@ private:
     Matrix weightGrad_;
     Matrix biasGrad_;
     Matrix input_;
+    QuantizedWeights quantized_;
 };
 
 } // namespace nc

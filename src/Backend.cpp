@@ -256,6 +256,8 @@ void gemmBlocked(bool transA, bool transB, std::size_t M, std::size_t N, std::si
     });
 }
 
+float dot(const float* a, const float* b, std::size_t n) { return dotProduct(a, b, n); }
+
 bool gpuAvailable() {
 #ifdef NEURACRAFT_HAS_METAL
     return metal::available();

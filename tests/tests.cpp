@@ -1021,6 +1021,118 @@ TEST(modern_gpt_learns_and_config_roundtrip) {
     std::remove(weights.c_str());
 }
 
+// ---- Quantization and grouped-query attention -------------------------------------------------
+
+TEST(int8_weights_error_bounds_and_outliers) {
+    setSeed(80);
+    Matrix w = Matrix::uniform(200, 70, -1, 1);  // in x out
+    w(3, 5) = 50.0f;                              // an outlier in output 5
+    const QuantizedWeights q = QuantizedWeights::fromInOut(w);
+    CHECK(q.inputs() == 200 && q.outputs() == 70 && q.group() == 64);
+    CHECK(q.bytes() < w.size() * sizeof(float) / 3);
+    const Matrix back = q.dequantize();
+    // Per-group scales: only the outlier's own group (inputs 0..63 of output 5) is coarse.
+    float worstOther = 0.0f, worstOutlierGroup = 0.0f;
+    for (std::size_t k = 0; k < 200; ++k)
+        for (std::size_t j = 0; j < 70; ++j) {
+            const float e = std::fabs(back(k, j) - w(k, j));
+            if (j == 5 && k < 64) worstOutlierGroup = std::max(worstOutlierGroup, e);
+            else worstOther = std::max(worstOther, e);
+        }
+    CHECK(worstOther <= 1.0f / 127.0f * 0.5f + 1e-6f);
+    CHECK(worstOutlierGroup <= 50.0f / 127.0f * 0.5f + 1e-5f);
+
+    const Matrix x = Matrix::uniform(3, 200, -1, 1);
+    const Matrix exact = x * back;  // the product with the dequantized weights
+    CHECK(q.multiply(x).approxEquals(exact, 1e-3f));
+    const QuantizedWeights fromRows = QuantizedWeights::fromOutIn(w.transpose());
+    CHECK(fromRows.dequantize().approxEquals(back, 0.0f));
+}
+
+TEST(dense_and_network_quantization) {
+    setSeed(81);
+    Dense d(64, 32);
+    const Matrix x = Matrix::uniform(4, 64, -1, 1);
+    const Matrix before = d.forward(x, false);
+    CHECK(d.quantize() == 1 && d.quantized() && d.parameters().empty());
+    CHECK(d.forward(x, false).approxEquals(before, 0.02f));
+    CHECK_THROWS(d.backward(Matrix(4, 32)), std::logic_error);
+    CHECK(d.describe().find("int8") != std::string::npos);
+
+    SequenceContextPtr ctx;
+    Network net = modernGpt(ctx, 16);
+    const Matrix ids{{1, 2, 3, 4, 5, 6}};
+    const Matrix fp32 = net.predict(ids);
+    CHECK(net.quantize() > 0);
+    const Matrix int8 = net.predict(ids);
+    float maxDiff = 0.0f;
+    for (std::size_t i = 0; i < fp32.size(); ++i) maxDiff = std::max(maxDiff, std::fabs(fp32.data()[i] - int8.data()[i]));
+    CHECK(maxDiff < 0.05f);
+    SamplingOptions greedy;
+    greedy.temperature = 0.0f;
+    CHECK(generate(net, {1, 2}, 10, 16, greedy, ctx).size() == 10);  // KV cache works on int8 layers
+}
+
+TEST(grouped_query_attention_gradcheck) {
+    for (std::size_t kv : {2, 1}) {  // grouped-query and multi-query attention
+        setSeed(82);
+        auto ctx = std::make_shared<SequenceContext>();
+        ctx->length = 3;
+        Network net;
+        auto& block = net.add<Residual>();
+        block.add<RMSNorm>(8);
+        block.add<CausalSelfAttention>(8, 4, ctx, true, 10000.0f, kv);
+        net.add<Dense>(8, 3);
+        MSE loss;
+        gradientCheck(net, loss, Matrix::uniform(6, 8, -1, 1), Matrix::uniform(6, 3, -1, 1));
+        auto& att = dynamic_cast<CausalSelfAttention&>(block.inner().layer(1));
+        CHECK(att.qkvWeight().cols() == 8 + 2 * kv * 2);
+    }
+    auto ctx = std::make_shared<SequenceContext>();
+    CHECK_THROWS(CausalSelfAttention(8, 4, ctx, false, 10000.0f, 3), std::invalid_argument);
+}
+
+TEST(grouped_query_kv_cache_matches_full_forward) {
+    setSeed(83);
+    GPTConfig cfg;
+    cfg.vocabSize = 11;
+    cfg.contextLength = 16;
+    cfg.dim = 16;
+    cfg.heads = 4;
+    cfg.kvHeads = 2;
+    cfg.layers = 2;
+    cfg.modern();
+    Network net;
+    SequenceContextPtr ctx = buildGPT(net, cfg);
+    const std::vector<float> ids{3, 1, 4, 1, 5, 9, 2, 6};
+    const Matrix full = net.predict(Matrix(1, ids.size(), ids));
+    ctx->incremental = true;
+    ctx->offset = 0;
+    std::vector<float> rows;
+    for (std::size_t pos = 0; pos < ids.size();) {
+        const std::size_t chunk = pos == 0 ? 3 : 1;
+        const Matrix out = net.predict(Matrix(1, chunk, std::vector<float>(ids.begin() + pos, ids.begin() + pos + chunk)));
+        rows.insert(rows.end(), out.values().begin(), out.values().end());
+        ctx->offset += chunk;
+        pos += chunk;
+    }
+    ctx->incremental = false;
+    ctx->offset = 0;
+    CHECK(Matrix(ids.size(), full.cols(), rows).approxEquals(full, 1e-4f));
+}
+
+TEST(skip_parameter_init_builds_empty_layers) {
+    {
+        SkipParameterInit skip;
+        CHECK(SkipParameterInit::active());
+        Dense d(1000, 1000);
+        CHECK(d.weights().empty() && d.parameters()[0].grad->empty());
+    }
+    CHECK(!SkipParameterInit::active());
+    Dense normal(4, 4);
+    CHECK(!normal.weights().empty());
+}
+
 // ---- Pretrained models ----------------------------------------------------------------------
 
 TEST(json_parser) {

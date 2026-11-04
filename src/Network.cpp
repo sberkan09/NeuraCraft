@@ -178,6 +178,12 @@ std::vector<Param> Network::parameters() {
     return params;
 }
 
+std::size_t Network::quantize() {
+    std::size_t n = 0;
+    for (auto& l : layers_) n += l->quantize();
+    return n;
+}
+
 void Network::releaseGradients() {
     for (const auto& p : parameters()) *p.grad = Matrix();
 }

@@ -86,6 +86,11 @@ public:
     // Frees every gradient buffer (they are recreated by the next backward
     // pass). Halves the memory of an inference-only model.
     void releaseGradients();
+    // Converts every large weight matrix (Dense, attention) to int8 for
+    // inference; returns how many were converted. Training is no longer
+    // possible afterwards, and save() would only see the remaining float
+    // parameters, so save before quantizing.
+    std::size_t quantize();
     std::size_t layerCount() const { return layers_.size(); }
     Layer& layer(std::size_t i) { return *layers_.at(i); }
     const Layer& layer(std::size_t i) const { return *layers_.at(i); }

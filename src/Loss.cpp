@@ -112,4 +112,45 @@ Matrix SoftmaxCrossEntropy::gradient() const {
     return (probabilities_ - targets_) / static_cast<float>(probabilities_.rows());
 }
 
+// ---- SparseSoftmaxCrossEntropy ------------------------------------------------
+
+float SparseSoftmaxCrossEntropy::compute(const Matrix& logits, const Matrix& targets) {
+    const std::size_t n = logits.rows(), classes = logits.cols();
+    if (n == 0 || classes == 0) throw std::invalid_argument("SparseSoftmaxCrossEntropy: empty logits");
+    if (targets.size() != n)
+        throw std::invalid_argument("SparseSoftmaxCrossEntropy: " + std::to_string(targets.size()) + " targets for " +
+                                    std::to_string(n) + " logits rows");
+    targets_.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const long id = std::lround(targets.data()[i]);
+        if (id < 0 || static_cast<std::size_t>(id) >= classes)
+            throw std::out_of_range("SparseSoftmaxCrossEntropy: target " + std::to_string(id) + " out of range");
+        targets_[i] = static_cast<std::size_t>(id);
+    }
+    probabilities_ = Matrix(n, classes);
+    double acc = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const float* row = logits.data() + i * classes;
+        float* prob = probabilities_.data() + i * classes;
+        float maxVal = row[0];
+        for (std::size_t j = 1; j < classes; ++j) maxVal = std::max(maxVal, row[j]);
+        double sumExp = 0.0;
+        for (std::size_t j = 0; j < classes; ++j) {
+            prob[j] = std::exp(row[j] - maxVal);
+            sumExp += prob[j];
+        }
+        const float inv = static_cast<float>(1.0 / sumExp);
+        for (std::size_t j = 0; j < classes; ++j) prob[j] *= inv;
+        acc -= static_cast<double>(row[targets_[i]] - maxVal) - std::log(sumExp);
+    }
+    return static_cast<float>(acc / static_cast<double>(n));
+}
+
+Matrix SparseSoftmaxCrossEntropy::gradient() const {
+    Matrix grad = probabilities_;
+    const std::size_t classes = grad.cols();
+    for (std::size_t i = 0; i < targets_.size(); ++i) grad.data()[i * classes + targets_[i]] -= 1.0f;
+    return grad / static_cast<float>(targets_.size());
+}
+
 } // namespace nc

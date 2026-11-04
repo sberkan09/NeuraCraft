@@ -73,6 +73,7 @@ public:
     std::size_t parameterCount();
     std::size_t layerCount() const { return layers_.size(); }
     Layer& layer(std::size_t i) { return *layers_.at(i); }
+    const Layer& layer(std::size_t i) const { return *layers_.at(i); }
 
     void summary(std::ostream& os) const;
     void summary() const;

@@ -14,7 +14,9 @@
 #include "Optimizer.h"
 #include "Parallel.h"
 #include "Random.h"
+#include "Text.h"
+#include "Transformer.h"
 
-#define NEURACRAFT_VERSION "1.1.0"
+#define NEURACRAFT_VERSION "1.2.0"
 
 #endif // NEURACRAFT_H

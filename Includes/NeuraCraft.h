@@ -4,6 +4,7 @@
 // Umbrella header: #include "NeuraCraft.h" to get the whole library.
 #include "Activations.h"
 #include "Backend.h"
+#include "Conv.h"
 #include "Data.h"
 #include "Dense.h"
 #include "Layer.h"

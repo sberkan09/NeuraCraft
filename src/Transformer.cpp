@@ -5,6 +5,7 @@
 #include "Parallel.h"
 
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -379,6 +380,43 @@ std::string Residual::describe() const {
 }
 
 // ---- GPT ------------------------------------------------------------------------------------
+
+void saveGPTConfig(const std::string& path, const GPTConfig& c) {
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("saveGPTConfig: cannot open " + path);
+    out << "vocab_size = " << c.vocabSize << "\ncontext_length = " << c.contextLength << "\ndim = " << c.dim
+        << "\nheads = " << c.heads << "\nlayers = " << c.layers << "\nmlp_ratio = " << c.mlpRatio
+        << "\ndropout = " << c.dropout << '\n';
+    if (!out) throw std::runtime_error("saveGPTConfig: write failed for " + path);
+}
+
+GPTConfig loadGPTConfig(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("loadGPTConfig: cannot open " + path);
+    GPTConfig c;
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        auto trim = [](std::string s) {
+            const auto b = s.find_first_not_of(" \t\r"), e = s.find_last_not_of(" \t\r");
+            return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
+        };
+        const std::string key = trim(line.substr(0, eq)), value = trim(line.substr(eq + 1));
+        try {
+            if (key == "vocab_size") c.vocabSize = std::stoul(value);
+            else if (key == "context_length") c.contextLength = std::stoul(value);
+            else if (key == "dim") c.dim = std::stoul(value);
+            else if (key == "heads") c.heads = std::stoul(value);
+            else if (key == "layers") c.layers = std::stoul(value);
+            else if (key == "mlp_ratio") c.mlpRatio = std::stoul(value);
+            else if (key == "dropout") c.dropout = std::stof(value);
+        } catch (const std::exception&) {
+            throw std::runtime_error("loadGPTConfig: bad value for " + key + " in " + path);
+        }
+    }
+    return c;
+}
 
 SequenceContextPtr buildGPT(Network& net, const GPTConfig& c) {
     if (c.vocabSize == 0 || c.contextLength == 0 || c.dim == 0 || c.heads == 0 || c.dim % c.heads != 0)

@@ -453,7 +453,11 @@ $ ./build_and_run.sh video data/animatediff t2v "a cozy log cabin in a snowy for
 $ ./build_and_run.sh video data/animatediff t2v "a corgi on the beach" --frames 48 -o long.png   # 4 windows, animated PNG
 ```
 
-I2V_SAMPLE
+<p><img src="docs/images/video_i2v_input.jpg" width="256"> <img src="docs/images/video_i2v.gif" width="256"></p>
+
+Above: the snowy cabin from the morph animation (left, saved with
+`saveJpeg`) animated with falling snow at strength 0.75 (right; 16 frames,
+512 x 512, 17 minutes on the 2-core machine).
 
 **Output formats**, all written by the library itself: `.gif` (`saveGif`,
 256 colours, plays everywhere), `.png` (`saveApng`, animated PNG, full

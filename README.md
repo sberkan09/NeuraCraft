@@ -201,6 +201,9 @@ weights — so a quarter of the bytes is much faster, at almost no cost:
 | greedy continuation above | — | identical |
 
 (With one scale per row instead of per 64 inputs, perplexity rose 4.2 %.)
+The `gpt2` command keeps GPT-2's activations in float (`setInt8Inputs(false)`):
+its activations have extreme outliers, and quantizing them too moved
+perplexity by -3.7 % instead of +0.5 %.
 Loading takes 1.5 s: layers are built without allocating weights or gradient
 buffers (`SkipParameterInit`), and the checkpoint fills them directly.
 
@@ -209,6 +212,7 @@ buffers (`SkipParameterInit`), and the checkpoint fills them directly.
 ```
 $ scripts/download_llama32.sh data/llama3        # Llama-3.2-1B-Instruct (~2.5 GB bf16)
 $ ./build_and_run.sh llama data/llama3 "What is the capital of Turkey?" --chat
+$ ./build_and_run.sh llama data/llama3 -i                     # multi-turn chat (/reset, /exit)
 $ scripts/download_tinyllama.sh data/tinyllama   # TinyLlama-1.1B-Chat (Apache 2.0, ~2.2 GB bf16)
 $ ./build_and_run.sh llama data/tinyllama "Write a haiku about Istanbul." 64 --chat --system "You are a poet."
 $ ./build_and_run.sh llama data/llama3 "What is the capital of Turkey?" 20 --chat --check --fp32
@@ -221,6 +225,12 @@ same layers as the modern GPT: RMSNorm, rotary attention with grouped-query
 heads (Llama 3.2 1B: 32 query heads sharing 8 key/value heads), SwiGLU and a
 tied or untied output head. Llama 3.1+'s `"rope_type": "llama3"` frequency
 scaling is applied (`RopeScaling`, `ropeFrequencies()`).
+
+Sampling follows the model's `generation_config.json` (Llama 3.2: temperature
+0.6, top-p 0.9) with top-k 40; `--temperature`, `--top-k`, `--top-p`,
+`--repeat-penalty`, `--greedy` and `--seed` override it. `-i` keeps one
+conversation going: a `Generator` holds the KV cache between turns, so each
+turn only runs the new message through the model.
 
 `--chat` picks the model's template: Llama 3's header/`<|eot_id|>` turns
 (with the knowledge-cutoff/today system preamble Hugging Face renders) or
@@ -239,6 +249,12 @@ template) and 51 for TinyLlama.
 Weights are int8 by default (`--fp32` keeps float32), including the
 embedding table, whose int8 copy also serves a tied output; each tensor is
 quantized as it is read, so the float copy of the whole model never exists.
+Products run on integers: activations are quantized per 32 values (as
+llama.cpp's q8_0) and each group is an int8 dot product — AVX-VNNI
+`vpdpbusd` (or AVX2 `vpmaddubsw`) on x86, `sdot` on Apple silicon and other
+ARMv8.2+ CPUs, plain C++ elsewhere. Weight rows are prefetched 4 KB ahead,
+which took the kernel from 11 to ~20 GB/s on a machine that streams memory at
+~23 GB/s, and prompts process four weight rows per pass over the input.
 `scripts/llama_reference.py` is an independent NumPy Llama: with `--fp32
 --check` both print the same token ids, top-5 logits and greedy answer
 (*"The capital of Turkey is Ankara."*), and over a mixed 42-token prompt all
@@ -248,10 +264,15 @@ within 3e-5).
 | 2-core x86, int8 / float32 | Llama 3.2 1B | TinyLlama 1.1B |
 |---|---:|---:|
 | memory (peak RSS) | **1.6** / 5.9 GB | **1.5** / 4.8 GB |
-| generation (160-token chat answer, incl. prompt) | **3.6** / 2.3 tokens/s | **4.5** / 2.3 tokens/s |
-| loading (bf16 checkpoint) | 21 / 35 s | 14 / 35 s |
-| perplexity, 1024 Shakespeare tokens | 35.090 / 35.088¹ | 13.277 / 13.264 |
+| generation (160-token chat answer, incl. prompt) | **11.5** / 2.3 tokens/s | **13.9** / 2.3 tokens/s |
+| one token / prompt processing | 13 / 33 tokens/s | — |
+| loading (bf16 checkpoint) | 12 / 35 s | 12 / 35 s |
+| perplexity, 1024 Shakespeare tokens | 35.131 / 35.088¹ | 13.269 / 13.264 |
 | greedy answers above | identical | identical |
+
+int8 generation was 3.6 and 4.5 tokens/s before the integer kernels (weights
+expanded to float per row); with float activations perplexity was 35.090 and
+13.277, so quantizing the activations costs 0.1 % on Llama 3.2.
 
 ¹ 256-token windows (512 for TinyLlama). The float32 value comes from the
 NumPy reference, whose logits match NeuraCraft's float32 ones to 3e-5: a
@@ -353,9 +374,9 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Layers | `Dense.h`, `Activations.h`, `Conv.h` | `Dense` (Xavier / He / zero init), `Conv2D` (stride, padding; im2col + GEMM), `MaxPool2D`, `ReLU`, `LeakyReLU`, `Sigmoid`, `Tanh`, `Softmax`, `Dropout` |
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
 | Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE with Llama 3 scaling, grouped-query attention, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
-| Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales), `Network::quantize()` for Dense, attention and embeddings (shared with tied outputs) |
+| Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales; integer AVX-VNNI / AVX2 / NEON products), `Network::quantize()` for Dense, attention and embeddings (shared with tied outputs), `setInt8Inputs` |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
-| Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k, streaming callback, stop token) |
+| Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k, top-p, repetition penalty, streaming callback, stop tokens), `Generator` (multi-turn, KV cache kept between calls) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |
 | Network | `Network.h` | `add<Layer>(...)`, `fit` (mini-batches, shuffling, validation, accuracy, LR schedule, gradient clipping, step limits, callbacks), `predict`, `evaluate`, `accuracy`, `summary`, `save` / `load`, `saveCheckpoint` / `loadCheckpoint` (exact resume) |
 | Data | `Data.h` | One-hot / argmax, train/test split, standardization, CSV load/save, MNIST IDX loader, XOR / spiral / sine generators |
@@ -400,8 +421,10 @@ grouped-query attention (gradients and KV cache), both Llama tokenizer kinds
 and the Llama 3 pre-tokenizer (against Hugging Face splits), Llama 3 RoPE
 scaling (against Hugging Face's formula), the Llama loader against an
 independent reference forward pass (float32, int8, tied output, RoPE scaling,
-sharded files, stop tokens), int8 embeddings, and that inference passes keep
-no backward state. CI runs
+sharded files, stop tokens), int8 embeddings, the integer int8 kernels
+(error bound, single-row vs. batched paths, ragged sizes), multi-turn
+generation against generating from the whole transcript, top-p and the
+repetition penalty, and that inference passes keep no backward state. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
 kernels).
 

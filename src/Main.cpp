@@ -542,7 +542,11 @@ int runGpt2(const std::string& dir, const std::string& prompt, std::size_t token
         std::cerr << e.what() << "\ndownload GPT-2 with: scripts/download_gpt2.sh " << dir << '\n';
         return 2;
     }
-    if (int8) model.net.quantize();
+    if (int8) {
+        // GPT-2's activations have extreme outliers: keep them float, quantize only the weights.
+        setInt8Inputs(false);
+        model.net.quantize();
+    }
     const double loadSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::cerr << (int8 ? "loaded GPT-2, int8 weights (" : "loaded GPT-2 (");
     std::cerr << "" << model.config.layers
@@ -592,10 +596,36 @@ int runGpt2(const std::string& dir, const std::string& prompt, std::size_t token
 
 struct LlamaOptions {
     std::string prompt = "What is the capital of Turkey?";
+    bool promptGiven = false;
     std::string system;
     std::size_t tokens = 128;
-    bool chat = false, check = false, int8 = true;
+    bool chat = false, check = false, int8 = true, interactive = false;
+    bool temperatureGiven = false, topPGiven = false;
     SamplingOptions sampling;
+};
+
+// Turn layout of the model's chat format.
+struct ChatTemplate {
+    bool llama3 = false;
+    std::string today;
+
+    std::string firstTurn(const std::string& system, const std::string& user) const {
+        if (llama3)  // as Hugging Face renders it: a system turn with the knowledge cutoff and today's date
+            return "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: " + today +
+                   "\n\n" + system + "<|eot_id|>" + nextTurn(user);
+        // Zephyr-style turns used by TinyLlama-Chat, each ended by </s>.
+        return (system.empty() ? std::string() : "<|system|>\n" + system + "</s>\n") + "<|user|>\n" + user +
+               "</s>\n<|assistant|>\n";
+    }
+    std::string nextTurn(const std::string& user) const {
+        if (llama3) return "<|start_header_id|>user<|end_header_id|>\n\n" + user + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+        return "<|user|>\n" + user + "</s>\n<|assistant|>\n";
+    }
+    // Between a finished reply and the next user turn; closes a reply that hit the token limit first.
+    std::string between(bool replyClosed) const {
+        if (llama3) return replyClosed ? "" : "<|eot_id|>";
+        return replyClosed ? "\n" : "</s>\n";
+    }
 };
 
 int runLlama(const std::string& dir, const LlamaOptions& o) {
@@ -611,25 +641,74 @@ int runLlama(const std::string& dir, const LlamaOptions& o) {
     }
     const double loadSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::cerr << "loaded " << model.config.layers << "-layer Llama (dim " << model.config.dim << ", " << model.config.heads
-              << " heads, " << model.config.kvHeads << " kv heads, " << (o.int8 ? "int8" : "float32") << ") in "
+              << " heads, " << model.config.kvHeads << " kv heads, "
+              << (o.int8 ? std::string(QuantizedWeights::kernelName()) : std::string("float32")) << ") in "
               << std::fixed << std::setprecision(1) << loadSeconds << " s" << std::defaultfloat << '\n';
 
-    std::string text = o.prompt;
-    if (o.chat && tok->tokenId("<|start_header_id|>") >= 0) {
-        // Llama 3 chat template (as Hugging Face renders it): a system turn with
-        // the knowledge cutoff and today's date, then the user turn.
-        char today[32];
-        const std::time_t now = std::time(nullptr);
-        std::strftime(today, sizeof(today), "%d %b %Y", std::localtime(&now));
-        text = "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: " +
-               std::string(today) + "\n\n" + o.system + "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n" + o.prompt +
-               "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
-    } else if (o.chat) {
-        // Zephyr-style template used by TinyLlama-Chat: <|system|>/<|user|>/<|assistant|> turns ended by </s>.
-        text.clear();
-        if (!o.system.empty()) text += "<|system|>\n" + o.system + "</s>\n";
-        text += "<|user|>\n" + o.prompt + "</s>\n<|assistant|>\n";
+    ChatTemplate chat;
+    chat.llama3 = tok->tokenId("<|start_header_id|>") >= 0;
+    char today[32];
+    const std::time_t now = std::time(nullptr);
+    std::strftime(today, sizeof(today), "%d %b %Y", std::localtime(&now));
+    chat.today = today;
+    const bool useChat = o.chat || o.interactive;
+
+    SamplingOptions sampling = o.sampling;
+    if (!o.temperatureGiven && model.temperature >= 0.0f) sampling.temperature = model.temperature;
+    if (!o.topPGiven && model.topP > 0.0f) sampling.topP = model.topP;
+    sampling.stopToken = tok->eos();
+    sampling.stopTokens = model.stopTokens;
+    auto isStop = [&](int id) {
+        return id == sampling.stopToken || std::find(sampling.stopTokens.begin(), sampling.stopTokens.end(), id) != sampling.stopTokens.end();
+    };
+
+    if (o.interactive) {
+        std::cerr << "chat (temperature " << sampling.temperature << ", top-k " << sampling.topK << ", top-p " << sampling.topP
+                  << "); /reset starts over, /exit or Ctrl-D quits\n";
+        Generator session(model.net, model.context, model.config.contextLength);
+        bool firstTurn = true, closed = true;
+        std::string line = o.promptGiven ? o.prompt : std::string();
+        bool havePending = o.promptGiven;
+        for (;;) {
+            if (!havePending) {
+                std::cout << "\n> " << std::flush;
+                if (!std::getline(std::cin, line)) break;
+            } else {
+                std::cout << "\n> " << line << '\n';
+            }
+            havePending = false;
+            if (line == "/exit" || line == "/quit") break;
+            if (line == "/reset") {
+                session.reset();
+                firstTurn = closed = true;
+                std::cout << "(conversation cleared)\n";
+                continue;
+            }
+            if (line.empty()) continue;
+            const std::string text = firstTurn ? chat.firstTurn(o.system, line) : chat.between(closed) + chat.nextTurn(line);
+            const std::vector<int> ids = tok->encode(text, firstTurn);
+            SamplingOptions turn = sampling;
+            bool startOfReply = true;
+            turn.onToken = [&](int id) {
+                std::string piece = tok->decodePiece(id);
+                if (startOfReply && !piece.empty() && piece[0] == ' ') piece.erase(0, 1);
+                startOfReply = false;
+                std::cout << piece << std::flush;
+            };
+            const auto start = std::chrono::steady_clock::now();
+            const auto reply = session.generate(ids, o.tokens, turn);
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            closed = !reply.empty() && isStop(reply.back());
+            firstTurn = false;
+            std::cout << '\n';
+            std::cerr << "[" << reply.size() << " tokens, " << std::fixed << std::setprecision(1)
+                      << static_cast<double>(reply.size()) / seconds << " tokens/s incl. " << ids.size() << " new prompt tokens; "
+                      << session.history().size() << " tokens in the conversation]" << std::defaultfloat << '\n';
+        }
+        return 0;
     }
+
+    const std::string text = useChat ? chat.firstTurn(o.system, o.prompt) : o.prompt;
     const std::vector<int> ids = tok->encode(text, true);
 
     if (o.check) {
@@ -648,16 +727,13 @@ int runLlama(const std::string& dir, const LlamaOptions& o) {
         std::cout << std::defaultfloat << '\n';
         SamplingOptions greedy;
         greedy.temperature = 0.0f;
-        greedy.stopToken = tok->eos();
-        greedy.stopTokens = model.stopTokens;
+        greedy.stopToken = sampling.stopToken;
+        greedy.stopTokens = sampling.stopTokens;
         const auto more = generate(model.net, ids, o.tokens, model.config.contextLength, greedy, model.context);
         std::cout << "greedy: " << quoted(tok->decode(more)) << '\n';
         return 0;
     }
 
-    SamplingOptions sampling = o.sampling;
-    sampling.stopToken = tok->eos();
-    sampling.stopTokens = model.stopTokens;
     bool first = true;
     sampling.onToken = [&](int id) {
         std::string piece = tok->decodePiece(id);
@@ -665,7 +741,7 @@ int runLlama(const std::string& dir, const LlamaOptions& o) {
         first = false;
         std::cout << piece << std::flush;
     };
-    if (!o.chat) std::cout << o.prompt << std::flush;
+    if (!useChat) std::cout << o.prompt << std::flush;
     const auto start = std::chrono::steady_clock::now();
     const auto out = generate(model.net, ids, o.tokens, model.config.contextLength, sampling, model.context);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -743,6 +819,26 @@ int runBench(bool quick) {
         std::cout << std::defaultfloat << '\n';
     }
     if (mismatches) std::cout << "\n" << mismatches << " result(s) disagreed with the reference ('!')\n";
+
+    // Int8 weights (LLM inference): one token reads every weight once (bandwidth bound), a prompt reuses them.
+    std::cout << "\nint8 weights (" << QuantizedWeights::kernelName() << "), 2048 -> 8192 layer:\n";
+    const QuantizedWeights q = QuantizedWeights::fromOutIn(Matrix::uniform(8192, 2048, -1, 1));
+    for (std::size_t rows : {std::size_t(1), std::size_t(64)}) {
+        const Matrix x = Matrix::uniform(rows, 2048, -1, 1);
+        q.multiply(x);
+        int reps = 0;
+        const auto start = std::chrono::steady_clock::now();
+        double elapsed = 0.0;
+        do {
+            q.multiply(x);
+            ++reps;
+            elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        } while (elapsed < (quick ? 0.2 : 1.0));
+        const double seconds = elapsed / reps;
+        std::cout << std::setw(6) << rows << " row" << (rows == 1 ? " " : "s") << std::fixed << std::setprecision(1) << std::setw(9)
+                  << 2.0 * static_cast<double>(rows) * 2048 * 8192 / seconds / 1e9 << " GOPS" << std::setw(8)
+                  << static_cast<double>(q.bytes()) / seconds / 1e9 << " GB/s of weights" << std::defaultfloat << '\n';
+    }
     return mismatches == 0 ? 0 : 1;
 }
 
@@ -762,7 +858,8 @@ void usage() {
               << "                               sample text from the trained GPT\n"
               << "  NeuraCraft gpt2 <dir> [prompt] [tokens] [--temperature T] [--top-k K] [--greedy] [--int8] [--check]\n"
               << "                               run pretrained GPT-2 (scripts/download_gpt2.sh)\n"
-              << "  NeuraCraft llama <dir> [prompt] [tokens] [--chat] [--system S] [--fp32] [--greedy] [--check]\n"
+              << "  NeuraCraft llama <dir> [prompt] [tokens] [--chat | -i] [--system S] [--fp32] [--check]\n"
+              << "                 [--greedy | --temperature T] [--top-k K] [--top-p P] [--repeat-penalty R] [--seed N]\n"
               << "                               Llama 3.x / TinyLlama / Mistral, int8 by default (scripts/download_llama32.sh)\n"
               << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
               << "options:\n"
@@ -910,14 +1007,18 @@ int main(int argc, char** argv) {
                     return args[++i];
                 };
                 if (a == "--chat") o.chat = true;
+                else if (a == "--interactive" || a == "-i") o.interactive = true;
                 else if (a == "--system") { o.system = value(); o.chat = true; }
                 else if (a == "--fp32") o.int8 = false;
                 else if (a == "--int8") o.int8 = true;
                 else if (a == "--check") o.check = true;
-                else if (a == "--greedy") o.sampling.temperature = 0.0f;
-                else if (a == "--temperature") o.sampling.temperature = std::stof(value());
+                else if (a == "--greedy") { o.sampling.temperature = 0.0f; o.temperatureGiven = true; }
+                else if (a == "--temperature") { o.sampling.temperature = std::stof(value()); o.temperatureGiven = true; }
                 else if (a == "--top-k") o.sampling.topK = std::stoul(value());
-                else if (positional == 0) { o.prompt = a; ++positional; }
+                else if (a == "--top-p") { o.sampling.topP = std::stof(value()); o.topPGiven = true; }
+                else if (a == "--repeat-penalty") o.sampling.repetitionPenalty = std::stof(value());
+                else if (a == "--seed") setSeed(static_cast<unsigned>(std::stoul(value())));
+                else if (positional == 0) { o.prompt = a; o.promptGiven = !a.empty(); ++positional; }
                 else if (positional == 1) { o.tokens = std::stoul(a); ++positional; }
                 else {
                     std::cerr << "unknown llama option: " << a << "\n";

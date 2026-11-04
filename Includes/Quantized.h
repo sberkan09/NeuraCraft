@@ -31,9 +31,16 @@ public:
     bool empty() const { return q_.empty(); }
     std::size_t bytes() const { return q_.size() + scale_.size() * sizeof(float); }
 
-    // x (N x in) -> N x out. Each weight row is expanded once and applied to
-    // all N inputs, so a forward pass reads the weights once whatever N is.
+    // x (N x in) -> N x out. The inputs are quantized too, per group of the
+    // same `group` columns (as llama.cpp's q8_0 x q8_0), so every group is an
+    // integer dot product: AVX-VNNI / AVX2 on x86, NEON dot product on ARM,
+    // plain C++ elsewhere. Each weight row is read once and applied to all N
+    // inputs while it is in cache.
     Matrix multiply(const Matrix& x) const;
+    // Same product with float inputs (each weight row expanded to float):
+    // slower, without the input rounding. For checks and comparisons.
+    Matrix multiplyFloat(const Matrix& x) const;
+    static const char* kernelName();  // which integer kernel multiply() uses
     Matrix dequantize() const;  // back to (in x out) floats
     // Output feature j's weights as floats (dst holds inputs() values), e.g. an
     // embedding row when the table is stored quantized.
@@ -44,6 +51,13 @@ private:
     std::vector<std::int8_t> q_;  // out x in, row-major
     std::vector<float> scale_;    // out x groupsPerRow
 };
+
+// Whether QuantizedWeights::multiply quantizes its inputs (default: yes).
+// Integer products are several times faster; models whose activations have
+// extreme outliers lose precision (GPT-2: perplexity -3.7 % instead of
+// +0.5 %; Llama 3.2: +0.05 %), so the gpt2 command turns this off.
+void setInt8Inputs(bool enabled);
+bool int8Inputs();
 
 } // namespace nc
 

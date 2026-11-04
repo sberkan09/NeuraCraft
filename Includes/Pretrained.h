@@ -106,6 +106,8 @@ struct PretrainedModel {
     SequenceContextPtr context;  // pass to generate() for the KV cache
     GPTConfig config;
     std::vector<int> stopTokens;  // end-of-turn ids from generation_config.json / config.json (Llama)
+    float temperature = -1.0f;    // the model's recommended sampling (generation_config.json), -1 = none
+    float topP = -1.0f;
 };
 
 // Loads a Hugging Face GPT-2 checkpoint directory (config.json +

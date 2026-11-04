@@ -166,6 +166,16 @@ Image toRgb(const Image& image);
 Image resizeImage(const Image& image, std::size_t width, std::size_t height);
 // The largest centred crop with the aspect ratio of width : height, resized to width x height.
 Image fitImage(const Image& image, std::size_t width, std::size_t height);
+// Affine resampling about the image centre: scale > 1 zooms in, (dx, dy)
+// shifts the content by that many pixels, angle rotates it (degrees,
+// counter-clockwise). Bilinear, edges clamped. Same size as the input.
+Image transformImage(const Image& image, float scale, float dx = 0.0f, float dy = 0.0f, float angleDegrees = 0.0f);
+
+// Animated GIF (RGB frames of one size): one 256-colour palette shared by all
+// frames (median cut over all of them, so colours do not flicker), a fixed
+// 4x4 ordered dither, LZW compression, looping forever when loop is set.
+void saveGif(const std::string& path, const std::vector<Image>& frames, float framesPerSecond = 8.0f, bool loop = true);
+
 // Binary PPM (P6) / PGM (P5), 8-bit.
 void savePpm(const std::string& path, const Image& image);
 Image loadPpm(const std::string& path);

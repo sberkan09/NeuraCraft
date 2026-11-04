@@ -366,7 +366,49 @@ Pieces, each checked against an independent NumPy implementation (`scripts/`):
 The full VAE decoder (~2.5 TFLOP at 512 x 512) is the slowest stage on a CPU;
 on Apple silicon the products go to Accelerate. Loading got faster with a
 tiled, parallel `Matrix::transpose` (0.3 -> 1.2 GB/s; UNet load 28 -> 16 s).
-Next: GPU convolutions, then video.
+
+### Animation: prompt morphs and infinite zoom
+
+```
+$ ./build_and_run.sh video data/sd-turbo morph "a cozy cabin in a snowy forest at night, warm lights, photo" \
+      "a cozy cabin in a spring forest with blooming flowers, photo" "a cozy cabin in an autumn forest, golden leaves, photo" \
+      --seeds 3 --frames 8 -o cabin.gif
+$ ./build_and_run.sh video data/sd-turbo zoom "an ancient city of towers in the clouds, fantasy painting" \
+      --frames 24 --zoom 1.04 -o city.gif --frames-dir city/      # also PNG frames (+ the ffmpeg line for an MP4)
+```
+
+<p><img src="docs/images/video_morph.gif" width="256"> <img src="docs/images/video_zoom.gif" width="256"></p>
+
+`StableDiffusion` keeps the tokenizer, text encoder, UNet and decoder in
+memory, so an animation pays the model loading once and then one UNet pass
+per frame (TAESD decodes automatically when `DIR/taesd` exists;
+`--full-vae` opts out). Two animation modes are built on it:
+
+- **Morph** (`morphAnimation()`): the prompts are keyframes. Between two of
+  them the text encoder's hidden states are interpolated linearly and the
+  starting noise spherically (slerp keeps it a plausible Gaussian sample),
+  with smoothstep easing so each keyframe holds for a moment; every frame is
+  a one-step SD-Turbo picture of its interpolated pair, and the keyframes are
+  exactly the pictures `txt2img` gives for them. One seed with several
+  prompts changes the subject in place; several seeds with one prompt wander
+  through compositions.
+- **Zoom** (`zoomAnimation()`, Deforum style): each frame is the previous one
+  moved (`transformImage()`: zoom, pan, rotation), sharpened, given a little
+  pixel noise and redrawn with image to image over two of the timesteps
+  SD-Turbo was distilled at (499 and 249; one pass from 249 alone keeps frames
+  closer but cannot invent the detail zooming needs, and the picture flattens
+  into blocks after a dozen frames). Each channel's histogram is matched to
+  the first frame's, so the feedback loop does not drift to other hues. Several prompts are spread over the
+  frames; `--start in.png` begins from your own picture.
+
+`saveGif()` writes the animated GIF itself: one 256-colour palette for all
+frames (median cut over every frame, so colours do not flicker), a fixed 4x4
+ordered dither (no crawling error-diffusion patterns) and LZW compression;
+Pillow and ffmpeg decode it, and the tests decode it with their own LZW
+reader. On the 2-core test machine a 512 x 512 frame takes ~15 s (morph) and
+~35 s (zoom: TAESD encode, two UNet passes, decode); at 256 x 256, 3.5 s, though
+SD-Turbo's pictures are best at its native 512. The animations above are
+512 x 512 runs shown at half size.
 
 ## Performance and devices
 
@@ -460,7 +502,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
 | Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE with Llama 3 scaling, grouped-query attention, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
 | Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales; integer AVX-VNNI / AVX2 / NEON products, expanded-tile GEMM for many rows), `Network::quantize()` for Dense, Conv2D, attention and embeddings (shared with tied outputs), `setInt8Inputs` |
-| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG (read / write) and PPM files, `resizeImage` / `fitImage`, `loadVae()`, `loadTinyVae()` (TAESD), `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` / `textToLatent()` / `decodeLatent()` / `imageToImage()` |
+| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG (read / write) and PPM files, `resizeImage` / `fitImage`, `loadVae()`, `loadTinyVae()` (TAESD), `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` / `textToLatent()` / `decodeLatent()` / `imageToImage()`, `StableDiffusion` (models kept in memory), `morphAnimation()`, `zoomAnimation()`, `transformImage()`, `saveGif()` (animated GIF) |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
 | Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k, top-p, repetition penalty, streaming callback, stop tokens), `Generator` (multi-turn, KV cache kept between calls) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |

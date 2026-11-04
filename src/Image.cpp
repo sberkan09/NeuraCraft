@@ -12,6 +12,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace nc {
 
@@ -804,6 +805,228 @@ Image fitImage(const Image& image, std::size_t width, std::size_t height) {
                   image.pixels.begin() + static_cast<long>(((oy + y) * image.width + ox + crop.width) * image.channels),
                   crop.pixels.begin() + static_cast<long>(y * crop.width * crop.channels));
     return crop.width == width && crop.height == height ? crop : resizeImage(crop, width, height);
+}
+
+Image transformImage(const Image& image, float scale, float dx, float dy, float angleDegrees) {
+    checkImage(image, "transformImage");
+    if (scale <= 0.0f) throw std::invalid_argument("transformImage: scale must be > 0");
+    Image out = image;
+    const double cx = (image.width - 1) / 2.0, cy = (image.height - 1) / 2.0;
+    const double a = angleDegrees * 3.14159265358979323846 / 180.0, ca = std::cos(a), sa = std::sin(a);
+    const std::size_t C = image.channels;
+    parallelFor(0, image.height, 4, [&](std::size_t y0, std::size_t y1) {
+        for (std::size_t y = y0; y < y1; ++y)
+            for (std::size_t x = 0; x < image.width; ++x) {
+                // Output pixel -> source: undo the shift, rotation and zoom about the centre.
+                const double ux = (static_cast<double>(x) - cx - dx) / scale, uy = (static_cast<double>(y) - cy - dy) / scale;
+                const double sx = std::min(std::max(cx + ca * ux + sa * uy, 0.0), image.width - 1.0);
+                const double sy = std::min(std::max(cy - sa * ux + ca * uy, 0.0), image.height - 1.0);
+                const std::size_t x0 = static_cast<std::size_t>(sx), y0_ = static_cast<std::size_t>(sy);
+                const std::size_t x1 = std::min(x0 + 1, image.width - 1), y1_ = std::min(y0_ + 1, image.height - 1);
+                const double fx = sx - x0, fy = sy - y0_;
+                for (std::size_t c = 0; c < C; ++c) {
+                    auto at = [&](std::size_t xx, std::size_t yy) { return static_cast<double>(image.pixels[(yy * image.width + xx) * C + c]); };
+                    const double v = (at(x0, y0_) * (1 - fx) + at(x1, y0_) * fx) * (1 - fy) + (at(x0, y1_) * (1 - fx) + at(x1, y1_) * fx) * fy;
+                    out.pixels[(y * image.width + x) * C + c] = static_cast<std::uint8_t>(std::lround(v));
+                }
+            }
+    });
+    return out;
+}
+
+// ---- Animated GIF -----------------------------------------------------------------------------
+
+namespace {
+struct Box {
+    std::vector<std::array<std::uint8_t, 3>> colors;
+};
+
+// Median cut: split the box with the widest channel range at its median until there are `n` boxes.
+std::vector<std::array<std::uint8_t, 3>> medianCut(std::vector<std::array<std::uint8_t, 3>> colors, std::size_t n) {
+    std::vector<std::vector<std::array<std::uint8_t, 3>>> boxes{std::move(colors)};
+    auto range = [](const std::vector<std::array<std::uint8_t, 3>>& b, int& channel) {
+        int best = -1;
+        for (int c = 0; c < 3; ++c) {
+            int lo = 255, hi = 0;
+            for (const auto& p : b) {
+                lo = std::min<int>(lo, p[static_cast<std::size_t>(c)]);
+                hi = std::max<int>(hi, p[static_cast<std::size_t>(c)]);
+            }
+            if (hi - lo > best) {
+                best = hi - lo;
+                channel = c;
+            }
+        }
+        return best;
+    };
+    while (boxes.size() < n) {
+        std::size_t pick = boxes.size();
+        int widest = 0, channel = 0;
+        for (std::size_t i = 0; i < boxes.size(); ++i) {
+            int c = 0;
+            const int r = boxes[i].size() > 1 ? range(boxes[i], c) : 0;
+            if (r > widest) {
+                widest = r;
+                pick = i;
+                channel = c;
+            }
+        }
+        if (pick == boxes.size()) break;  // every box is a single colour
+        auto& b = boxes[pick];
+        const std::size_t ch = static_cast<std::size_t>(channel);
+        std::nth_element(b.begin(), b.begin() + static_cast<long>(b.size() / 2), b.end(),
+                         [ch](const auto& x, const auto& y) { return x[ch] < y[ch]; });
+        std::vector<std::array<std::uint8_t, 3>> upper(b.begin() + static_cast<long>(b.size() / 2), b.end());
+        b.resize(b.size() / 2);
+        boxes.push_back(std::move(upper));
+    }
+    std::vector<std::array<std::uint8_t, 3>> palette;
+    for (const auto& b : boxes) {
+        if (b.empty()) continue;
+        unsigned long s[3] = {0, 0, 0};
+        for (const auto& p : b)
+            for (std::size_t c = 0; c < 3; ++c) s[c] += p[c];
+        palette.push_back({static_cast<std::uint8_t>(s[0] / b.size()), static_cast<std::uint8_t>(s[1] / b.size()),
+                           static_cast<std::uint8_t>(s[2] / b.size())});
+    }
+    return palette;
+}
+
+// GIF LZW: variable-width codes (min code size 8), a clear code whenever the table is full.
+std::vector<std::uint8_t> lzw(const std::vector<std::uint8_t>& indices) {
+    const int clear = 256, end = 257;
+    std::vector<std::uint8_t> out;
+    std::uint32_t buffer = 0;
+    int bits = 0, width = 9;
+    auto put = [&](int code) {
+        buffer |= static_cast<std::uint32_t>(code) << bits;
+        bits += width;
+        while (bits >= 8) {
+            out.push_back(static_cast<std::uint8_t>(buffer & 0xFF));
+            buffer >>= 8;
+            bits -= 8;
+        }
+    };
+    std::unordered_map<std::uint32_t, int> table;  // (prefix code << 8 | byte) -> code
+    int next = 258;
+    put(clear);
+    int prefix = -1;
+    for (std::uint8_t v : indices) {
+        if (prefix < 0) {
+            prefix = v;
+            continue;
+        }
+        const std::uint32_t key = (static_cast<std::uint32_t>(prefix) << 8) | v;
+        auto it = table.find(key);
+        if (it != table.end()) {
+            prefix = it->second;
+            continue;
+        }
+        put(prefix);
+        if (next < 4096) {
+            table.emplace(key, next++);
+            if (next > (1 << width) && width < 12) ++width;
+        } else {
+            put(clear);
+            table.clear();
+            next = 258;
+            width = 9;
+        }
+        prefix = v;
+    }
+    if (prefix >= 0) put(prefix);
+    put(end);
+    if (bits > 0) out.push_back(static_cast<std::uint8_t>(buffer & 0xFF));
+    return out;
+}
+} // namespace
+
+void saveGif(const std::string& path, const std::vector<Image>& frames, float fps, bool loop) {
+    if (frames.empty()) throw std::invalid_argument("saveGif: no frames");
+    const std::size_t W = frames[0].width, H = frames[0].height;
+    if (W > 65535 || H > 65535) throw std::invalid_argument("saveGif: frames are too large");
+    for (const auto& f : frames) {
+        checkImage(f, "saveGif");
+        if (f.width != W || f.height != H || f.channels != 3) throw std::invalid_argument("saveGif: frames must be RGB and of one size");
+    }
+    // Shared palette from a sample of all frames.
+    std::vector<std::array<std::uint8_t, 3>> sample;
+    const std::size_t total = frames.size() * W * H, step = std::max<std::size_t>(1, total / 200000);
+    for (std::size_t i = 0; i < total; i += step) {
+        const Image& f = frames[i / (W * H)];
+        const std::size_t p = i % (W * H);
+        sample.push_back({f.pixels[p * 3], f.pixels[p * 3 + 1], f.pixels[p * 3 + 2]});
+    }
+    auto palette = medianCut(std::move(sample), 256);
+    palette.resize(256, {0, 0, 0});
+    // Nearest palette entry per 5-bit-per-channel colour cell, filled on demand.
+    std::vector<int> cache(32 * 32 * 32, -1);
+    auto nearest = [&](int r, int g, int b) {
+        const std::size_t cell = static_cast<std::size_t>(((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3));
+        if (cache[cell] < 0) {
+            const int cr = (r & ~7) + 4, cg = (g & ~7) + 4, cb = (b & ~7) + 4;
+            int best = 0, bestD = 1 << 30;
+            for (int i = 0; i < 256; ++i) {
+                const int d = (palette[static_cast<std::size_t>(i)][0] - cr) * (palette[static_cast<std::size_t>(i)][0] - cr) * 2 +
+                              (palette[static_cast<std::size_t>(i)][1] - cg) * (palette[static_cast<std::size_t>(i)][1] - cg) * 4 +
+                              (palette[static_cast<std::size_t>(i)][2] - cb) * (palette[static_cast<std::size_t>(i)][2] - cb) * 3;
+                if (d < bestD) {
+                    bestD = d;
+                    best = i;
+                }
+            }
+            cache[cell] = best;
+        }
+        return static_cast<std::uint8_t>(cache[cell]);
+    };
+    static const int bayer[4][4] = {{0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}};
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("saveGif: cannot open " + path);
+    std::vector<std::uint8_t> out{'G', 'I', 'F', '8', '9', 'a'};
+    auto u16 = [&](std::size_t v) {
+        out.push_back(static_cast<std::uint8_t>(v & 0xFF));
+        out.push_back(static_cast<std::uint8_t>(v >> 8));
+    };
+    u16(W);
+    u16(H);
+    out.insert(out.end(), {0xF7, 0, 0});  // global colour table of 2^(7+1) entries
+    for (const auto& c : palette) out.insert(out.end(), c.begin(), c.end());
+    if (loop) {
+        const std::uint8_t netscape[] = {0x21, 0xFF, 0x0B, 'N', 'E', 'T', 'S', 'C', 'A', 'P', 'E', '2', '.', '0', 3, 1, 0, 0, 0};
+        out.insert(out.end(), netscape, netscape + sizeof(netscape));
+    }
+    const std::size_t delay = static_cast<std::size_t>(std::lround(100.0 / std::max(0.1f, fps)));
+    std::vector<std::uint8_t> indices(W * H);
+    for (const auto& frame : frames) {
+        out.insert(out.end(), {0x21, 0xF9, 4, 0x04});  // graphic control: disposal "leave in place"
+        u16(delay);
+        out.insert(out.end(), {0, 0});
+        out.push_back(0x2C);  // image descriptor
+        u16(0);
+        u16(0);
+        u16(W);
+        u16(H);
+        out.push_back(0);
+        for (std::size_t y = 0; y < H; ++y)
+            for (std::size_t x = 0; x < W; ++x) {
+                const int d = (bayer[y & 3][x & 3] - 8) / 2;  // +-4 levels
+                const std::uint8_t* p = frame.pixels.data() + (y * W + x) * 3;
+                auto clamp = [](int v) { return std::min(255, std::max(0, v)); };
+                indices[y * W + x] = nearest(clamp(p[0] + d), clamp(p[1] + d), clamp(p[2] + d));
+            }
+        const std::vector<std::uint8_t> data = lzw(indices);
+        out.push_back(8);  // LZW minimum code size
+        for (std::size_t at = 0; at < data.size(); at += 255) {
+            const std::size_t n = std::min<std::size_t>(255, data.size() - at);
+            out.push_back(static_cast<std::uint8_t>(n));
+            out.insert(out.end(), data.begin() + static_cast<long>(at), data.begin() + static_cast<long>(at + n));
+        }
+        out.push_back(0);
+    }
+    out.push_back(0x3B);
+    f.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
+    if (!f) throw std::runtime_error("saveGif: write failed for " + path);
 }
 
 Matrix imageToTensor(const Image& image, float lo, float hi) {

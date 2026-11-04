@@ -20,6 +20,7 @@
 //   NeuraCraft img2img <dir> in.png "prompt" [out.png] [--strength S] [--steps N] ...
 //   NeuraCraft video <dir> morph "prompt 1" "prompt 2" ... [-o out.gif] [--seeds 1,2] [--frames N] [--fps F]
 //   NeuraCraft video <dir> zoom "prompt" ... [-o out.gif] [--frames N] [--zoom Z] [--pan DX,DY] [--rotate DEG]
+//   NeuraCraft video <dir> t2v "prompt" [-o out.gif] [--frames 16] [--steps 4]   (AnimateDiff text to video)
 //                              image to image
 //   NeuraCraft vae <dir> [in.ppm] [out.png] [--size N]
 //                              Stable Diffusion VAE round trip (scripts/download_sd_turbo.sh)
@@ -955,6 +956,7 @@ void usage() {
               << "  NeuraCraft img2img <dir> in.png \"prompt\" [out.png] [--strength S] [--steps N] [--seed S] [--size N] ...\n"
               << "  NeuraCraft video <dir> morph \"prompt\" \"prompt\" ... [-o out.gif] [--seeds A,B,..] [--frames N] [--fps F] [--no-loop]\n"
               << "  NeuraCraft video <dir> zoom \"prompt\" ... [-o out.gif] [--frames N] [--zoom Z] [--pan DX,DY] [--rotate DEG]\n"
+              << "  NeuraCraft video <dir> t2v \"prompt\" [-o out.gif] [--frames 16] [--steps 4] [--seed S] [--motion file] [--guidance G]\n"
               << "        [--strength S] [--steps N] [--start in.png] [--seed S] [--size N] [--frames-dir DIR] [--full-vae]\n"
               << "        [--sharpen A] [--noise N] [--no-color-match]\n"
               << "                               image to image (input: PNG or PPM, cropped to the size)\n"
@@ -1141,17 +1143,18 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (cmd == "video") {
-            if (args.size() < 4 || (args[2] != "morph" && args[2] != "zoom")) {
+            if (args.size() < 4 || (args[2] != "morph" && args[2] != "zoom" && args[2] != "t2v")) {
                 usage();
                 return 2;
             }
-            const bool morph = args[2] == "morph";
+            const bool morph = args[2] == "morph", t2v = args[2] == "t2v";
             TextToImageOptions o;
+            TextToVideoOptions vo;
             MorphOptions mo;
             ZoomOptions zo;
             std::vector<std::string> prompts;
             std::vector<unsigned> seeds;
-            std::string output = morph ? "morph.gif" : "zoom.gif", framesDir, start;
+            std::string output = morph ? "morph.gif" : t2v ? "t2v.gif" : "zoom.gif", framesDir, start;
             float fps = morph ? 10.0f : 8.0f;
             bool fullVae = false, framesSet = false;
             std::size_t frames = 0;
@@ -1175,7 +1178,11 @@ int main(int argc, char** argv) {
                     seeds.clear();
                     for (const std::string& s : split(value())) seeds.push_back(static_cast<unsigned>(std::stoul(s)));
                 } else if (a == "--no-loop") mo.loop = false;
-                else if (a == "--steps") mo.steps = zo.steps = std::stoul(value());
+                else if (a == "--steps") mo.steps = zo.steps = vo.steps = std::stoul(value());
+                else if (a == "--guidance") vo.guidance = std::stof(value());
+                else if (a == "--negative") vo.negativePrompt = value();
+                else if (a == "--motion") vo.motion = value();
+                else if (a == "--schedule") vo.betaSchedule = value();
                 else if (a == "--zoom") zo.zoom = std::stof(value());
                 else if (a == "--pan") {
                     const auto parts = split(value());
@@ -1206,7 +1213,15 @@ int main(int argc, char** argv) {
             if (seeds.empty()) seeds = {0};
             // TAESD makes decoding ~10x cheaper, which matters for dozens of frames.
             if (o.tinyVae.empty() && !fullVae && std::ifstream(args[1] + "/taesd/config.json")) o.tinyVae = args[1] + "/taesd";
-            if (morph) {
+            if (t2v) {
+                if (prompts.size() != 1) throw std::invalid_argument("video t2v: give one prompt");
+                vo.width = o.width;
+                vo.height = o.height;
+                vo.seed = seeds[0];
+                vo.int8 = o.int8;
+                vo.tinyVae = o.tinyVae;
+                if (framesSet) vo.frames = frames;
+            } else if (morph) {
                 if (seeds.size() == 1 && prompts.size() == 1) throw std::invalid_argument("video morph: give two prompts or several --seeds");
                 if (seeds.size() > 1 && prompts.size() == 1) prompts.resize(seeds.size(), prompts[0]);
                 if (framesSet) mo.framesPerSegment = frames;
@@ -1215,8 +1230,16 @@ int main(int argc, char** argv) {
             o.progress = [](const std::string& stage, double seconds) {
                 std::cerr << "  " << stage << ": " << std::fixed << std::setprecision(1) << seconds << " s" << std::defaultfloat << '\n';
             };
+            vo.progress = o.progress;
             std::vector<Image> video;
-            try {
+            if (t2v) {
+                try {
+                    video = textToVideo(args[1], prompts[0], vo);
+                } catch (const std::exception& e) {
+                    std::cerr << e.what() << "\ndownload a model and motion module with: scripts/download_animatediff.sh " << args[1] << '\n';
+                    return 2;
+                }
+            } else try {
                 StableDiffusion sd(args[1], o, !morph);
                 if (morph) video = morphAnimation(sd, prompts, seeds, mo);
                 else {

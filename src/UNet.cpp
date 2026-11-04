@@ -7,6 +7,7 @@
 #include "Random.h"
 #include "SafeTensors.h"
 
+#include <random>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -617,7 +618,7 @@ Image imageToImage(const std::string& dir, const Image& input, const std::string
     // As diffusers: the last steps * strength steps of the schedule run, starting from the
     // encoded image with noise at that step's sigma.
     const EulerScheduler sched = schedulerFor(dir, o.steps);
-    const std::size_t run = std::min(o.steps, static_cast<std::size_t>(static_cast<float>(o.steps) * o.strength));
+    const std::size_t run = std::min(o.steps, static_cast<std::size_t>(static_cast<float>(o.steps) * o.strength + 1e-4f));
     if (run > 0) {
         const std::size_t first = o.steps - run;
         const auto context = encodePrompts(dir, prompt, o);
@@ -650,6 +651,244 @@ Image decodeLatent(const std::string& dir, const Matrix& latent, const TextToIma
 
 Image textToImage(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
     return decodeLatent(dir, textToLatent(dir, prompt, o), o);
+}
+
+// ---- Persistent model and animations --------------------------------------------------------------
+
+struct StableDiffusion::Impl {
+    std::string dir;
+    TextToImageOptions options;
+    std::unique_ptr<ClipTokenizer> tokenizer;
+    ClipTextEncoder clip;
+    int pad = 0;
+    UNet2DCondition unet;
+    std::unique_ptr<TinyVae> tiny;
+    std::unique_ptr<Vae> vae;
+    bool encoder = false;
+};
+
+StableDiffusion::StableDiffusion(const std::string& dir, const TextToImageOptions& o, bool withEncoder) : impl_(std::make_unique<Impl>()) {
+    checkSize(o);
+    Impl& m = *impl_;
+    m.dir = dir;
+    m.options = o;
+    m.encoder = withEncoder;
+    auto t = PipelineClock::now();
+    m.tokenizer = std::make_unique<ClipTokenizer>(ClipTokenizer::fromDirectory(dir + "/tokenizer"));
+    m.clip = loadClipTextEncoder(dir, o.int8);
+    m.pad = m.tokenizer->endOfText();
+    if (std::ifstream(dir + "/tokenizer/tokenizer_config.json")) {
+        const json::Value c = json::parse(readFile(dir + "/tokenizer/tokenizer_config.json"));
+        if (const json::Value* p = c.find("pad_token"); p && p->isString() && p->string == "!") m.pad = 0;
+    }
+    reportStage(o, "load text encoder", t);
+    t = PipelineClock::now();
+    m.unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8);
+    reportStage(o, "load unet", t);
+    t = PipelineClock::now();
+    if (!o.tinyVae.empty()) m.tiny = std::make_unique<TinyVae>(loadTinyVae(o.tinyVae, o.width, o.height, withEncoder, true));
+    else m.vae = std::make_unique<Vae>(loadVae(dir, o.width, o.height, withEncoder, true));
+    reportStage(o, "load autoencoder", t);
+}
+
+StableDiffusion::~StableDiffusion() = default;
+StableDiffusion::StableDiffusion(StableDiffusion&&) noexcept = default;
+StableDiffusion& StableDiffusion::operator=(StableDiffusion&&) noexcept = default;
+
+std::size_t StableDiffusion::width() const { return impl_->options.width; }
+const TextToImageOptions& StableDiffusion::impl_options() const { return impl_->options; }
+std::size_t StableDiffusion::height() const { return impl_->options.height; }
+
+Matrix StableDiffusion::encodePrompt(const std::string& prompt) {
+    return impl_->clip.encode(impl_->tokenizer->encodeForModel(prompt, impl_->clip.length, impl_->pad));
+}
+
+Matrix StableDiffusion::noise(unsigned seed) const {
+    setSeed(seed);
+    return Matrix::normal(1, impl_->unet.latentShape().size(), 0.0f, 1.0f);
+}
+
+EulerScheduler StableDiffusion::scheduler(std::size_t steps) const { return schedulerFor(impl_->dir, steps); }
+
+void StableDiffusion::denoise(Matrix& latent, const Matrix& context, const EulerScheduler& sched, std::size_t first, float guidance,
+                              const Matrix& negative) {
+    for (std::size_t i = first; i < sched.timesteps.size(); ++i) {
+        Matrix in = latent;
+        const float scale = static_cast<float>(sched.inputScale(i));
+        for (float& v : in.values()) v *= scale;
+        Matrix eps = impl_->unet.forward(in, static_cast<float>(sched.timesteps[i]), context);
+        if (guidance > 1.0f) {
+            const Matrix uncond = impl_->unet.forward(in, static_cast<float>(sched.timesteps[i]), negative);
+            for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + guidance * (eps.data()[k] - uncond.data()[k]);
+        }
+        sched.step(i, eps, latent);
+    }
+}
+
+Matrix StableDiffusion::encodeImage(const Image& image) {
+    if (!impl_->encoder) throw std::logic_error("StableDiffusion: loaded without an image encoder");
+    const Matrix x = imageToTensor(fitImage(toRgb(image), width(), height()));
+    return impl_->tiny ? impl_->tiny->encode(x) : impl_->vae->encode(x);
+}
+
+Image StableDiffusion::decode(const Matrix& latent) {
+    const Matrix img = impl_->tiny ? impl_->tiny->decode(latent) : impl_->vae->decode(latent);
+    return tensorToImage(img.data(), {3, height(), width()});
+}
+
+Image StableDiffusion::generate(const std::string& prompt, unsigned seed, std::size_t steps) {
+    const EulerScheduler sched = scheduler(steps);
+    Matrix latent = noise(seed);
+    for (float& v : latent.values()) v *= static_cast<float>(sched.initNoiseSigma);
+    denoise(latent, encodePrompt(prompt), sched);
+    return decode(latent);
+}
+
+Image StableDiffusion::transform(const Image& input, const std::string& prompt, unsigned seed, std::size_t steps, float strength) {
+    if (strength < 0.0f || strength > 1.0f) throw std::invalid_argument("StableDiffusion::transform: strength must be in [0, 1]");
+    Matrix latent = encodeImage(input);
+    const EulerScheduler sched = scheduler(steps);
+    const std::size_t run = std::min(steps, static_cast<std::size_t>(static_cast<float>(steps) * strength + 1e-4f));
+    if (run > 0) {
+        const std::size_t first = steps - run;
+        const Matrix n = noise(seed);
+        const float sigma = static_cast<float>(sched.sigmas[first]);
+        for (std::size_t k = 0; k < latent.size(); ++k) latent.data()[k] += sigma * n.data()[k];
+        denoise(latent, encodePrompt(prompt), sched, first);
+    }
+    return decode(latent);
+}
+
+namespace {
+// Spherical interpolation of two noise latents (keeps the norm of a Gaussian sample).
+Matrix slerp(const Matrix& a, const Matrix& b, double t) {
+    double dot = 0, na = 0, nb = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        dot += static_cast<double>(a.data()[i]) * b.data()[i];
+        na += static_cast<double>(a.data()[i]) * a.data()[i];
+        nb += static_cast<double>(b.data()[i]) * b.data()[i];
+    }
+    const double cosTheta = std::max(-1.0, std::min(1.0, dot / std::sqrt(na * nb)));
+    const double theta = std::acos(cosTheta);
+    Matrix out(a.rows(), a.cols());
+    if (theta < 1e-4) {  // nearly the same direction: linear is exact enough
+        for (std::size_t i = 0; i < a.size(); ++i) out.data()[i] = static_cast<float>((1 - t) * a.data()[i] + t * b.data()[i]);
+        return out;
+    }
+    const double s = std::sin(theta), wa = std::sin((1 - t) * theta) / s, wb = std::sin(t * theta) / s;
+    for (std::size_t i = 0; i < a.size(); ++i) out.data()[i] = static_cast<float>(wa * a.data()[i] + wb * b.data()[i]);
+    return out;
+}
+
+// Per-channel mean and standard deviation transfer: keeps feedback loops from
+// drifting towards over-saturated colours.
+void matchColors(Image& image, const Image& reference) {
+    const std::size_t C = image.channels, n = image.width * image.height;
+    for (std::size_t c = 0; c < C; ++c) {
+        double s[2] = {0, 0}, q[2] = {0, 0};
+        const Image* imgs[2] = {&image, &reference};
+        for (int k = 0; k < 2; ++k) {
+            const std::size_t m = imgs[k]->width * imgs[k]->height;
+            for (std::size_t i = 0; i < m; ++i) {
+                const double v = imgs[k]->pixels[i * C + c];
+                s[k] += v;
+                q[k] += v * v;
+            }
+            s[k] /= static_cast<double>(m);
+            q[k] = std::sqrt(std::max(q[k] / static_cast<double>(m) - s[k] * s[k], 1e-6));
+        }
+        const double gain = q[1] / q[0];
+        for (std::size_t i = 0; i < n; ++i) {
+            const double v = (image.pixels[i * C + c] - s[0]) * gain + s[1];
+            image.pixels[i * C + c] = static_cast<std::uint8_t>(std::lround(std::min(255.0, std::max(0.0, v))));
+        }
+    }
+}
+
+// Unsharp mask (3x3 binomial blur) plus Gaussian pixel noise, both in place.
+void sharpenAndNoise(Image& image, float amount, float noise, unsigned seed) {
+    const std::size_t W = image.width, H = image.height, C = image.channels;
+    const std::vector<std::uint8_t> src = image.pixels;
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> gauss(0.0f, noise * 255.0f);
+    for (std::size_t y = 0; y < H; ++y)
+        for (std::size_t x = 0; x < W; ++x)
+            for (std::size_t c = 0; c < C; ++c) {
+                float blur = 0.0f;
+                for (int j = -1; j <= 1; ++j)
+                    for (int i = -1; i <= 1; ++i) {
+                        const std::size_t yy = static_cast<std::size_t>(std::min<long>(std::max<long>(static_cast<long>(y) + j, 0), static_cast<long>(H) - 1));
+                        const std::size_t xx = static_cast<std::size_t>(std::min<long>(std::max<long>(static_cast<long>(x) + i, 0), static_cast<long>(W) - 1));
+                        blur += static_cast<float>((j == 0 ? 2 : 1) * (i == 0 ? 2 : 1)) * src[(yy * W + xx) * C + c];
+                    }
+                const float v = src[(y * W + x) * C + c];
+                float out = v + amount * (v - blur / 16.0f);
+                if (noise > 0.0f) out += gauss(rng);
+                image.pixels[(y * W + x) * C + c] = static_cast<std::uint8_t>(std::lround(std::min(255.0f, std::max(0.0f, out))));
+            }
+}
+
+void frameDone(const TextToImageOptions& o, std::size_t i, std::size_t n, PipelineClock::time_point start) {
+    reportStage(o, "frame " + std::to_string(i + 1) + "/" + std::to_string(n), start);
+}
+} // namespace
+
+std::vector<Image> morphAnimation(StableDiffusion& sd, const std::vector<std::string>& prompts, const std::vector<unsigned>& seeds,
+                                  const MorphOptions& o) {
+    if (prompts.empty()) throw std::invalid_argument("morphAnimation: no prompts");
+    if (seeds.size() != 1 && seeds.size() != prompts.size())
+        throw std::invalid_argument("morphAnimation: give one seed, or one per prompt");
+    if (o.framesPerSegment == 0) throw std::invalid_argument("morphAnimation: framesPerSegment must be > 0");
+    const std::size_t keys = prompts.size();
+    std::vector<Matrix> contexts, noises;
+    for (std::size_t i = 0; i < keys; ++i) {
+        contexts.push_back(sd.encodePrompt(prompts[i]));
+        noises.push_back(sd.noise(seeds.size() == 1 ? seeds[0] : seeds[i]));
+    }
+    const EulerScheduler sched = sd.scheduler(o.steps);
+    const std::size_t segments = keys == 1 ? 1 : (o.loop ? keys : keys - 1);
+    const std::size_t total = segments * o.framesPerSegment + (o.loop || keys == 1 ? 0 : 1);
+    const TextToImageOptions& opts = sd.impl_options();
+    std::vector<Image> frames;
+    for (std::size_t f = 0; f < total; ++f) {
+        const auto t = PipelineClock::now();
+        const std::size_t seg = std::min(f / o.framesPerSegment, segments - 1);
+        const double u = static_cast<double>(f - seg * o.framesPerSegment) / static_cast<double>(o.framesPerSegment);
+        const std::size_t a = seg % keys, b = (seg + 1) % keys;
+        // Smoothstep easing, so each keyframe holds for a moment.
+        const double w = u * u * (3 - 2 * u);
+        Matrix context(contexts[a].rows(), contexts[a].cols());
+        for (std::size_t k = 0; k < context.size(); ++k)
+            context.data()[k] = static_cast<float>((1 - w) * contexts[a].data()[k] + w * contexts[b].data()[k]);
+        Matrix latent = slerp(noises[a], noises[b], w);
+        for (float& v : latent.values()) v *= static_cast<float>(sched.initNoiseSigma);
+        sd.denoise(latent, context, sched);
+        frames.push_back(sd.decode(latent));
+        frameDone(opts, f, total, t);
+    }
+    return frames;
+}
+
+std::vector<Image> zoomAnimation(StableDiffusion& sd, const std::vector<std::string>& prompts, const ZoomOptions& o, const Image* start) {
+    if (prompts.empty()) throw std::invalid_argument("zoomAnimation: no prompts");
+    if (o.frames == 0) throw std::invalid_argument("zoomAnimation: frames must be > 0");
+    const TextToImageOptions& opts = sd.impl_options();
+    std::vector<Image> frames;
+    auto t = PipelineClock::now();
+    if (start) frames.push_back(fitImage(toRgb(*start), sd.width(), sd.height()));
+    else frames.push_back(sd.transform(sd.generate(prompts[0], o.seed, 1), prompts[0], o.seed + 7919u, o.steps, o.strength));
+    frameDone(opts, 0, o.frames, t);
+    for (std::size_t f = 1; f < o.frames; ++f) {
+        t = PipelineClock::now();
+        const std::string& prompt = prompts[std::min(prompts.size() - 1, f * prompts.size() / o.frames)];
+        Image moved = transformImage(frames.back(), o.zoom, o.dx, o.dy, o.rotate);
+        if (o.sharpen > 0.0f || o.noise > 0.0f) sharpenAndNoise(moved, o.sharpen, o.noise, o.seed * 7919u + static_cast<unsigned>(f));
+        Image next = sd.transform(moved, prompt, o.seed + static_cast<unsigned>(f), o.steps, o.strength);
+        if (o.colorCoherence) matchColors(next, frames.front());
+        frames.push_back(std::move(next));
+        frameDone(opts, f, o.frames, t);
+    }
+    return frames;
 }
 
 } // namespace nc

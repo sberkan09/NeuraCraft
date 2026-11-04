@@ -13,6 +13,7 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -2514,6 +2515,164 @@ Image pngFromBytes(const std::vector<std::uint8_t>& bytes) {
 }
 } // namespace
 
+// A minimal GIF reader for the tests: global palette, delay, loop flag and
+// LZW-decoded frames (no local palettes, no interlacing: what saveGif writes).
+struct GifFile {
+    std::size_t width = 0, height = 0;
+    bool loops = false;
+    std::vector<int> delays;
+    std::vector<Image> frames;
+};
+
+GifFile readGif(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<std::uint8_t> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    GifFile g;
+    if (d.size() < 13 || std::string(d.begin(), d.begin() + 6) != "GIF89a") throw std::runtime_error("not a GIF89a");
+    g.width = d[6] | (d[7] << 8);
+    g.height = d[8] | (d[9] << 8);
+    std::size_t pos = 13;
+    std::vector<std::uint8_t> palette;
+    if (d[10] & 0x80) {
+        const std::size_t n = std::size_t{2} << (d[10] & 7);
+        palette.assign(d.begin() + 13, d.begin() + 13 + static_cast<long>(3 * n));
+        pos += 3 * n;
+    }
+    auto subBlocks = [&](std::vector<std::uint8_t>* out) {
+        while (d.at(pos) != 0) {
+            const std::size_t len = d[pos++];
+            if (out) out->insert(out->end(), d.begin() + static_cast<long>(pos), d.begin() + static_cast<long>(pos + len));
+            pos += len;
+        }
+        ++pos;
+    };
+    while (pos < d.size()) {
+        const std::uint8_t kind = d[pos++];
+        if (kind == 0x3B) break;
+        if (kind == 0x21) {
+            const std::uint8_t label = d[pos++];
+            std::vector<std::uint8_t> data;
+            subBlocks(&data);
+            if (label == 0xF9) g.delays.push_back(data.at(1) | (data.at(2) << 8));
+            if (label == 0xFF && std::string(data.begin(), data.begin() + 11) == "NETSCAPE2.0") g.loops = true;
+            continue;
+        }
+        if (kind != 0x2C) throw std::runtime_error("bad GIF block");
+        const std::size_t w = d[pos + 4] | (d[pos + 5] << 8), h = d[pos + 6] | (d[pos + 7] << 8);
+        pos += 9;
+        const int minCode = d[pos++];
+        std::vector<std::uint8_t> data;
+        subBlocks(&data);
+        // LZW
+        const int clear = 1 << minCode, end = clear + 1;
+        std::vector<std::vector<std::uint8_t>> table;
+        auto reset = [&] {
+            table.assign(static_cast<std::size_t>(end + 1), {});
+            for (int i = 0; i < clear; ++i) table[static_cast<std::size_t>(i)] = {static_cast<std::uint8_t>(i)};
+        };
+        reset();
+        int width = minCode + 1, prev = -1;
+        std::size_t bitPos = 0;
+        std::vector<std::uint8_t> indices;
+        while (bitPos + static_cast<std::size_t>(width) <= data.size() * 8) {
+            int code = 0;
+            for (int b = 0; b < width; ++b, ++bitPos) code |= ((data[bitPos / 8] >> (bitPos % 8)) & 1) << b;
+            if (code == clear) {
+                reset();
+                width = minCode + 1;
+                prev = -1;
+                continue;
+            }
+            if (code == end) break;
+            std::vector<std::uint8_t> entry;
+            if (code < static_cast<int>(table.size())) entry = table[static_cast<std::size_t>(code)];
+            else if (prev >= 0 && code == static_cast<int>(table.size())) {
+                entry = table[static_cast<std::size_t>(prev)];
+                entry.push_back(entry[0]);
+            } else throw std::runtime_error("bad LZW code");
+            if (prev >= 0 && table.size() < 4096) {
+                std::vector<std::uint8_t> added = table[static_cast<std::size_t>(prev)];
+                added.push_back(entry[0]);
+                table.push_back(added);
+                if (static_cast<int>(table.size()) == (1 << width) && width < 12) ++width;
+            }
+            indices.insert(indices.end(), entry.begin(), entry.end());
+            prev = code;
+        }
+        if (indices.size() != w * h) throw std::runtime_error("GIF frame has the wrong pixel count");
+        Image f;
+        f.width = w;
+        f.height = h;
+        for (std::uint8_t i : indices)
+            for (int c = 0; c < 3; ++c) f.pixels.push_back(palette.at(3u * i + static_cast<unsigned>(c)));
+        g.frames.push_back(std::move(f));
+    }
+    return g;
+}
+
+TEST(transform_image_and_animated_gif) {
+    Image img;
+    img.width = 40;
+    img.height = 30;
+    for (std::size_t y = 0; y < 30; ++y)
+        for (std::size_t x = 0; x < 40; ++x)
+            for (int c = 0; c < 3; ++c) img.pixels.push_back(static_cast<std::uint8_t>(c == 0 ? x * 6 : c == 1 ? y * 8 : 128));
+    CHECK(transformImage(img, 1.0f).pixels == img.pixels);  // identity
+    // A shift by whole pixels moves the content (edges clamp).
+    const Image moved = transformImage(img, 1.0f, 3.0f, -2.0f);
+    for (std::size_t y = 0; y < 27; ++y)
+        for (std::size_t x = 3; x < 40; ++x)
+            for (std::size_t c = 0; c < 3; ++c)
+                CHECK(moved.pixels[(y * 40 + x) * 3 + c] == img.pixels[((y + 2) * 40 + x - 3) * 3 + c]);
+    // Zooming in by 2 keeps the centre and stretches the gradient to half the slope.
+    const Image zoomed = transformImage(img, 2.0f);
+    const auto red = [](const Image& im, std::size_t x, std::size_t y) { return static_cast<int>(im.pixels[(y * im.width + x) * 3]); };
+    CHECK(std::abs(2 * (red(zoomed, 30, 15) - red(zoomed, 10, 15)) - (red(img, 30, 15) - red(img, 10, 15))) <= 4);
+    CHECK(std::abs(red(zoomed, 19, 15) - red(img, 19, 15)) <= 3);
+    // A 180 degree rotation mirrors both axes.
+    const Image turned = transformImage(img, 1.0f, 0.0f, 0.0f, 180.0f);
+    CHECK(std::abs(red(turned, 0, 0) - red(img, 39, 29)) <= 1 && std::abs(red(turned, 39, 5) - red(img, 0, 24)) <= 1);
+    CHECK_THROWS(transformImage(img, 0.0f), std::invalid_argument);
+
+    // GIF: frames of a few flat colours come back exactly; a gradient comes back
+    // close (one shared palette, dithered).
+    std::vector<Image> frames;
+    for (int k = 0; k < 3; ++k) {
+        Image f;
+        f.width = 40;
+        f.height = 30;
+        for (std::size_t y = 0; y < 30; ++y)
+            for (std::size_t x = 0; x < 40; ++x) {
+                const bool a = (x / 5 + y / 5 + static_cast<std::size_t>(k)) % 2 == 0;
+                const std::uint8_t px[3] = {static_cast<std::uint8_t>(a ? 250 : 10), static_cast<std::uint8_t>(a ? 40 : 200),
+                                            static_cast<std::uint8_t>(k * 100)};
+                f.pixels.insert(f.pixels.end(), px, px + 3);
+            }
+        frames.push_back(f);
+    }
+    frames.push_back(img);
+    const std::string path = tempPath("anim.gif");
+    saveGif(path, frames, 4.0f);
+    const GifFile g = readGif(path);
+    CHECK(g.width == 40 && g.height == 30 && g.loops);
+    CHECK(g.frames.size() == 4 && g.delays == std::vector<int>({25, 25, 25, 25}));
+    for (int k = 0; k < 3; ++k) CHECK(g.frames[static_cast<std::size_t>(k)].pixels == frames[static_cast<std::size_t>(k)].pixels);
+    double err = 0;
+    for (std::size_t i = 0; i < img.pixels.size(); ++i) err += std::abs(g.frames[3].pixels[i] - img.pixels[i]);
+    CHECK(err / static_cast<double>(img.pixels.size()) < 6.0);
+    // Larger, noisy frames exercise the LZW table reset (more than 4096 codes).
+    Image noise;
+    noise.width = noise.height = 200;
+    std::mt19937 rng(5);
+    for (std::size_t i = 0; i < 200 * 200 * 3; ++i) noise.pixels.push_back(static_cast<std::uint8_t>(rng() % 256));
+    saveGif(path, {noise, noise}, 10.0f, false);
+    const GifFile n = readGif(path);
+    CHECK(n.frames.size() == 2 && !n.loops && n.delays[0] == 10 && n.frames[0].pixels == n.frames[1].pixels);
+    CHECK_THROWS(saveGif(path, {}, 8.0f), std::invalid_argument);
+    CHECK_THROWS(saveGif(path, {img, noise}, 8.0f), std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
 TEST(png_reader_and_image_resizing) {
     const Image rgb = pngFromBytes(kPngRgb);
     CHECK(rgb.width == 9 && rgb.height == 7 && rgb.channels == 3 && rgb.pixels == kPngRgbPixels);
@@ -2563,12 +2722,13 @@ TEST(png_reader_and_image_resizing) {
     for (std::uint8_t v : square.pixels) CHECK(v == 255);
 }
 
-TEST(text_to_image_pipeline_runs_end_to_end) {
-    // Tokenizer, text encoder, UNet, VAE and scheduler, all tiny, in one diffusers directory.
+// Tokenizer, text encoder, UNet, VAE and scheduler, all tiny, in one diffusers
+// directory; the tokenizer's own scratch directory is returned in `tok`.
+std::string writeTinyStableDiffusion(const std::string& name, std::string& tok) {
     setSeed(98);
-    const std::string dir = tempPath("sd_tiny");
+    const std::string dir = tempPath(name);
     std::filesystem::create_directories(dir + "/tokenizer");
-    const std::string tok = tinyClipTokenizer();
+    tok = tinyClipTokenizer();
     for (const char* f : {"vocab.json", "merges.txt", "tokenizer_config.json"})
         std::filesystem::copy_file(tok + "/" + f, dir + "/tokenizer/" + f, std::filesystem::copy_options::overwrite_existing);
     std::ofstream(dir + "/tokenizer/tokenizer_config.json") << R"({"pad_token":"!","added_tokens_decoder":{"0":{"content":"!"}}})";
@@ -2612,7 +2772,12 @@ TEST(text_to_image_pipeline_runs_end_to_end) {
     }
     std::filesystem::create_directories(dir + "/scheduler");
     std::ofstream(dir + "/scheduler/scheduler_config.json") << R"({"beta_schedule":"scaled_linear","timestep_spacing":"trailing"})";
+    return dir;
+}
 
+TEST(text_to_image_pipeline_runs_end_to_end) {
+    std::string tok;
+    const std::string dir = writeTinyStableDiffusion("sd_tiny", tok);
     TextToImageOptions o;
     o.width = 64;
     o.height = 128;
@@ -2662,6 +2827,71 @@ TEST(text_to_image_pipeline_runs_end_to_end) {
     o.progress = nullptr;
     o.width = 60;
     CHECK_THROWS(textToImage(dir, "hello", o), std::invalid_argument);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(tok);
+}
+
+TEST(stable_diffusion_session_and_animations) {
+    std::string tok;
+    const std::string dir = writeTinyStableDiffusion("sd_anim", tok);
+    TextToImageOptions o;
+    o.width = 64;
+    o.height = 64;
+    o.tinyVae = dir + "/taesd";
+    writeTinyTaesd(o.tinyVae, false);
+    std::vector<std::string> stages;
+    o.progress = [&](const std::string& s, double) { stages.push_back(s); };
+    StableDiffusion sd(dir, o);
+    CHECK(sd.width() == 64 && sd.height() == 64);
+    CHECK(stages == std::vector<std::string>({"load text encoder", "load unet", "load autoencoder"}));
+    // The session gives the same pictures as the one-shot functions.
+    o.progress = nullptr;
+    o.steps = 2;
+    o.seed = 5;
+    CHECK(sd.generate("hello he", 5, 2).pixels == textToImage(dir, "hello he", o).pixels);
+    Image input;
+    input.width = 80;
+    input.height = 70;
+    for (std::size_t i = 0; i < 80 * 70 * 3; ++i) input.pixels.push_back(static_cast<std::uint8_t>(i * 7 % 256));
+    o.steps = 4;
+    o.strength = 0.5f;
+    CHECK(sd.transform(input, "hello", 5, 4, 0.5f).pixels == imageToImage(dir, input, "hello", o).pixels);
+    CHECK_THROWS(sd.transform(input, "hello", 5, 4, 2.0f), std::invalid_argument);
+    const Matrix z = sd.encodeImage(input);
+    CHECK(z.rows() == 1 && z.cols() == 4 * 8 * 8);
+    CHECK(sd.noise(1).values() == sd.noise(1).values() && sd.noise(1).values() != sd.noise(2).values());
+    StableDiffusion decoderOnly(dir, o, false);
+    CHECK_THROWS(decoderOnly.encodeImage(input), std::logic_error);
+
+    // Morph: keyframes are hit exactly, frames per segment and looping add up.
+    MorphOptions mo;
+    mo.framesPerSegment = 3;
+    stages.clear();
+    const auto loop = morphAnimation(sd, {"hello", "he"}, {1, 2}, mo);
+    CHECK(loop.size() == 6);
+    CHECK(loop[0].pixels == sd.generate("hello", 1).pixels);
+    CHECK(loop[3].pixels == sd.generate("he", 2).pixels);
+    CHECK(loop[1].pixels != loop[0].pixels && loop[1].pixels != loop[3].pixels);
+    mo.loop = false;
+    const auto open = morphAnimation(sd, {"hello", "he", "hello he"}, {7}, mo);
+    CHECK(open.size() == 7);
+    CHECK(open.back().pixels == sd.generate("hello he", 7).pixels);
+    CHECK_THROWS(morphAnimation(sd, {"a", "b"}, {1, 2, 3}, mo), std::invalid_argument);
+    CHECK_THROWS(morphAnimation(sd, {}, {1}, mo), std::invalid_argument);
+
+    // Zoom: a start image is kept as frame 0, every frame has the session's size,
+    // and the run is deterministic.
+    ZoomOptions zo;
+    zo.frames = 3;
+    const auto zoom = zoomAnimation(sd, {"hello", "he"}, zo, &input);
+    CHECK(zoom.size() == 3);
+    CHECK(zoom[0].pixels == fitImage(input, 64, 64).pixels);
+    for (const Image& f : zoom) CHECK(f.width == 64 && f.height == 64 && f.channels == 3);
+    CHECK(zoomAnimation(sd, {"hello", "he"}, zo, &input)[2].pixels == zoom[2].pixels);
+    zo.frames = 2;
+    CHECK(zoomAnimation(sd, {"hello"}, zo).size() == 2);  // generated first frame
+    zo.frames = 0;
+    CHECK_THROWS(zoomAnimation(sd, {"hello"}, zo), std::invalid_argument);
     std::filesystem::remove_all(dir);
     std::filesystem::remove_all(tok);
 }

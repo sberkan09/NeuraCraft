@@ -18,6 +18,8 @@
 //   NeuraCraft txt2img <dir> "prompt" [out.png] [--steps N] [--seed S] [--size N] [--width W --height H]
 //                              text to image with Stable Diffusion / SD-Turbo (scripts/download_sd_turbo.sh)
 //   NeuraCraft img2img <dir> in.png "prompt" [out.png] [--strength S] [--steps N] ...
+//   NeuraCraft video <dir> morph "prompt 1" "prompt 2" ... [-o out.gif] [--seeds 1,2] [--frames N] [--fps F]
+//   NeuraCraft video <dir> zoom "prompt" ... [-o out.gif] [--frames N] [--zoom Z] [--pan DX,DY] [--rotate DEG]
 //                              image to image
 //   NeuraCraft vae <dir> [in.ppm] [out.png] [--size N]
 //                              Stable Diffusion VAE round trip (scripts/download_sd_turbo.sh)
@@ -32,13 +34,16 @@
 #include <ctime>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <memory>
 #include <numeric>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -948,6 +953,10 @@ void usage() {
               << "  NeuraCraft txt2img <dir> \"prompt\" [out.png] [--steps N] [--seed S] [--size N] [--guidance G --negative N]\n"
               << "                 [--tiny-vae <taesd dir>] [--fp32]\n"
               << "  NeuraCraft img2img <dir> in.png \"prompt\" [out.png] [--strength S] [--steps N] [--seed S] [--size N] ...\n"
+              << "  NeuraCraft video <dir> morph \"prompt\" \"prompt\" ... [-o out.gif] [--seeds A,B,..] [--frames N] [--fps F] [--no-loop]\n"
+              << "  NeuraCraft video <dir> zoom \"prompt\" ... [-o out.gif] [--frames N] [--zoom Z] [--pan DX,DY] [--rotate DEG]\n"
+              << "        [--strength S] [--steps N] [--start in.png] [--seed S] [--size N] [--frames-dir DIR] [--full-vae]\n"
+              << "        [--sharpen A] [--noise N] [--no-color-match]\n"
               << "                               image to image (input: PNG or PPM, cropped to the size)\n"
               << "                               text to image with Stable Diffusion (SD-Turbo: 1-4 steps)\n"
               << "  NeuraCraft vae <dir> [in.ppm] [out.png] [--size N]\n"
@@ -1129,6 +1138,110 @@ int main(int argc, char** argv) {
             std::cout << "wrote " << output << " (" << o.width << "x" << o.height << ", " << o.steps << " step" << (o.steps == 1 ? "" : "s")
                       << ", seed " << o.seed << ") in " << std::fixed << std::setprecision(1)
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() << " s" << std::defaultfloat << '\n';
+            return 0;
+        }
+        if (cmd == "video") {
+            if (args.size() < 4 || (args[2] != "morph" && args[2] != "zoom")) {
+                usage();
+                return 2;
+            }
+            const bool morph = args[2] == "morph";
+            TextToImageOptions o;
+            MorphOptions mo;
+            ZoomOptions zo;
+            std::vector<std::string> prompts;
+            std::vector<unsigned> seeds;
+            std::string output = morph ? "morph.gif" : "zoom.gif", framesDir, start;
+            float fps = morph ? 10.0f : 8.0f;
+            bool fullVae = false, framesSet = false;
+            std::size_t frames = 0;
+            auto split = [](const std::string& s) {
+                std::vector<std::string> parts;
+                std::stringstream ss(s);
+                for (std::string p; std::getline(ss, p, ',');) parts.push_back(p);
+                return parts;
+            };
+            for (std::size_t i = 3; i < args.size(); ++i) {
+                const std::string& a = args[i];
+                auto value = [&]() -> std::string {
+                    if (i + 1 >= args.size()) throw std::invalid_argument(a + " needs a value");
+                    return args[++i];
+                };
+                if (a == "-o" || a == "--output") output = value();
+                else if (a == "--frames") frames = std::stoul(value()), framesSet = true;
+                else if (a == "--fps") fps = std::stof(value());
+                else if (a == "--seed") zo.seed = static_cast<unsigned>(std::stoul(value())), seeds = {zo.seed};
+                else if (a == "--seeds") {
+                    seeds.clear();
+                    for (const std::string& s : split(value())) seeds.push_back(static_cast<unsigned>(std::stoul(s)));
+                } else if (a == "--no-loop") mo.loop = false;
+                else if (a == "--steps") mo.steps = zo.steps = std::stoul(value());
+                else if (a == "--zoom") zo.zoom = std::stof(value());
+                else if (a == "--pan") {
+                    const auto parts = split(value());
+                    if (parts.size() != 2) throw std::invalid_argument("--pan takes DX,DY");
+                    zo.dx = std::stof(parts[0]);
+                    zo.dy = std::stof(parts[1]);
+                } else if (a == "--rotate") zo.rotate = std::stof(value());
+                else if (a == "--strength") zo.strength = std::stof(value());
+                else if (a == "--no-color-match") zo.colorCoherence = false;
+                else if (a == "--sharpen") zo.sharpen = std::stof(value());
+                else if (a == "--noise") zo.noise = std::stof(value());
+                else if (a == "--start") start = value();
+                else if (a == "--size") o.width = o.height = std::stoul(value());
+                else if (a == "--width") o.width = std::stoul(value());
+                else if (a == "--height") o.height = std::stoul(value());
+                else if (a == "--tiny-vae") o.tinyVae = value();
+                else if (a == "--full-vae") fullVae = true;
+                else if (a == "--frames-dir") framesDir = value();
+                else if (a == "--int8") o.int8 = true;
+                else if (a == "--fp32") o.int8 = false;
+                else if (a.rfind("--", 0) != 0) prompts.push_back(a);
+                else {
+                    std::cerr << "unknown video option: " << a << "\n";
+                    return 2;
+                }
+            }
+            if (prompts.empty()) throw std::invalid_argument("video: give at least one prompt");
+            if (seeds.empty()) seeds = {0};
+            // TAESD makes decoding ~10x cheaper, which matters for dozens of frames.
+            if (o.tinyVae.empty() && !fullVae && std::ifstream(args[1] + "/taesd/config.json")) o.tinyVae = args[1] + "/taesd";
+            if (morph) {
+                if (seeds.size() == 1 && prompts.size() == 1) throw std::invalid_argument("video morph: give two prompts or several --seeds");
+                if (seeds.size() > 1 && prompts.size() == 1) prompts.resize(seeds.size(), prompts[0]);
+                if (framesSet) mo.framesPerSegment = frames;
+            } else if (framesSet) zo.frames = frames;
+            const auto begin = std::chrono::steady_clock::now();
+            o.progress = [](const std::string& stage, double seconds) {
+                std::cerr << "  " << stage << ": " << std::fixed << std::setprecision(1) << seconds << " s" << std::defaultfloat << '\n';
+            };
+            std::vector<Image> video;
+            try {
+                StableDiffusion sd(args[1], o, !morph);
+                if (morph) video = morphAnimation(sd, prompts, seeds, mo);
+                else {
+                    Image first;
+                    if (!start.empty()) first = loadImage(start);
+                    video = zoomAnimation(sd, prompts, zo, start.empty() ? nullptr : &first);
+                }
+            } catch (const std::exception& e) {
+                std::cerr << e.what() << "\ndownload SD-Turbo with: scripts/download_sd_turbo.sh " << args[1] << '\n';
+                return 2;
+            }
+            saveGif(output, video, fps);
+            if (!framesDir.empty()) {
+                std::filesystem::create_directories(framesDir);
+                for (std::size_t i = 0; i < video.size(); ++i) {
+                    char name[32];
+                    std::snprintf(name, sizeof name, "/frame_%04zu.png", i);
+                    savePng(framesDir + name, video[i]);
+                }
+                std::cout << "frames in " << framesDir << "; for an MP4: ffmpeg -framerate " << fps << " -i " << framesDir
+                          << "/frame_%04d.png -pix_fmt yuv420p video.mp4\n";
+            }
+            std::cout << "wrote " << output << " (" << video.size() << " frames, " << o.width << "x" << o.height << ", " << fps
+                      << " fps) in " << std::fixed << std::setprecision(1)
+                      << std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() << " s" << std::defaultfloat << '\n';
             return 0;
         }
         if (cmd == "vae") {

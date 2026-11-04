@@ -283,10 +283,10 @@ scaling types (linear, dynamic, YaRN), attention biases (Qwen 2; its
 tokenizer pattern is supported), sliding-window attention (Mistral v0.1) and
 tokenizer.json files with other pre-tokenizers (e.g. Metaspace).
 
-### Image generation (in progress): Stable Diffusion's VAE
+### Image generation (in progress): Stable Diffusion's VAE and text encoder
 
 ```
-$ scripts/download_sd_turbo.sh data/sd-turbo                  # the VAE of SD-Turbo (~170 MB fp16)
+$ scripts/download_sd_turbo.sh data/sd-turbo                  # SD-Turbo's VAE and text encoder (~850 MB fp16)
 $ ./build_and_run.sh vae data/sd-turbo                        # built-in test picture, 512x512
 $ ./build_and_run.sh vae data/sd-turbo photo.ppm out.png      # your own image (sides multiple of 8)
 ```
@@ -312,8 +312,16 @@ pattern; fine stripes soften a little, as with any SD VAE).
 | peak memory | — | 1.4 GB |
 
 The decoder is ~2.5 TFLOP at 512 x 512, running at ~70 GFLOPS here; on Apple
-silicon the same products go to Accelerate. Next: the CLIP text encoder, the
-UNet and the sampler, then GPU convolutions.
+silicon the same products go to Accelerate.
+
+The prompt side: `ClipTokenizer` (CLIP's lowercased byte-level BPE with
+`</w>` word ends; same ids as transformers' `CLIPTokenizer` on 20 prompts,
+including SD 2's quirk of turning every "!" into the pad token) and
+`loadClipTextEncoder()` (Hugging Face `CLIPTextModel`, built from the GPT
+layers: learned positions, causal pre-norm blocks, an erf or "quick" `GELU`).
+SD-Turbo's 23-layer OpenCLIP ViT-H text model turns a prompt into 77 x 1024
+hidden states in 1.2 s; `scripts/clip_reference.py` (NumPy) agrees within
+7.9e-6. Next: the UNet and the sampler, then GPU convolutions.
 
 ## Performance and devices
 
@@ -407,7 +415,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
 | Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE with Llama 3 scaling, grouped-query attention, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
 | Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales; integer AVX-VNNI / AVX2 / NEON products), `Network::quantize()` for Dense, attention and embeddings (shared with tied outputs), `setInt8Inputs` |
-| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG / PPM files, `loadVae()` (Stable Diffusion autoencoder: `encode`, `decode`) |
+| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG / PPM files, `loadVae()` (Stable Diffusion autoencoder: `encode`, `decode`), `loadClipTextEncoder()`, `ClipTokenizer` |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
 | Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k, top-p, repetition penalty, streaming callback, stop tokens), `Generator` (multi-turn, KV cache kept between calls) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |
@@ -460,8 +468,10 @@ generation against generating from the whole transcript, top-p and the
 repetition penalty, that inference passes keep no backward state, the
 convolution inference path against the training path, the image layers
 (known values and gradient checks), spatial attention against a naive
-implementation, PNG/PPM files (chunks, CRCs and pixels parsed back), and the
-VAE loader on a synthetic diffusers checkpoint. CI runs
+implementation, PNG/PPM files (chunks, CRCs and pixels parsed back), the VAE
+loader on a synthetic diffusers checkpoint, the GELU variants, the CLIP
+tokenizer (cleanup, splitting, merges, added tokens, padding) and the CLIP
+text encoder against a naive reference on a synthetic checkpoint. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
 kernels).
 
@@ -472,6 +482,6 @@ Includes/   public headers (NeuraCraft.h includes everything)
 src/        library sources + Main.cpp (demo CLI -> bin/NeuraCraft)
 tests/      unit tests
 scripts/    download_{mnist,shakespeare,gpt2,tinyllama,llama32,sd_turbo}.sh, gpt2_reference.py, llama_reference.py,
-            vae_reference.py,
+            vae_reference.py, clip_reference.py,
             gen_unicode_tables.py (src/UnicodeTables.cpp)
 ```

@@ -660,6 +660,282 @@ std::string LlamaTokenizer::decode(const std::vector<int>& ids) const {
     return out;
 }
 
+// ---- CLIP tokenizer ------------------------------------------------------------------------
+
+namespace {
+// Simple lowercase mapping for the scripts prompts usually use.
+std::uint32_t toLower(std::uint32_t c) {
+    if (c >= 'A' && c <= 'Z') return c + 32;
+    if ((c >= 0xC0 && c <= 0xDE && c != 0xD7)) return c + 32;
+    if (c == 0x178) return 0xFF;  // Ÿ -> ÿ
+    if (c >= 0x100 && c <= 0x17F && c != 0x178 && c != 0x130 && c != 0x131 && c != 0x138 && c != 0x149 && c != 0x17F) {
+        // Latin Extended-A: mostly upper/lower pairs, with an odd-start run in 0x139..0x148 and 0x179..0x17E.
+        const bool oddRun = (c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E);
+        return oddRun ? (c % 2 == 1 ? c + 1 : c) : (c % 2 == 0 ? c + 1 : c);
+    }
+    if (c >= 0x391 && c <= 0x3AB && c != 0x3A2) return c + 32;  // Greek
+    if (c >= 0x410 && c <= 0x42F) return c + 32;                 // Cyrillic
+    if (c >= 0x400 && c <= 0x40F) return c + 80;
+    return c;
+}
+
+bool isCjk(std::uint32_t c) {
+    return (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF) || (c >= 0x20000 && c <= 0x2A6DF) ||
+           (c >= 0x2A700 && c <= 0x2B73F) || (c >= 0x2B740 && c <= 0x2B81F) || (c >= 0x2B820 && c <= 0x2CEAF) ||
+           (c >= 0xF900 && c <= 0xFAFF) || (c >= 0x2F800 && c <= 0x2FA1F);
+}
+} // namespace
+
+std::string ClipTokenizer::clean(const std::string& text) {
+    // transformers' BasicTokenizer(do_lower_case=True, strip_accents=False, do_split_on_punc=False):
+    // drop NUL / U+FFFD / control characters, whitespace -> " ", spaces around CJK, split on
+    // whitespace, lowercase, join with single spaces.
+    std::string spaced;
+    for (std::size_t i = 0; i < text.size();) {
+        std::size_t len = 1;
+        const std::uint32_t c = decodeUtf8(text, i, len);
+        i += len;
+        if (c == 0 || c == 0xFFFD || c >= 0x110000) continue;
+        if (c == '\t' || c == '\n' || c == '\r' || isSpace(c)) {
+            spaced += ' ';
+            continue;
+        }
+        if (c < 0x20 || (c >= 0x7F && c < 0xA0) || c == 0x200B || c == 0x200C || c == 0x200D || c == 0xFEFF || c == 0xAD) continue;
+        if (isCjk(c)) {
+            spaced += ' ';
+            appendUtf8(spaced, c);
+            spaced += ' ';
+            continue;
+        }
+        if (c == 0x130) {  // İ lowercases to i + combining dot above (as Python's str.lower)
+            spaced += "i\xcc\x87";
+            continue;
+        }
+        appendUtf8(spaced, toLower(c));
+    }
+    std::string out;
+    std::istringstream words(spaced);
+    std::string w;
+    while (words >> w) out += (out.empty() ? "" : " ") + w;
+    return out;
+}
+
+std::vector<std::string> ClipTokenizer::splitWords(const std::string& text) {
+    // <\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+  (ignore case)
+    struct Cp {
+        std::uint32_t cp;
+        std::size_t pos;
+        Kind kind;
+    };
+    std::vector<Cp> cps;
+    for (std::size_t i = 0; i < text.size();) {
+        std::size_t len = 1;
+        const std::uint32_t cp = decodeUtf8(text, i, len);
+        cps.push_back({cp, i, kindOf(cp)});
+        i += len;
+    }
+    const std::size_t n = cps.size();
+    std::vector<std::string> words;
+    auto emit = [&](std::size_t a, std::size_t b) {
+        const std::size_t begin = cps[a].pos, end = b < n ? cps[b].pos : text.size();
+        words.push_back(text.substr(begin, end - begin));
+    };
+    auto lower = [](std::uint32_t c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; };
+    std::size_t i = 0;
+    while (i < n) {
+        bool special = false;
+        for (const char* s : {"<|startoftext|>", "<|endoftext|>"}) {
+            const std::string token(s);
+            if (text.compare(cps[i].pos, token.size(), token) == 0) {
+                std::size_t e = i;
+                while (e < n && cps[e].pos < cps[i].pos + token.size()) ++e;
+                emit(i, e);
+                i = e;
+                special = true;
+                break;
+            }
+        }
+        if (special) continue;
+        if (cps[i].cp == '\'' && i + 1 < n) {
+            const std::uint32_t a = lower(cps[i + 1].cp), b = i + 2 < n ? lower(cps[i + 2].cp) : 0;
+            std::size_t take = 0;
+            if (a == 's' || a == 't' || a == 'm' || a == 'd') take = 2;
+            else if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) take = 3;
+            if (take) {
+                emit(i, i + take);
+                i += take;
+                continue;
+            }
+        }
+        const Kind k = cps[i].kind;
+        if (k == Kind::Space) {  // not matched by the pattern: skipped
+            ++i;
+            continue;
+        }
+        if (k == Kind::Number) {
+            emit(i, i + 1);
+            ++i;
+            continue;
+        }
+        std::size_t e = i;
+        while (e < n && cps[e].kind == k) ++e;  // a run of letters, or of other characters
+        emit(i, e);
+        i = e;
+    }
+    return words;
+}
+
+ClipTokenizer ClipTokenizer::fromDirectory(const std::string& dir) {
+    const std::string config = dir + "/tokenizer_config.json";
+    return ClipTokenizer(dir + "/vocab.json", dir + "/merges.txt", std::ifstream(config) ? config : std::string());
+}
+
+ClipTokenizer::ClipTokenizer(const std::string& vocabJsonPath, const std::string& mergesPath,
+                             const std::string& tokenizerConfigPath) {
+    byteLevelTables(byteToUnicode_, unicodeToByte_);
+    const json::Value vocab = json::parse(readFile(vocabJsonPath));
+    if (!vocab.isObject() || vocab.object.empty()) throw std::runtime_error("ClipTokenizer: bad vocab.json");
+    idToToken_.resize(vocab.object.size());
+    for (const auto& [token, id] : vocab.object) {
+        const auto i = static_cast<std::size_t>(id.number);
+        if (i >= idToToken_.size()) idToToken_.resize(i + 1);
+        idToToken_[i] = token;
+        vocab_[token] = static_cast<int>(i);
+    }
+    std::istringstream merges(readFile(mergesPath));
+    std::string line;
+    int rank = 0;
+    while (std::getline(merges, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line.rfind("#version", 0) == 0) continue;
+        ranks_.emplace(line, rank++);
+    }
+    auto find = [&](const char* s) { auto it = vocab_.find(s); return it == vocab_.end() ? -1 : it->second; };
+    bos_ = find("<|startoftext|>");
+    eos_ = find("<|endoftext|>");
+    if (bos_ < 0 || eos_ < 0) throw std::runtime_error("ClipTokenizer: vocabulary has no <|startoftext|> / <|endoftext|>");
+    if (!tokenizerConfigPath.empty()) {
+        const json::Value cfg = json::parse(readFile(tokenizerConfigPath));
+        if (const json::Value* added = cfg.find("added_tokens_decoder"))
+            for (const auto& [id, entry] : added->object) {
+                const std::string& content = entry.at("content").string;
+                if (content == "<|startoftext|>" || content == "<|endoftext|>") continue;  // handled by the pattern
+                added_.emplace_back(content, std::stoi(id));
+            }
+        std::sort(added_.begin(), added_.end(), [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+    }
+}
+
+std::vector<int> ClipTokenizer::encodeWord(const std::string& word) const {
+    auto hit = cache_.find(word);
+    if (hit != cache_.end()) return hit->second;
+    std::vector<int> ids;
+    if (word == "<|startoftext|>" || word == "<|endoftext|>") {
+        ids.push_back(word == "<|startoftext|>" ? bos_ : eos_);
+        return ids;
+    }
+    std::vector<std::string> symbols;
+    for (unsigned char b : word) symbols.push_back(byteToUnicode_[b]);
+    symbols.back() += "</w>";
+    while (symbols.size() > 1) {
+        int best = std::numeric_limits<int>::max();
+        std::size_t at = 0;
+        for (std::size_t i = 0; i + 1 < symbols.size(); ++i) {
+            auto it = ranks_.find(symbols[i] + " " + symbols[i + 1]);
+            if (it != ranks_.end() && it->second < best) {
+                best = it->second;
+                at = i;
+            }
+        }
+        if (best == std::numeric_limits<int>::max()) break;
+        const std::string left = symbols[at], right = symbols[at + 1];
+        std::vector<std::string> merged;
+        for (std::size_t i = 0; i < symbols.size(); ++i) {
+            if (i + 1 < symbols.size() && symbols[i] == left && symbols[i + 1] == right) {
+                merged.push_back(left + right);
+                ++i;
+            } else {
+                merged.push_back(symbols[i]);
+            }
+        }
+        symbols = std::move(merged);
+    }
+    for (const auto& s : symbols) {
+        auto it = vocab_.find(s);
+        ids.push_back(it != vocab_.end() ? it->second : eos_);  // unk_token is <|endoftext|>
+    }
+    if (cache_.size() < 100000) cache_.emplace(word, ids);
+    return ids;
+}
+
+std::vector<int> ClipTokenizer::encodeText(const std::string& text) const {
+    std::vector<int> ids;
+    for (const auto& w : splitWords(clean(text))) {
+        const auto part = encodeWord(w);
+        ids.insert(ids.end(), part.begin(), part.end());
+    }
+    return ids;
+}
+
+std::vector<int> ClipTokenizer::encode(const std::string& text) const {
+    std::vector<int> ids;
+    std::size_t start = 0, i = 0;
+    while (i < text.size()) {
+        bool matched = false;
+        for (const auto& [content, id] : added_) {
+            if (!content.empty() && text.compare(i, content.size(), content) == 0) {
+                const auto part = encodeText(text.substr(start, i - start));
+                ids.insert(ids.end(), part.begin(), part.end());
+                ids.push_back(id);
+                i += content.size();
+                start = i;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) ++i;
+    }
+    const auto part = encodeText(text.substr(start));
+    ids.insert(ids.end(), part.begin(), part.end());
+    return ids;
+}
+
+std::vector<int> ClipTokenizer::encodeForModel(const std::string& text, std::size_t length, int pad) const {
+    if (length < 2) throw std::invalid_argument("ClipTokenizer::encodeForModel: length must be >= 2");
+    std::vector<int> ids{bos_};
+    const auto body = encode(text);
+    ids.insert(ids.end(), body.begin(), body.begin() + static_cast<long>(std::min(body.size(), length - 2)));
+    ids.push_back(eos_);
+    ids.resize(length, pad < 0 ? eos_ : pad);
+    return ids;
+}
+
+std::string ClipTokenizer::decode(const std::vector<int>& ids) const {
+    std::string mapped;
+    for (int id : ids) {
+        if (id < 0 || static_cast<std::size_t>(id) >= idToToken_.size())
+            throw std::out_of_range("ClipTokenizer: id " + std::to_string(id) + " out of range");
+        if (id == bos_ || id == eos_) continue;
+        mapped += idToToken_[static_cast<std::size_t>(id)];
+    }
+    std::string out;
+    for (std::size_t i = 0; i < mapped.size();) {
+        if (mapped.compare(i, 4, "</w>") == 0) {
+            out += ' ';
+            i += 4;
+            continue;
+        }
+        std::size_t len = 1;
+        const std::uint32_t cp = decodeUtf8(mapped, i, len);
+        auto it = unicodeToByte_.find(cp);
+        if (it != unicodeToByte_.end()) out += static_cast<char>(it->second);
+        else out += mapped.substr(i, len);
+        i += len;
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
 // ---- Model -----------------------------------------------------------------------------------
 
 namespace {

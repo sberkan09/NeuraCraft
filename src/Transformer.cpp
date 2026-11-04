@@ -312,9 +312,21 @@ constexpr float kGeluA = 0.044715f;
 } // namespace
 
 Matrix GELU::forward(const Matrix& input, bool training) {
+    Matrix out(input.rows(), input.cols());
+    if (approximation_ != Approximation::Tanh) {
+        const bool erf = approximation_ == Approximation::Erf;
+        parallelFor(0, input.size(), 16384, [&](std::size_t i0, std::size_t i1) {
+            for (std::size_t i = i0; i < i1; ++i) {
+                const float x = input.data()[i];
+                out.data()[i] = erf ? 0.5f * x * (1.0f + std::erf(x * 0.70710678118654752f)) : x / (1.0f + std::exp(-1.702f * x));
+            }
+        });
+        input_ = training ? input : Matrix();
+        tanh_ = Matrix();
+        return out;
+    }
     input_ = input;
     tanh_ = Matrix(input.rows(), input.cols());
-    Matrix out(input.rows(), input.cols());
     parallelFor(0, input.size(), 16384, [&](std::size_t i0, std::size_t i1) {
         for (std::size_t i = i0; i < i1; ++i) {
             const float x = input.data()[i];
@@ -331,17 +343,34 @@ Matrix GELU::forward(const Matrix& input, bool training) {
 }
 
 Matrix GELU::backward(const Matrix& gradOutput) {
-    if (!gradOutput.sameShape(tanh_)) throw std::invalid_argument("GELU::backward: gradient shape does not match the last forward");
+    if (!gradOutput.sameShape(input_)) throw std::invalid_argument("GELU::backward: gradient shape does not match the last forward");
     Matrix grad(gradOutput);
     parallelFor(0, grad.size(), 16384, [&](std::size_t i0, std::size_t i1) {
         for (std::size_t i = i0; i < i1; ++i) {
             const float x = input_.data()[i];
-            const float t = tanh_.data()[i];
-            const float dt = (1.0f - t * t) * kGeluC * (1.0f + 3.0f * kGeluA * x * x);
-            grad.data()[i] *= 0.5f * (1.0f + t) + 0.5f * x * dt;
+            float d;
+            if (approximation_ == Approximation::Tanh) {
+                const float t = tanh_.data()[i];
+                const float dt = (1.0f - t * t) * kGeluC * (1.0f + 3.0f * kGeluA * x * x);
+                d = 0.5f * (1.0f + t) + 0.5f * x * dt;
+            } else if (approximation_ == Approximation::Erf) {
+                d = 0.5f * (1.0f + std::erf(x * 0.70710678118654752f)) + x * 0.39894228040143268f * std::exp(-0.5f * x * x);
+            } else {
+                const float s = 1.0f / (1.0f + std::exp(-1.702f * x));
+                d = s + 1.702f * x * s * (1.0f - s);
+            }
+            grad.data()[i] *= d;
         }
     });
     return grad;
+}
+
+std::string GELU::describe() const {
+    switch (approximation_) {
+    case Approximation::Erf: return "GELU(erf)";
+    case Approximation::Sigmoid: return "GELU(quick)";
+    default: return "GELU";
+    }
 }
 
 // ---- CausalSelfAttention ------------------------------------------------------------------

@@ -7,6 +7,7 @@
 #include "Conv.h"
 #include "Image.h"
 #include "Network.h"
+#include "Transformer.h"
 
 #include <string>
 
@@ -32,6 +33,22 @@ struct Vae {
 // skipped to save memory.
 Vae loadVae(const std::string& directory, std::size_t width, std::size_t height, bool withEncoder = true,
             bool withDecoder = true);
+
+// CLIP's text transformer (Hugging Face CLIPTextModel): token ids (padded to
+// `length`, usually 77) -> one hidden state per position after the final
+// layer norm, the conditioning Stable Diffusion's UNet cross-attends to.
+struct ClipTextEncoder {
+    Network net;
+    SequenceContextPtr context;
+    std::size_t length = 77, dim = 0, layers = 0;
+
+    Matrix encode(const std::vector<int>& ids);  // length x dim
+};
+
+// Loads `directory`/text_encoder (or `directory` itself): config.json plus
+// model(.fp16).safetensors. Supports hidden_act gelu (OpenCLIP, SD 2 / Turbo)
+// and quick_gelu (OpenAI CLIP, SD 1.x).
+ClipTextEncoder loadClipTextEncoder(const std::string& directory);
 
 } // namespace nc
 

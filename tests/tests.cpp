@@ -680,6 +680,48 @@ TEST(tokenizer_and_dataset) {
     CHECK_THROWS(makeNextTokenDataset({1, 2}, 3), std::invalid_argument);
 }
 
+TEST(bpe_split_train_encode_decode) {
+    const std::string text = "the cat sat on the mat. the cat ate 42 rats!\n\nthe end";
+    std::string joined;
+    for (const auto& w : splitWords(text)) joined += w;
+    CHECK(joined == text);
+    CHECK(splitWords("hi  there, 12x")[1] == " ");  // "hi", " ", " there", ",", " 12", "x"
+    CHECK(splitWords("hi  there, 12x").size() == 6);
+
+    const BpeTokenizer tok = BpeTokenizer::train(text, 280);
+    CHECK(tok.vocabSize() > 256 && tok.vocabSize() <= 280);
+    CHECK(tok.piece(256).size() == 2);
+    const auto ids = tok.encode(text);
+    CHECK(ids.size() < text.size());
+    CHECK(tok.decode(ids) == text);
+    // Unseen bytes still round-trip (byte fallback).
+    const std::string other = "Zebra \xc3\xa7ok g\xc3\xbczel~\t";
+    CHECK(tok.decode(tok.encode(other)) == other);
+    // " the" occurs often enough to become one token.
+    bool hasThe = false;
+    for (std::size_t id = 256; id < tok.vocabSize(); ++id) hasThe |= tok.piece(static_cast<int>(id)) == " the";
+    CHECK(hasThe);
+    CHECK_THROWS(BpeTokenizer::train(text, 100), std::invalid_argument);
+}
+
+TEST(bpe_save_load_and_determinism) {
+    const std::string text = "low lower lowest newer newest wider widest low low lower";
+    const BpeTokenizer a = BpeTokenizer::train(text, 270);
+    const BpeTokenizer b = BpeTokenizer::train(text, 270);
+    CHECK(a.encode(text) == b.encode(text));
+    const std::string path = tempPath("bpe.txt");
+    a.save(path);
+    const BpeTokenizer c = BpeTokenizer::load(path);
+    CHECK(c.vocabSize() == a.vocabSize());
+    CHECK(c.encode(text) == a.encode(text));
+    {
+        std::ofstream out(path);
+        out << "NEURACRAFT-BPE 1\n1\n300 2\n";
+    }
+    CHECK_THROWS(BpeTokenizer::load(path), std::runtime_error);
+    std::remove(path.c_str());
+}
+
 TEST(gpt_memorizes_a_sequence_and_generates_it) {
     setSeed(34);
     const std::string text = "abcdefgh abcdefgh abcdefgh abcdefgh abcdefgh abcdefgh ";

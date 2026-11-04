@@ -7,8 +7,8 @@
 //   NeuraCraft eval <dir> [mlp|cnn]
 //                              evaluate the saved weights on the MNIST test set
 //                              (see scripts/download_mnist.sh)
-//   NeuraCraft gpt <text-file> [epochs]
-//                              train a character-level GPT (scripts/download_shakespeare.sh)
+//   NeuraCraft gpt <text-file> [epochs] [bpe|char]
+//                              train a GPT on a text file (scripts/download_shakespeare.sh)
 //   NeuraCraft generate <text-file> [prompt] [length]
 //                              sample from the trained GPT
 //   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
@@ -21,6 +21,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
+#include <memory>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -309,8 +311,29 @@ GPTConfig textModelConfig(std::size_t vocab) {
 }
 
 std::string gptWeightsPath(const std::string& textPath) { return textPath + ".gpt.weights"; }
+std::string gptTokenizerPath(const std::string& textPath) { return textPath + ".gpt.tokenizer"; }
+constexpr std::size_t kBpeVocab = 512;
 
-void printSample(Network& net, const CharTokenizer& tok, const std::string& prompt, std::size_t length,
+// The tokenizer file records which tokenizer the weights were trained with:
+// BPE merges, or a marker meaning "character vocabulary of the text file".
+void saveTokenizer(const std::string& textPath, const Tokenizer& tok) {
+    if (const auto* bpe = dynamic_cast<const BpeTokenizer*>(&tok)) {
+        bpe->save(gptTokenizerPath(textPath));
+    } else {
+        std::ofstream out(gptTokenizerPath(textPath));
+        out << "NEURACRAFT-CHAR 1\n";
+        if (!out) throw std::runtime_error("cannot write " + gptTokenizerPath(textPath));
+    }
+}
+
+std::unique_ptr<Tokenizer> loadTokenizer(const std::string& textPath, const std::string& text) {
+    std::ifstream in(gptTokenizerPath(textPath));
+    std::string magic;
+    if (!in || !(in >> magic) || magic == "NEURACRAFT-CHAR") return std::make_unique<CharTokenizer>(text);
+    return std::make_unique<BpeTokenizer>(BpeTokenizer::load(gptTokenizerPath(textPath)));
+}
+
+void printSample(Network& net, const Tokenizer& tok, const std::string& prompt, std::size_t length,
                  std::size_t context) {
     SamplingOptions sampling;
     sampling.temperature = 0.8f;
@@ -319,8 +342,12 @@ void printSample(Network& net, const CharTokenizer& tok, const std::string& prom
               << "\n------------------" << std::endl;
 }
 
-int runGpt(const std::string& path, std::size_t epochs) {
-    banner("Character-level GPT");
+int runGpt(const std::string& path, std::size_t epochs, const std::string& tokenizerKind) {
+    banner("GPT language model (" + tokenizerKind + " tokens)");
+    if (tokenizerKind != "char" && tokenizerKind != "bpe") {
+        std::cerr << "unknown tokenizer '" << tokenizerKind << "' (use char or bpe)\n";
+        return 2;
+    }
     std::string text;
     try {
         text = loadText(path);
@@ -328,17 +355,30 @@ int runGpt(const std::string& path, std::size_t epochs) {
         std::cerr << e.what() << "\ndownload a corpus with: scripts/download_shakespeare.sh\n";
         return 2;
     }
-    const CharTokenizer tok(text);
-    const std::vector<int> ids = tok.encode(text);
+    std::unique_ptr<Tokenizer> tok;
+    if (tokenizerKind == "bpe") {
+        const auto t0 = std::chrono::steady_clock::now();
+        tok = std::make_unique<BpeTokenizer>(BpeTokenizer::train(text, kBpeVocab));
+        std::cout << "trained BPE (" << tok->vocabSize() << " tokens) in " << std::fixed << std::setprecision(2)
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << " s\n"
+                  << std::defaultfloat;
+    } else {
+        tok = std::make_unique<CharTokenizer>(text);
+    }
+    const std::vector<int> ids = tok->encode(text);
     const std::size_t split = ids.size() * 9 / 10;
-    const GPTConfig cfg = textModelConfig(tok.vocabSize());
-    const Dataset train = makeNextTokenDataset(std::vector<int>(ids.begin(), ids.begin() + static_cast<long>(split)),
-                                               cfg.contextLength);
-    const Dataset val = makeNextTokenDataset(std::vector<int>(ids.begin() + static_cast<long>(split), ids.end()),
-                                             cfg.contextLength);
-    std::cout << path << ": " << ids.size() << " characters, vocabulary " << tok.vocabSize() << ", "
-              << train.x.rows() << " training / " << val.x.rows() << " validation sequences of "
-              << cfg.contextLength << "\n";
+    const std::vector<int> trainIds(ids.begin(), ids.begin() + static_cast<long>(split));
+    const std::vector<int> valIds(ids.begin() + static_cast<long>(split), ids.end());
+    // Loss per character makes runs with different tokenizers comparable.
+    const double tokensPerChar = static_cast<double>(valIds.size()) / static_cast<double>(tok->decode(valIds).size());
+
+    const GPTConfig cfg = textModelConfig(tok->vocabSize());
+    const Dataset train = makeNextTokenDataset(trainIds, cfg.contextLength);
+    const Dataset val = makeNextTokenDataset(valIds, cfg.contextLength);
+    std::cout << path << ": " << text.size() << " characters -> " << ids.size() << " tokens ("
+              << std::setprecision(3) << 1.0 / tokensPerChar << std::defaultfloat << " chars/token), vocabulary "
+              << tok->vocabSize() << ", " << train.x.rows() << " training / " << val.x.rows()
+              << " validation sequences of " << cfg.contextLength << " tokens\n";
 
     Network net;
     buildGPT(net, cfg);
@@ -352,30 +392,35 @@ int runGpt(const std::string& path, std::size_t epochs) {
     opts.validationX = &val.x;
     opts.validationY = &val.y;
     const std::string prompt(1, text[0]);
-    opts.onEpochEnd = [&](const EpochStats&) { printSample(net, tok, prompt, 300, cfg.contextLength); };
+    opts.onEpochEnd = [&](const EpochStats& s) {
+        std::cout << "validation loss per character: " << std::fixed << std::setprecision(4)
+                  << s.validationLoss * tokensPerChar << std::defaultfloat << '\n';
+        printSample(net, *tok, prompt, 300 / (tokenizerKind == "bpe" ? 2 : 1), cfg.contextLength);
+    };
     const auto start = std::chrono::steady_clock::now();
     net.fit(train.x, train.y, loss, optimizer, opts);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
-    const std::string weights = gptWeightsPath(path);
-    net.save(weights);
+    net.save(gptWeightsPath(path));
+    saveTokenizer(path, *tok);
     std::cout << "trained in " << std::fixed << std::setprecision(1) << seconds << " s ("
               << seconds / static_cast<double>(epochs) << " s/epoch, incl. samples)\n" << std::defaultfloat
-              << "weights saved to " << weights << "\ngenerate more with: NeuraCraft generate " << path
-              << " \"PROMPT\" 500\n";
+              << "weights saved to " << gptWeightsPath(path) << ", tokenizer to " << gptTokenizerPath(path)
+              << "\ngenerate more with: NeuraCraft generate " << path << " \"PROMPT\" 500\n";
     return 0;
 }
 
 int runGenerate(const std::string& path, const std::string& prompt, std::size_t length) {
     std::string text;
+    std::unique_ptr<Tokenizer> tok;
     try {
         text = loadText(path);
+        tok = loadTokenizer(path, text);
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 2;
     }
-    const CharTokenizer tok(text);  // same text -> same vocabulary as in training
-    const GPTConfig cfg = textModelConfig(tok.vocabSize());
+    const GPTConfig cfg = textModelConfig(tok->vocabSize());
     Network net;
     buildGPT(net, cfg);
     try {
@@ -386,7 +431,7 @@ int runGenerate(const std::string& path, const std::string& prompt, std::size_t 
     }
     std::vector<int> promptIds;
     try {
-        promptIds = tok.encode(prompt.empty() ? std::string(1, text[0]) : prompt);
+        promptIds = tok->encode(prompt.empty() ? std::string(1, text[0]) : prompt);
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 2;
@@ -394,7 +439,8 @@ int runGenerate(const std::string& path, const std::string& prompt, std::size_t 
     SamplingOptions sampling;
     sampling.temperature = 0.8f;
     sampling.topK = 20;
-    std::cout << prompt << tok.decode(generate(net, promptIds, length, cfg.contextLength, sampling)) << '\n';
+    // `length` counts tokens; with BPE a token is ~2 characters.
+    std::cout << prompt << tok->decode(generate(net, promptIds, length, cfg.contextLength, sampling)) << '\n';
     return 0;
 }
 
@@ -464,8 +510,8 @@ void usage() {
               << "                               train on MNIST IDX files in <dir>, save weights\n"
               << "  NeuraCraft eval <dir> [mlp|cnn]\n"
               << "                               evaluate saved MNIST weights on the test set\n"
-              << "  NeuraCraft gpt <text-file> [epochs]\n"
-              << "                               train a character-level GPT on a text file\n"
+              << "  NeuraCraft gpt <text-file> [epochs] [bpe|char]\n"
+              << "                               train a GPT on a text file (BPE or character tokens)\n"
               << "  NeuraCraft generate <text-file> [prompt] [length]\n"
               << "                               sample text from the trained GPT\n"
               << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
@@ -533,7 +579,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
             const std::size_t epochs = args.size() > 2 ? static_cast<std::size_t>(std::strtoul(args[2].c_str(), nullptr, 10)) : 1;
-            return runGpt(args[1], epochs == 0 ? 1 : epochs);
+            return runGpt(args[1], epochs == 0 ? 1 : epochs, args.size() > 3 ? args[3] : "bpe");
         }
         if (cmd == "generate") {
             if (args.size() < 2) {

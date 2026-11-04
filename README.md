@@ -65,39 +65,47 @@ $ ./build_and_run.sh eval data/mnist cnn      # reload, per-digit accuracy, show
 | MLP 784-128-64-10 | 109 k | 3 | 97.10 % | 2.3 s |
 | CNN 16-32 conv + 128 dense | 207 k | 3 | 98.83 % | 46 s |
 
-### Language model (character-level GPT)
+### Language model (GPT)
 
 ```
-$ scripts/download_shakespeare.sh                 # data/shakespeare.txt (1.1 MB)
-$ ./build_and_run.sh gpt data/shakespeare.txt 2   # train 2 epochs, samples after each
-$ ./build_and_run.sh generate data/shakespeare.txt "ROMEO:" 400
+$ scripts/download_shakespeare.sh                     # data/shakespeare.txt (1.1 MB)
+$ ./build_and_run.sh gpt data/shakespeare.txt 2       # BPE tokens (default)
+$ ./build_and_run.sh gpt data/shakespeare.txt 2 char  # character tokens
+$ ./build_and_run.sh generate data/shakespeare.txt "ROMEO:" 200
 ```
 
-`gpt` trains a 4-layer, 4-head, 128-dim decoder (context 64, ~0.8 M
-parameters) on any text file, prints a sample after every epoch and saves
-`<file>.gpt.weights`; `generate` reloads it and samples with temperature 0.8,
-top-k 20.
+`gpt` trains a 4-layer, 4-head, 128-dim decoder (context 64 tokens) on any
+text file, prints a sample after every epoch and saves `<file>.gpt.weights`
+plus `<file>.gpt.tokenizer`; `generate` reloads both and samples with
+temperature 0.8, top-k 20. The default tokenizer is byte-level BPE with 512
+tokens (learned from the file in under a second); `char` uses one token per
+character. Validation loss is also reported per character, so the two are
+comparable.
 
-Reference run on Tiny Shakespeare (2-core x86 sandbox, ~4 min per epoch):
-validation loss 2.12 after epoch 1 and **1.91 after epoch 2**. The output
-already has the play's structure (speaker names, verse lines), with
-Shakespeare-flavoured but mostly invented words. More epochs, a longer context
-or a wider model improve it; on Apple silicon the Accelerate backend makes
-epochs much faster.
+Tiny Shakespeare, 2 epochs, 2-core x86 sandbox:
+
+| tokenizer | chars / token | parameters | time | val loss per character |
+|---|---:|---:|---:|---:|
+| char (65) | 1.00 | 0.82 M | 487 s | 1.911 |
+| BPE (512) | 1.92 | 0.93 M | **259 s** | **1.817** |
+
+BPE sees about twice as much text in the same 64-token context and needs half
+the steps per epoch, so it is both better and faster here. Samples already
+have the play's structure (speaker names, verse lines) with partly invented
+words; more epochs or a wider model improve them:
 
 ```
-ROMEO:
-And the lay lords were give?
+JULIET:
+O, I belure you'er frilince, beless, they are. Venount?
 
-FLORE:
-You my my fall muter, rethis drove your with mer;
-It the him fatery of me chould the might.
+QUEEN MARGARET:
+Whoppleack, Vposed, he is hered armporire.
 ```
 
 Building one yourself:
 
 ```cpp
-CharTokenizer tok(text);
+BpeTokenizer tok = BpeTokenizer::train(text, 512);    // or CharTokenizer tok(text);
 Dataset d = makeNextTokenDataset(tok.encode(text), 64);  // x, y: (sequences x 64) ids
 
 GPTConfig cfg;
@@ -198,7 +206,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Layers | `Dense.h`, `Activations.h`, `Conv.h` | `Dense` (Xavier / He / zero init), `Conv2D` (stride, padding; im2col + GEMM), `MaxPool2D`, `ReLU`, `LeakyReLU`, `Sigmoid`, `Tanh`, `Softmax`, `Dropout` |
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
 | Transformer | `Transformer.h` | `TokenEmbedding` (token + learned positions), `LayerNorm`, `GELU`, multi-head `CausalSelfAttention`, `Residual` blocks, `buildGPT()` |
-| Text | `Text.h` | `CharTokenizer`, `makeNextTokenDataset`, `generate()` (temperature, top-k) |
+| Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay) |
 | Network | `Network.h` | `add<Layer>(...)`, `fit` (mini-batches, shuffling, validation, accuracy, callbacks), `predict`, `evaluate`, `accuracy`, `summary`, `save` / `load` |
 | Data | `Data.h` | One-hot / argmax, train/test split, standardization, CSV load/save, MNIST IDX loader, XOR / spiral / sine generators |

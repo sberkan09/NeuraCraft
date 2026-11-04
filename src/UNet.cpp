@@ -780,28 +780,25 @@ Matrix slerp(const Matrix& a, const Matrix& b, double t) {
     return out;
 }
 
-// Per-channel mean and standard deviation transfer: keeps feedback loops from
-// drifting towards over-saturated colours.
+// Per-channel histogram matching to a reference picture: keeps feedback loops
+// from drifting towards over-saturated or shifted colours.
 void matchColors(Image& image, const Image& reference) {
-    const std::size_t C = image.channels, n = image.width * image.height;
+    const std::size_t C = image.channels, n = image.width * image.height, m = reference.width * reference.height;
     for (std::size_t c = 0; c < C; ++c) {
-        double s[2] = {0, 0}, q[2] = {0, 0};
-        const Image* imgs[2] = {&image, &reference};
-        for (int k = 0; k < 2; ++k) {
-            const std::size_t m = imgs[k]->width * imgs[k]->height;
-            for (std::size_t i = 0; i < m; ++i) {
-                const double v = imgs[k]->pixels[i * C + c];
-                s[k] += v;
-                q[k] += v * v;
-            }
-            s[k] /= static_cast<double>(m);
-            q[k] = std::sqrt(std::max(q[k] / static_cast<double>(m) - s[k] * s[k], 1e-6));
+        double hi[256] = {}, hr[256] = {};
+        for (std::size_t i = 0; i < n; ++i) hi[image.pixels[i * C + c]] += 1.0 / static_cast<double>(n);
+        for (std::size_t i = 0; i < m; ++i) hr[reference.pixels[i * C + c]] += 1.0 / static_cast<double>(m);
+        // Map each level to the reference level at the same cumulative fraction (mid-bin).
+        std::vector<std::uint8_t> map(256);
+        double ci = 0, cr = hr[0];
+        int r = 0;
+        for (int v = 0; v < 256; ++v) {
+            const double target = ci + hi[v] / 2;
+            ci += hi[v];
+            while (r < 255 && cr < target) cr += hr[++r];
+            map[v] = static_cast<std::uint8_t>(r);
         }
-        const double gain = q[1] / q[0];
-        for (std::size_t i = 0; i < n; ++i) {
-            const double v = (image.pixels[i * C + c] - s[0]) * gain + s[1];
-            image.pixels[i * C + c] = static_cast<std::uint8_t>(std::lround(std::min(255.0, std::max(0.0, v))));
-        }
+        for (std::size_t i = 0; i < n; ++i) image.pixels[i * C + c] = map[image.pixels[i * C + c]];
     }
 }
 

@@ -15,6 +15,8 @@
 //                              run pretrained GPT-2 weights (scripts/download_gpt2.sh)
 //   NeuraCraft llama <dir> [prompt] [tokens] [options]
 //                              run a Llama-family checkpoint (scripts/download_llama32.sh, download_tinyllama.sh)
+//   NeuraCraft txt2img <dir> "prompt" [out.png] [--steps N] [--seed S] [--size N] [--width W --height H]
+//                              text to image with Stable Diffusion / SD-Turbo (scripts/download_sd_turbo.sh)
 //   NeuraCraft vae <dir> [in.ppm] [out.png] [--size N]
 //                              Stable Diffusion VAE round trip (scripts/download_sd_turbo.sh)
 //   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
@@ -941,6 +943,8 @@ void usage() {
               << "  NeuraCraft llama <dir> [prompt] [tokens] [--chat | -i] [--system S] [--fp32] [--check]\n"
               << "                 [--greedy | --temperature T] [--top-k K] [--top-p P] [--repeat-penalty R] [--seed N]\n"
               << "                               Llama 3.x / TinyLlama / Mistral, int8 by default (scripts/download_llama32.sh)\n"
+              << "  NeuraCraft txt2img <dir> \"prompt\" [out.png] [--steps N] [--seed S] [--size N] [--guidance G --negative N]\n"
+              << "                               text to image with Stable Diffusion (SD-Turbo: 1-4 steps)\n"
               << "  NeuraCraft vae <dir> [in.ppm] [out.png] [--size N]\n"
               << "                               encode and decode an image with Stable Diffusion's VAE\n"
               << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
@@ -1072,6 +1076,48 @@ int main(int argc, char** argv) {
                 }
             }
             return runGpt2(args[1], prompt, tokens, sampling, check, int8);
+        }
+        if (cmd == "txt2img") {
+            if (args.size() < 3) {
+                usage();
+                return 2;
+            }
+            TextToImageOptions o;
+            std::string output = "txt2img.png";
+            for (std::size_t i = 3; i < args.size(); ++i) {
+                const std::string& a = args[i];
+                auto value = [&]() -> std::string {
+                    if (i + 1 >= args.size()) throw std::invalid_argument(a + " needs a value");
+                    return args[++i];
+                };
+                if (a == "--steps") o.steps = std::stoul(value());
+                else if (a == "--seed") o.seed = static_cast<unsigned>(std::stoul(value()));
+                else if (a == "--size") o.width = o.height = std::stoul(value());
+                else if (a == "--width") o.width = std::stoul(value());
+                else if (a == "--height") o.height = std::stoul(value());
+                else if (a == "--guidance") o.guidance = std::stof(value());
+                else if (a == "--negative") o.negativePrompt = value();
+                else if (a.rfind("--", 0) != 0) output = a;
+                else {
+                    std::cerr << "unknown txt2img option: " << a << "\n";
+                    return 2;
+                }
+            }
+            o.progress = [](const std::string& stage, double seconds) {
+                std::cerr << "  " << stage << ": " << std::fixed << std::setprecision(1) << seconds << " s" << std::defaultfloat << '\n';
+            };
+            const auto start = std::chrono::steady_clock::now();
+            try {
+                const Image img = textToImage(args[1], args[2], o);
+                savePng(output, img);
+            } catch (const std::exception& e) {
+                std::cerr << e.what() << "\ndownload SD-Turbo with: scripts/download_sd_turbo.sh " << args[1] << '\n';
+                return 2;
+            }
+            std::cout << "wrote " << output << " (" << o.width << "x" << o.height << ", " << o.steps << " step" << (o.steps == 1 ? "" : "s")
+                      << ", seed " << o.seed << ") in " << std::fixed << std::setprecision(1)
+                      << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() << " s" << std::defaultfloat << '\n';
+            return 0;
         }
         if (cmd == "vae") {
             if (args.size() < 2) {

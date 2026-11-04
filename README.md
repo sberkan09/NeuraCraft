@@ -87,7 +87,7 @@ Tiny Shakespeare, 2 epochs, 2-core x86 sandbox:
 | tokenizer | chars / token | parameters | time | val loss per character |
 |---|---:|---:|---:|---:|
 | char (65) | 1.00 | 0.82 M | 487 s | 1.911 |
-| BPE (512) | 1.92 | 0.93 M | **259 s** (172 s after the CPU fixes below) | **1.817** |
+| BPE (512) | 1.92 | 0.93 M | **259 s** (one epoch now takes 86 s, see Performance) | **1.817** |
 
 BPE sees about twice as much text in the same 64-token context and needs half
 the steps per epoch, so it is both better and faster here.

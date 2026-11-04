@@ -1,47 +1,29 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Builds NeuraCraft (incrementally) and runs the demo binary.
+# Any arguments are passed to the binary, e.g.:
+#   ./build_and_run.sh            # xor + spiral + sine demos
+#   ./build_and_run.sh spiral
+#   ./build_and_run.sh mnist data/mnist 5
+#   ./build_and_run.sh --test     # build and run the test suite instead
+set -euo pipefail
+
+cd "$(dirname "$0")"
 
 BUILD_DIRECTORY="./build"
-BINARY_DIRECTORY="./bin"
-SOURCE_DIRECTORY="./src"
-BINARY_PATH="$BINARY_DIRECTORY/NeuraCraft"
+BINARY_PATH="./bin/NeuraCraft"
 
-function check_modified() {
-    if [ ! -f "$BINARY_PATH" ]; then
-        return 0
-    fi
-
-    local build_time=$(stat -c "%Y" "$BINARY_PATH")
-
-    for file in $(find $SOURCE_DIRECTORY -name '*.cpp' -or -name '*.h'); do
-        local file_time=$(stat -c "%Y" "$file")
-        if [ "$file_time" -gt "$build_time" ]; then
-            return 0
-        fi
-    done
-
-    return 1
-}
-
-if check_modified; then
-    echo "Source files have been modified, building..."
-
-    if [ ! -d "$BUILD_DIRECTORY" ]; then
-        mkdir "$BUILD_DIRECTORY"
-    else
-        rm -r "$BUILD_DIRECTORY"
-        mkdir "$BUILD_DIRECTORY"
-    fi
-
-    cd "$BUILD_DIRECTORY"
-    cmake ..
-    make
-    cd ..
+if command -v nproc >/dev/null 2>&1; then
+    JOBS=$(nproc)
 else
-    echo "No source files modified, skipping build..."
+    JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 2)
 fi
 
-if [ -f "$BINARY_PATH" ]; then
-    ./"$BINARY_PATH"
-else
-    echo "Executable not found: $BINARY_PATH"
+cmake -S . -B "$BUILD_DIRECTORY" -DCMAKE_BUILD_TYPE=Release >/dev/null
+cmake --build "$BUILD_DIRECTORY" --parallel "$JOBS"
+
+if [ "${1:-}" = "--test" ]; then
+    ctest --test-dir "$BUILD_DIRECTORY" --output-on-failure
+    exit $?
 fi
+
+exec "$BINARY_PATH" "$@"

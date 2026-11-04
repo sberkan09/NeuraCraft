@@ -1,26 +1,39 @@
 #ifndef LAYER_H
 #define LAYER_H
 
-#include <vector>
-#include <string>
+#include "Matrix.h"
 
+#include <string>
+#include <vector>
+
+namespace nc {
+
+// A trainable tensor and the gradient accumulated for it by backward().
+struct Param {
+    Matrix* value;
+    Matrix* grad;
+};
+
+// Base class for every layer. Inputs/outputs are (batch x features) matrices.
+//
+// forward() caches whatever backward() needs. backward() receives dL/d(output),
+// stores dL/d(param) in each parameter's grad, and returns dL/d(input) so the
+// gradient can flow to the previous layer.
 class Layer {
 public:
-    Layer(int input_size, int output_size);
+    virtual ~Layer() = default;
 
-    std::vector<float> forward(const std::vector<float>& input_data);
-    std::pair<std::vector<float>, std::string> backward(const std::vector<float>& dloss, const std::string& prev_layer_type);
-    void printWeight();
+    virtual Matrix forward(const Matrix& input, bool training) = 0;
+    virtual Matrix backward(const Matrix& gradOutput) = 0;
 
-private:
-    int input_size;
-    int output_size;
-    int iterations;
-    std::string layer_type;
-    std::vector<float> bias;
-    std::vector<std::vector<float>> weights;
-    std::vector<float> inputs;
-    std::vector<float> output;
+    virtual std::vector<Param> parameters() { return {}; }
+    virtual std::string name() const = 0;
+    // Human-readable description, e.g. "Dense(784 -> 128)".
+    virtual std::string describe() const { return name(); }
+    // Number of output features for a given number of input features.
+    virtual std::size_t outputSize(std::size_t inputSize) const { return inputSize; }
 };
+
+} // namespace nc
 
 #endif // LAYER_H

@@ -17,6 +17,8 @@
 //                              run a Llama-family checkpoint (scripts/download_llama32.sh, download_tinyllama.sh)
 //   NeuraCraft txt2img <dir> "prompt" [out.png] [--steps N] [--seed S] [--size N] [--width W --height H]
 //                              text to image with Stable Diffusion / SD-Turbo (scripts/download_sd_turbo.sh)
+//   NeuraCraft img2img <dir> in.png "prompt" [out.png] [--strength S] [--steps N] ...
+//                              image to image
 //   NeuraCraft vae <dir> [in.ppm] [out.png] [--size N]
 //                              Stable Diffusion VAE round trip (scripts/download_sd_turbo.sh)
 //   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
@@ -944,7 +946,9 @@ void usage() {
               << "                 [--greedy | --temperature T] [--top-k K] [--top-p P] [--repeat-penalty R] [--seed N]\n"
               << "                               Llama 3.x / TinyLlama / Mistral, int8 by default (scripts/download_llama32.sh)\n"
               << "  NeuraCraft txt2img <dir> \"prompt\" [out.png] [--steps N] [--seed S] [--size N] [--guidance G --negative N]\n"
-              << "                 [--tiny-vae <taesd dir>]\n"
+              << "                 [--tiny-vae <taesd dir>] [--fp32]\n"
+              << "  NeuraCraft img2img <dir> in.png \"prompt\" [out.png] [--strength S] [--steps N] [--seed S] [--size N] ...\n"
+              << "                               image to image (input: PNG or PPM, cropped to the size)\n"
               << "                               text to image with Stable Diffusion (SD-Turbo: 1-4 steps)\n"
               << "  NeuraCraft vae <dir> [in.ppm] [out.png] [--size N]\n"
               << "                               encode and decode an image with Stable Diffusion's VAE\n"
@@ -1078,14 +1082,17 @@ int main(int argc, char** argv) {
             }
             return runGpt2(args[1], prompt, tokens, sampling, check, int8);
         }
-        if (cmd == "txt2img") {
-            if (args.size() < 3) {
+        if (cmd == "txt2img" || cmd == "img2img") {
+            const bool img2img = cmd == "img2img";
+            if (args.size() < (img2img ? 4u : 3u)) {
                 usage();
                 return 2;
             }
             TextToImageOptions o;
-            std::string output = "txt2img.png";
-            for (std::size_t i = 3; i < args.size(); ++i) {
+            if (img2img) o.steps = 2;  // SD-Turbo's image-to-image setting: 2 steps at strength 0.5
+            std::string output = img2img ? "img2img.png" : "txt2img.png";
+            const std::string prompt = args[img2img ? 3 : 2];
+            for (std::size_t i = img2img ? 4 : 3; i < args.size(); ++i) {
                 const std::string& a = args[i];
                 auto value = [&]() -> std::string {
                     if (i + 1 >= args.size()) throw std::invalid_argument(a + " needs a value");
@@ -1100,6 +1107,7 @@ int main(int argc, char** argv) {
                 else if (a == "--negative") o.negativePrompt = value();
                 else if (a == "--tiny-vae") o.tinyVae = value();
                 else if (a == "--int8") o.int8 = true;
+                else if (a == "--strength") o.strength = std::stof(value());
                 else if (a == "--fp32") o.int8 = false;
                 else if (a.rfind("--", 0) != 0) output = a;
                 else {
@@ -1112,7 +1120,7 @@ int main(int argc, char** argv) {
             };
             const auto start = std::chrono::steady_clock::now();
             try {
-                const Image img = textToImage(args[1], args[2], o);
+                const Image img = img2img ? imageToImage(args[1], loadImage(args[2]), prompt, o) : textToImage(args[1], prompt, o);
                 savePng(output, img);
             } catch (const std::exception& e) {
                 std::cerr << e.what() << "\ndownload SD-Turbo with: scripts/download_sd_turbo.sh " << args[1] << '\n';

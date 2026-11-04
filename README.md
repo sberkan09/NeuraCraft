@@ -295,6 +295,7 @@ $ scripts/download_sd_turbo.sh data/sd-turbo                  # SD-Turbo, fp16 (
 $ ./build_and_run.sh txt2img data/sd-turbo "A cinematic photo of a red fox sitting in the snow, golden hour" fox.png --seed 42
 $ ./build_and_run.sh txt2img data/sd-turbo "The Istanbul skyline at sunset, oil painting" ist.png --steps 2 --seed 7
 $ ./build_and_run.sh txt2img data/sd-turbo "A watercolor lighthouse" l.png --tiny-vae data/sd-turbo/taesd   # 10x faster decode
+$ ./build_and_run.sh img2img data/sd-turbo fox.png "a white arctic fox in the snow" arctic.png --tiny-vae data/sd-turbo/taesd
 $ ./build_and_run.sh vae data/sd-turbo photo.ppm out.png      # the autoencoder alone: encode + decode
 ```
 
@@ -316,6 +317,20 @@ against float32, no visible difference) at 40 % of the memory:
 | UNet: load / one denoising step | 14.5 s / 14.5 s | **8.5 s / 12.2 s** |
 | TAESD decode (full VAE: 50 s) | 5.4 s | 5.4 s |
 | total for one image (1 step) | 39 s | **33 s** |
+
+**Image to image** (`imageToImage()`, `img2img`): the input (PNG or PPM) is
+cropped and resized to the output size, encoded, noised to the sigma of step
+`steps - steps * strength` and denoised for the remaining steps with the
+prompt, as diffusers does; SD-Turbo's setting is 2 steps at strength 0.5, one
+UNet pass. Below, the fox picture turned into an arctic fox (48 s, TAESD):
+
+<p><img src="docs/images/sd_turbo_img2img.jpg" width="520"></p>
+
+The PNG reader has its own inflate (stored, fixed and dynamic Huffman blocks)
+and handles grey, grey + alpha, RGB, RGBA and palette images (1- to 16-bit);
+it decodes Pillow's files of all those kinds to identical pixels.
+`resizeImage()` (bilinear, box-filtered when shrinking) and `fitImage()`
+(centred crop to the aspect ratio) prepare inputs.
 
 Pieces, each checked against an independent NumPy implementation (`scripts/`):
 
@@ -351,7 +366,7 @@ Pieces, each checked against an independent NumPy implementation (`scripts/`):
 The full VAE decoder (~2.5 TFLOP at 512 x 512) is the slowest stage on a CPU;
 on Apple silicon the products go to Accelerate. Loading got faster with a
 tiled, parallel `Matrix::transpose` (0.3 -> 1.2 GB/s; UNet load 28 -> 16 s).
-Next: image-to-image, GPU convolutions.
+Next: GPU convolutions, then video.
 
 ## Performance and devices
 
@@ -445,7 +460,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
 | Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE with Llama 3 scaling, grouped-query attention, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
 | Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales; integer AVX-VNNI / AVX2 / NEON products, expanded-tile GEMM for many rows), `Network::quantize()` for Dense, Conv2D, attention and embeddings (shared with tied outputs), `setInt8Inputs` |
-| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG / PPM files, `loadVae()`, `loadTinyVae()` (TAESD), `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` / `textToLatent()` / `decodeLatent()` |
+| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG (read / write) and PPM files, `resizeImage` / `fitImage`, `loadVae()`, `loadTinyVae()` (TAESD), `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` / `textToLatent()` / `decodeLatent()` / `imageToImage()` |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
 | Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k, top-p, repetition penalty, streaming callback, stop tokens), `Generator` (multi-turn, KV cache kept between calls) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |
@@ -506,7 +521,10 @@ multi-head attention against a naive one, the timestep embedding, the Euler
 scheduler against diffusers' values, a synthetic UNet (text and time
 conditioning), TAESD (layer layout and value ranges), int8 convolutions (both
 paths, strided and 1x1) and int8 UNet / CLIP loading against float, and the
-whole text-to-image pipeline on tiny synthetic models, with either decoder. CI runs
+whole text-to-image pipeline on tiny synthetic models, with either decoder,
+the PNG reader on embedded Pillow / zlib files (all three deflate block kinds,
+palette with transparency, 16-bit), resizing and cropping, and image to image
+(strength picks the number of steps). CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
 kernels).
 

@@ -1,6 +1,7 @@
 // NeuraCraft unit tests. Dependency-free: a tiny TEST/CHECK harness below.
 #include "NeuraCraft.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -2491,6 +2492,77 @@ TEST(tiny_vae_loader_layers_and_value_ranges) {
     std::filesystem::remove_all(dir);
 }
 
+namespace {
+// Small PNGs written by Pillow / zlib (dynamic and fixed Huffman, adaptive and Paeth filters,
+// a 4-bit palette with transparency, 16-bit grey) and their decoded pixels.
+const std::vector<std::uint8_t> kPngRgb = {137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 9, 0, 0, 0, 7, 8, 2, 0, 0, 0, 85, 249, 240, 55, 0, 0, 0, 130, 73, 68, 65, 84, 120, 218, 37, 201, 43, 14, 195, 48, 16, 69, 209, 231, 220, 137, 10, 134, 15, 179, 84, 171, 170, 82, 96, 30, 238, 85, 116, 255, 219, 240, 175, 160, 135, 158, 36, 83, 78, 202, 93, 249, 161, 60, 148, 167, 242, 161, 188, 149, 77, 198, 71, 12, 7, 167, 59, 135, 51, 29, 28, 156, 229, 198, 83, 152, 51, 130, 29, 164, 224, 12, 122, 160, 96, 133, 241, 18, 56, 10, 118, 65, 133, 163, 144, 10, 171, 160, 98, 92, 34, 57, 4, 171, 48, 42, 103, 37, 85, 70, 69, 95, 227, 18, 211, 177, 96, 255, 239, 102, 52, 184, 73, 183, 241, 22, 56, 43, 152, 133, 179, 162, 70, 111, 172, 134, 181, 31, 51, 151, 33, 127, 151, 45, 48, 117, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130};
+const std::vector<std::uint8_t> kPngRgbPixels = {0, 4, 0, 29, 5, 0, 58, 0, 0, 87, 7, 0, 116, 3, 0, 145, 0, 0, 174, 2, 0, 203, 1, 0, 232, 5, 0, 3, 44, 0, 32, 40, 11, 61, 43, 22, 90, 38, 33, 119, 40, 44, 148, 37, 55, 177, 40, 66, 206, 43, 77, 235, 41, 88, 6, 76, 0, 35, 80, 22, 64, 76, 44, 93, 75, 66, 122, 76, 88, 151, 81, 110, 180, 76, 132, 209, 76, 154, 238, 74, 176, 9, 111, 0, 38, 114, 33, 67, 114, 66, 96, 113, 99, 125, 113, 132, 154, 115, 165, 183, 116, 198, 212, 114, 231, 241, 114, 8, 12, 150, 0, 41, 151, 44, 70, 154, 88, 99, 152, 132, 128, 148, 176, 157, 153, 220, 186, 154, 8, 215, 150, 52, 244, 150, 96, 15, 189, 0, 44, 186, 55, 73, 190, 110, 102, 189, 165, 131, 185, 220, 160, 190, 19, 189, 186, 74, 218, 189, 129, 247, 190, 184, 18, 226, 0, 47, 229, 66, 76, 227, 132, 105, 224, 198, 134, 229, 8, 163, 229, 74, 192, 224, 140, 221, 222, 206, 250, 226, 16};
+const std::vector<std::uint8_t> kPngPalette = {137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 6, 0, 0, 0, 5, 4, 3, 0, 0, 0, 148, 118, 128, 213, 0, 0, 0, 48, 80, 76, 84, 69, 0, 37, 74, 111, 148, 185, 222, 3, 40, 77, 114, 151, 188, 225, 6, 43, 80, 117, 154, 191, 228, 9, 46, 83, 120, 157, 194, 231, 12, 49, 86, 123, 160, 197, 234, 15, 52, 89, 126, 163, 200, 237, 18, 55, 92, 129, 166, 203, 118, 58, 233, 232, 0, 0, 0, 4, 116, 82, 78, 83, 255, 255, 255, 0, 64, 42, 169, 244, 0, 0, 0, 15, 73, 68, 65, 84, 120, 94, 99, 100, 84, 82, 98, 82, 66, 197, 0, 17, 241, 1, 231, 122, 177, 125, 227, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130};
+const std::vector<std::uint8_t> kPngPalettePixels = {0, 37, 74, 255, 111, 148, 185, 255, 222, 3, 40, 255, 77, 114, 151, 0, 188, 225, 6, 255, 43, 80, 117, 255, 222, 3, 40, 255, 77, 114, 151, 0, 188, 225, 6, 255, 43, 80, 117, 255, 154, 191, 228, 255, 9, 46, 83, 255, 188, 225, 6, 255, 43, 80, 117, 255, 154, 191, 228, 255, 9, 46, 83, 255, 120, 157, 194, 255, 231, 12, 49, 255, 154, 191, 228, 255, 9, 46, 83, 255, 120, 157, 194, 255, 231, 12, 49, 255, 86, 123, 160, 255, 197, 234, 15, 255, 120, 157, 194, 255, 231, 12, 49, 255, 86, 123, 160, 255, 197, 234, 15, 255, 52, 89, 126, 255, 163, 200, 237, 255};
+const std::vector<std::uint8_t> kPngGrey16 = {137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 5, 0, 0, 0, 4, 16, 0, 0, 0, 0, 51, 200, 118, 223, 0, 0, 0, 41, 73, 68, 65, 84, 120, 94, 99, 100, 96, 48, 58, 97, 12, 134, 44, 76, 123, 152, 247, 48, 159, 96, 62, 193, 116, 130, 5, 198, 96, 222, 195, 194, 188, 135, 233, 4, 211, 9, 144, 0, 0, 76, 118, 15, 145, 189, 200, 133, 255, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130};
+const std::vector<std::uint8_t> kPngGrey16Pixels = {0, 50, 101, 152, 203, 2, 53, 104, 155, 205, 5, 56, 107, 157, 208, 8, 58, 109, 160, 211};
+const std::vector<std::uint8_t> kPngFixedPaeth = {137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 8, 0, 0, 0, 6, 8, 2, 0, 0, 0, 113, 103, 72, 172, 0, 0, 0, 42, 73, 68, 65, 84, 120, 1, 99, 97, 96, 248, 47, 207, 248, 70, 158, 249, 141, 60, 235, 27, 121, 246, 55, 242, 156, 111, 228, 185, 223, 200, 243, 190, 97, 97, 103, 252, 142, 21, 209, 67, 2, 0, 37, 114, 48, 110, 150, 138, 15, 224, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130};
+const std::vector<std::uint8_t> kPngFixedPaethPixels = {0, 0, 255, 31, 1, 235, 62, 4, 215, 93, 9, 195, 124, 16, 175, 155, 25, 155, 186, 36, 135, 217, 49, 115, 7, 1, 246, 38, 2, 226, 69, 5, 206, 100, 10, 186, 131, 17, 166, 162, 26, 146, 193, 37, 126, 224, 50, 106, 14, 2, 237, 45, 3, 217, 76, 6, 197, 107, 11, 177, 138, 18, 157, 169, 27, 137, 200, 38, 117, 231, 51, 97, 21, 3, 228, 52, 4, 208, 83, 7, 188, 114, 12, 168, 145, 19, 148, 176, 28, 128, 207, 39, 108, 238, 52, 88, 28, 4, 219, 59, 5, 199, 90, 8, 179, 121, 13, 159, 152, 20, 139, 183, 29, 119, 214, 40, 99, 245, 53, 79, 35, 5, 210, 66, 6, 190, 97, 9, 170, 128, 14, 150, 159, 21, 130, 190, 30, 110, 221, 41, 90, 252, 54, 70};
+
+
+Image pngFromBytes(const std::vector<std::uint8_t>& bytes) {
+    const std::string path = tempPath("fixture.png");
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    Image img = loadImage(path);
+    std::filesystem::remove(path);
+    return img;
+}
+} // namespace
+
+TEST(png_reader_and_image_resizing) {
+    const Image rgb = pngFromBytes(kPngRgb);
+    CHECK(rgb.width == 9 && rgb.height == 7 && rgb.channels == 3 && rgb.pixels == kPngRgbPixels);
+    const Image pal = pngFromBytes(kPngPalette);
+    CHECK(pal.width == 6 && pal.height == 5 && pal.channels == 4 && pal.pixels == kPngPalettePixels);
+    const Image g16 = pngFromBytes(kPngGrey16);
+    CHECK(g16.channels == 1 && g16.pixels == kPngGrey16Pixels);
+    const Image fixed = pngFromBytes(kPngFixedPaeth);
+    CHECK(fixed.width == 8 && fixed.height == 6 && fixed.pixels == kPngFixedPaethPixels);
+    // Our own writer round-trips through the reader; PPM goes through loadImage too.
+    const std::string path = tempPath("rt.png");
+    savePng(path, rgb);
+    CHECK(loadImage(path).pixels == rgb.pixels);
+    std::ofstream(path) << "not an image";
+    CHECK_THROWS(loadImage(path), std::runtime_error);
+    std::filesystem::remove(path);
+
+    // toRgb composites alpha over white and expands grey.
+    Image ga;
+    ga.width = 2;
+    ga.height = 1;
+    ga.channels = 2;
+    ga.pixels = {0, 255, 0, 0};  // black opaque, black transparent
+    CHECK(toRgb(ga).pixels == std::vector<std::uint8_t>({0, 0, 0, 255, 255, 255}));
+    // resizeImage: bilinear upsampling of a 2x1 ramp, identity at the same size, box filter when shrinking a lot.
+    Image ramp;
+    ramp.width = 2;
+    ramp.height = 1;
+    ramp.channels = 1;
+    ramp.pixels = {0, 200};
+    CHECK(resizeImage(ramp, 4, 1).pixels == std::vector<std::uint8_t>({0, 50, 150, 200}));
+    CHECK(resizeImage(rgb, 9, 7).pixels == rgb.pixels);
+    Image checker;
+    checker.width = checker.height = 16;
+    checker.channels = 1;
+    for (std::size_t i = 0; i < 256; ++i) checker.pixels.push_back((i % 16 + i / 16) % 2 ? 255 : 0);
+    for (std::uint8_t v : resizeImage(checker, 4, 4).pixels) CHECK(v >= 126 && v <= 129);  // averages, no aliasing
+    // fitImage: centred crop to the aspect ratio, then resize.
+    Image wide;
+    wide.width = 30;
+    wide.height = 10;
+    wide.channels = 1;
+    for (std::size_t y = 0; y < 10; ++y)
+        for (std::size_t x = 0; x < 30; ++x) wide.pixels.push_back(x < 10 || x >= 20 ? 0 : 255);  // white middle third
+    const Image square = fitImage(wide, 10, 10);
+    CHECK(square.width == 10 && square.height == 10);
+    for (std::uint8_t v : square.pixels) CHECK(v == 255);
+}
+
 TEST(text_to_image_pipeline_runs_end_to_end) {
     // Tokenizer, text encoder, UNet, VAE and scheduler, all tiny, in one diffusers directory.
     setSeed(98);
@@ -2567,6 +2639,26 @@ TEST(text_to_image_pipeline_runs_end_to_end) {
     o.progress = [&](const std::string& s, double) { stages.push_back(s); };
     const Image tiny = textToImage(dir, "hello he", o);
     CHECK(tiny.width == 64 && tiny.height == 128 && stages.back() == "taesd decode");
+    // Image to image: strength picks how many of the steps run; 0 only encodes and decodes.
+    Image input;
+    input.width = 100;
+    input.height = 150;
+    input.channels = 3;
+    for (std::size_t i = 0; i < 100 * 150 * 3; ++i) input.pixels.push_back(static_cast<std::uint8_t>(i * 13 % 256));
+    o.steps = 4;
+    for (float strength : {0.0f, 0.5f, 1.0f}) {
+        o.strength = strength;
+        stages.clear();
+        const Image out = imageToImage(dir, input, "hello he", o);
+        CHECK(out.width == 64 && out.height == 128);
+        const std::size_t steps = static_cast<std::size_t>(std::count_if(stages.begin(), stages.end(), [](const std::string& s) {
+            return s.rfind("step ", 0) == 0;
+        }));
+        CHECK(steps == static_cast<std::size_t>(4 * strength));
+        CHECK(stages.front() == "taesd encode" && stages.back() == "taesd decode");
+    }
+    o.strength = 1.5f;
+    CHECK_THROWS(imageToImage(dir, input, "hello", o), std::invalid_argument);
     o.progress = nullptr;
     o.width = 60;
     CHECK_THROWS(textToImage(dir, "hello", o), std::invalid_argument);

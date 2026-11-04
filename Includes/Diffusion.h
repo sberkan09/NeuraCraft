@@ -131,6 +131,7 @@ struct TextToImageOptions {
     std::string negativePrompt;             // used with guidance > 1
     std::string tinyVae;                    // TAESD directory: decode with it instead of the full VAE
     bool int8 = true;                       // int8 UNet and text encoder weights (false: float32)
+    float strength = 0.5f;                  // image to image: how much of the schedule runs (0 keeps the input)
     std::function<void(const std::string& stage, double seconds)> progress;  // after each stage / step
 };
 
@@ -144,6 +145,12 @@ Image textToImage(const std::string& directory, const std::string& prompt, const
 Matrix textToLatent(const std::string& directory, const std::string& prompt, const TextToImageOptions& options = {});
 // ... and the last: decode it with the full VAE of `directory`, or with the TAESD in options.tinyVae.
 Image decodeLatent(const std::string& directory, const Matrix& latent, const TextToImageOptions& options = {});
+// Image to image: the input is cropped / resized to width x height, encoded
+// (TAESD encoder with options.tinyVae, else the full VAE), noised to the
+// sigma of step steps - steps * strength, and denoised for the remaining
+// steps with the prompt (SD-Turbo: steps 2, strength 0.5 = one step).
+Image imageToImage(const std::string& directory, const Image& input, const std::string& prompt,
+                   const TextToImageOptions& options = {});
 
 } // namespace nc
 

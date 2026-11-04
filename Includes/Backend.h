@@ -1,6 +1,8 @@
 #ifndef NEURACRAFT_BACKEND_H
 #define NEURACRAFT_BACKEND_H
 
+#include "Matrix.h"
+
 #include <cstddef>
 #include <string>
 
@@ -32,6 +34,11 @@ std::size_t gpuMinWork();
 void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
           const float* A, std::size_t lda, const float* B, std::size_t ldb,
           float* C, std::size_t ldc, bool accumulate = false);
+
+// C = op(A) * op(B) for whole matrices (C must already be M x N). This is what
+// Matrix products use: same dispatch as gemm(), and on the GPU page-backed
+// matrices (Matrix::pageBacked) are mapped in place instead of copied.
+void matmul(const Matrix& a, bool transA, const Matrix& b, bool transB, Matrix& c);
 
 // Direct access to each implementation (used by tests and benchmarks).
 void gemmCpu(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,

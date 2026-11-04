@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <new>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -34,7 +36,42 @@ Matrix::Matrix(std::initializer_list<std::initializer_list<float>> values) {
     }
 }
 
-Matrix::Matrix(std::size_t rows, std::size_t cols, std::vector<float> data)
+namespace detail {
+
+std::size_t storageBytesFor(std::size_t bytes) {
+    if (bytes < kPageBackedBytes) return bytes;
+    return (bytes + kStoragePage - 1) / kStoragePage * kStoragePage;
+}
+
+void* allocateStorage(std::size_t bytes) {
+    void* p = nullptr;
+#ifdef _WIN32
+    p = _aligned_malloc(std::max<std::size_t>(1, storageBytesFor(bytes)), bytes >= kPageBackedBytes ? kStoragePage : 64);
+#else
+    if (bytes >= kPageBackedBytes) {
+        if (posix_memalign(&p, kStoragePage, storageBytesFor(bytes)) != 0) p = nullptr;
+    } else {
+        p = std::malloc(std::max<std::size_t>(1, bytes));
+    }
+#endif
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+
+void freeStorage(void* p) noexcept {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
+
+} // namespace detail
+
+Matrix::Matrix(std::size_t rows, std::size_t cols, const std::vector<float>& data)
+    : Matrix(rows, cols, FloatVector(data.begin(), data.end())) {}
+
+Matrix::Matrix(std::size_t rows, std::size_t cols, FloatVector data)
     : rows_(rows), cols_(cols), data_(std::move(data)) {
     if (data_.size() != rows_ * cols_) {
         throw std::invalid_argument("Matrix: data size does not match " + shapeOf(rows, cols));
@@ -102,8 +139,7 @@ Matrix Matrix::operator*(const Matrix& rhs) const {
                                     " * " + shapeOf(rhs.rows_, rhs.cols_));
     }
     Matrix result(rows_, rhs.cols_);
-    gemm(false, false, rows_, rhs.cols_, cols_, data_.data(), cols_, rhs.data_.data(), rhs.cols_,
-         result.data_.data(), rhs.cols_);
+    nc::matmul(*this, false, rhs, false, result);
     return result;
 }
 
@@ -114,8 +150,7 @@ Matrix Matrix::transposeMatmul(const Matrix& rhs) const {
                                     "^T * " + shapeOf(rhs.rows_, rhs.cols_));
     }
     Matrix result(cols_, rhs.cols_);
-    gemm(true, false, cols_, rhs.cols_, rows_, data_.data(), cols_, rhs.data_.data(), rhs.cols_,
-         result.data_.data(), rhs.cols_);
+    nc::matmul(*this, true, rhs, false, result);
     return result;
 }
 
@@ -126,8 +161,7 @@ Matrix Matrix::matmulTranspose(const Matrix& rhs) const {
                                     " * " + shapeOf(rhs.rows_, rhs.cols_) + "^T");
     }
     Matrix result(rows_, rhs.rows_);
-    gemm(false, true, rows_, rhs.rows_, cols_, data_.data(), cols_, rhs.data_.data(), rhs.cols_,
-         result.data_.data(), rhs.rows_);
+    nc::matmul(*this, false, rhs, true, result);
     return result;
 }
 
@@ -241,8 +275,8 @@ Matrix Matrix::gatherRows(const std::vector<std::size_t>& indices) const {
 
 Matrix Matrix::sliceRows(std::size_t begin, std::size_t end) const {
     if (begin > end || end > rows_) throw std::out_of_range("Matrix sliceRows range out of bounds");
-    return Matrix(end - begin, cols_,
-                  std::vector<float>(data_.begin() + begin * cols_, data_.begin() + end * cols_));
+    return Matrix(end - begin, cols_, FloatVector(data_.begin() + static_cast<long>(begin * cols_),
+                                                  data_.begin() + static_cast<long>(end * cols_)));
 }
 
 float Matrix::sum() const {

@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -898,6 +899,42 @@ TEST(gpu_device_trains_same_as_cpu) {
     if (!gpuAvailable()) return;
     const float gpu = train(Device::GPU);
     CHECK_NEAR(cpu, gpu, 1e-3);
+}
+
+TEST(matrix_storage_is_page_backed_when_large) {
+    const Matrix small(4, 4);
+    CHECK(!small.pageBacked());
+    const Matrix large(128, 256);  // 128 KB
+    CHECK(large.pageBacked());
+    CHECK(reinterpret_cast<std::uintptr_t>(large.data()) % kStoragePage == 0);
+    CHECK(large.storageBytes() % kStoragePage == 0 && large.storageBytes() >= large.size() * sizeof(float));
+    const Matrix copy = large;
+    CHECK(reinterpret_cast<std::uintptr_t>(copy.data()) % kStoragePage == 0);
+    const Matrix fromVector(2, 2, std::vector<float>{1, 2, 3, 4});
+    CHECK(fromVector.approxEquals(Matrix{{1, 2}, {3, 4}}));
+}
+
+TEST(gpu_zero_copy_matmul_matches_cpu) {
+    if (!gpuAvailable()) return;
+    setSeed(42);
+    const std::size_t saved = gpuMinWork();
+    setGpuMinWork(1);
+    for (int ta = 0; ta < 2; ++ta)
+        for (int tb = 0; tb < 2; ++tb) {
+            // Large enough to be page-backed; ragged sizes exercise tile edges.
+            const std::size_t M = 150, N = 133, K = 270;
+            const Matrix a = ta ? Matrix::uniform(K, M, -1, 1) : Matrix::uniform(M, K, -1, 1);
+            const Matrix b = tb ? Matrix::uniform(N, K, -1, 1) : Matrix::uniform(K, N, -1, 1);
+            CHECK(a.pageBacked() && b.pageBacked());
+            Matrix cpu(M, N), gpu(M, N);
+            setDevice(Device::CPU);
+            matmul(a, ta, b, tb, cpu);
+            setDevice(Device::GPU);
+            matmul(a, ta, b, tb, gpu);
+            setDevice(Device::CPU);
+            CHECK(gpu.approxEquals(cpu, 1e-3f));
+        }
+    setGpuMinWork(saved);
 }
 
 TEST(matrix_products_independent_of_thread_count) {

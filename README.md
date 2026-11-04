@@ -87,7 +87,7 @@ Tiny Shakespeare, 2 epochs, 2-core x86 sandbox:
 | tokenizer | chars / token | parameters | time | val loss per character |
 |---|---:|---:|---:|---:|
 | char (65) | 1.00 | 0.82 M | 487 s | 1.911 |
-| BPE (512) | 1.92 | 0.93 M | **259 s** | **1.817** |
+| BPE (512) | 1.92 | 0.93 M | **259 s** (one epoch now takes 86 s, see Performance) | **1.817** |
 
 BPE sees about twice as much text in the same 64-token context and needs half
 the steps per epoch, so it is both better and faster here.
@@ -163,6 +163,10 @@ Measured matrix-multiply throughput (GFLOPS, square n×n):
 | 256 | 12.4 | 35 | 91 |
 | 1024 | 8.4 | 45 | 108 |
 | 2048 | – | 44 | 119 |
+
+For the GPT demo (many products with a transposed operand), packing those
+operands with sequential reads plus caching GELU's `tanh` cut a training epoch
+from 129.5 s to 85.9 s (−34 %) with identical losses.
 
 `build_and_run.sh` builds with `NEURACRAFT_NATIVE=ON` (all instructions the CPU
 supports); plain CMake builds stay portable unless you pass

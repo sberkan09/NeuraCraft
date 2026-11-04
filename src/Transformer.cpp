@@ -167,22 +167,30 @@ constexpr float kGeluA = 0.044715f;
 
 Matrix GELU::forward(const Matrix& input, bool) {
     input_ = input;
+    tanh_ = Matrix(input.rows(), input.cols());
     Matrix out(input.rows(), input.cols());
-    for (std::size_t i = 0; i < input.size(); ++i) {
-        const float x = input.data()[i];
-        out.data()[i] = 0.5f * x * (1.0f + std::tanh(kGeluC * (x + kGeluA * x * x * x)));
-    }
+    parallelFor(0, input.size(), 16384, [&](std::size_t i0, std::size_t i1) {
+        for (std::size_t i = i0; i < i1; ++i) {
+            const float x = input.data()[i];
+            const float t = std::tanh(kGeluC * (x + kGeluA * x * x * x));
+            tanh_.data()[i] = t;
+            out.data()[i] = 0.5f * x * (1.0f + t);
+        }
+    });
     return out;
 }
 
 Matrix GELU::backward(const Matrix& gradOutput) {
+    if (!gradOutput.sameShape(tanh_)) throw std::invalid_argument("GELU::backward: gradient shape does not match the last forward");
     Matrix grad(gradOutput);
-    for (std::size_t i = 0; i < grad.size(); ++i) {
-        const float x = input_.data()[i];
-        const float t = std::tanh(kGeluC * (x + kGeluA * x * x * x));
-        const float dt = (1.0f - t * t) * kGeluC * (1.0f + 3.0f * kGeluA * x * x);
-        grad.data()[i] *= 0.5f * (1.0f + t) + 0.5f * x * dt;
-    }
+    parallelFor(0, grad.size(), 16384, [&](std::size_t i0, std::size_t i1) {
+        for (std::size_t i = i0; i < i1; ++i) {
+            const float x = input_.data()[i];
+            const float t = tanh_.data()[i];
+            const float dt = (1.0f - t * t) * kGeluC * (1.0f + 3.0f * kGeluA * x * x);
+            grad.data()[i] *= 0.5f * (1.0f + t) + 0.5f * x * dt;
+        }
+    });
     return grad;
 }
 

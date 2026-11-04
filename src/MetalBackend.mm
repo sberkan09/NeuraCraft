@@ -265,7 +265,8 @@ std::string kernelName() { return context().useSimd ? "simdgroup" : "tiled"; }
 
 void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
           const float* A, std::size_t lda, const float* B, std::size_t ldb,
-          float* C, std::size_t ldc, bool accumulate) {
+          float* C, std::size_t ldc, bool accumulate,
+          std::size_t aMapBytes, std::size_t bMapBytes, std::size_t cMapBytes) {
     Context& ctx = context();
     if (!ctx.ok) throw std::runtime_error("Metal unavailable: " + ctx.error);
     if (M == 0 || N == 0) return;
@@ -275,7 +276,9 @@ void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
         return;
     }
 
-    GemmParams params{to32(M), to32(N), to32(K), to32(lda), to32(ldb), to32(N),
+    // C can be written in place only when it is dense (ldc == N).
+    const bool mapC = cMapBytes > 0 && ldc == N;
+    GemmParams params{to32(M), to32(N), to32(K), to32(lda), to32(ldb), to32(mapC ? ldc : N),
                       transA ? 1u : 0u, transB ? 1u : 0u, accumulate ? 1u : 0u};
     // Bytes actually spanned by each strided operand.
     const std::size_t aRows = transA ? K : M, aCols = transA ? M : K;
@@ -284,16 +287,37 @@ void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
     const std::size_t bBytes = ((bRows - 1) * ldb + bCols) * sizeof(float);
     const std::size_t cBytes = M * N * sizeof(float);
 
+    // Wraps page-aligned host memory without copying (unified memory), or copies.
+    auto input = [&](const float* p, std::size_t bytes, std::size_t mapBytes) -> id<MTLBuffer> {
+        if (mapBytes >= bytes && mapBytes > 0) {
+            id<MTLBuffer> b = [ctx.device newBufferWithBytesNoCopy:const_cast<float*>(p)
+                                                            length:mapBytes
+                                                           options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+            if (b != nil) return b;
+        }
+        return [ctx.device newBufferWithBytes:p length:bytes options:MTLResourceStorageModeShared];
+    };
+
     std::string failure;
     @autoreleasepool {
-        id<MTLBuffer> bufA = [ctx.device newBufferWithBytes:A length:aBytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufB = [ctx.device newBufferWithBytes:B length:bBytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufC = [ctx.device newBufferWithLength:cBytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bufA = input(A, aBytes, aMapBytes);
+        id<MTLBuffer> bufB = input(B, bBytes, bMapBytes);
+        id<MTLBuffer> bufC = nil;
+        bool inPlace = false;
+        if (mapC && cMapBytes >= cBytes) {
+            bufC = [ctx.device newBufferWithBytesNoCopy:C length:cMapBytes options:MTLResourceStorageModeShared deallocator:nil];
+            inPlace = bufC != nil;
+        }
+        if (!inPlace) {
+            bufC = [ctx.device newBufferWithLength:cBytes options:MTLResourceStorageModeShared];
+            params.ldc = to32(N);
+        }
         if (bufA == nil || bufB == nil || bufC == nil) {
             failure = "could not allocate GPU buffers";
         } else {
             float* out = static_cast<float*>([bufC contents]);
-            if (accumulate)
+            if (accumulate && !inPlace)
                 for (std::size_t i = 0; i < M; ++i) std::memcpy(out + i * N, C + i * ldc, N * sizeof(float));
 
             id<MTLCommandBuffer> cb = [ctx.queue commandBuffer];
@@ -318,7 +342,7 @@ void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
                 NSError* err = [cb error];
                 failure = std::string("command buffer failed: ") +
                           (err ? [[err localizedDescription] UTF8String] : "unknown error");
-            } else {
+            } else if (!inPlace) {
                 for (std::size_t i = 0; i < M; ++i) std::memcpy(C + i * ldc, out + i * N, N * sizeof(float));
             }
         }

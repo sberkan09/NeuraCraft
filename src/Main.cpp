@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <iomanip>
 #include <iostream>
@@ -450,18 +451,15 @@ int runGenerate(const std::string& path, const std::string& prompt, std::size_t 
     return 0;
 }
 
-// Times one backend on an n x n x n product; returns GFLOPS.
-double timeGemm(void (*fn)(bool, bool, std::size_t, std::size_t, std::size_t, const float*, std::size_t,
-                           const float*, std::size_t, float*, std::size_t, bool),
-                const Matrix& a, const Matrix& b, Matrix& c) {
-    const std::size_t n = a.rows();
-    fn(false, false, n, n, n, a.data(), n, b.data(), n, c.data(), n, false);  // warm-up
+// Times `run` (one n x n x n product); returns GFLOPS.
+double timeGemm(std::size_t n, const std::function<void()>& run) {
+    run();  // warm-up
     const double flops = 2.0 * static_cast<double>(n) * n * n;
     int reps = 0;
     const auto start = std::chrono::steady_clock::now();
     double elapsed = 0.0;
     do {
-        fn(false, false, n, n, n, a.data(), n, b.data(), n, c.data(), n, false);
+        run();
         ++reps;
         elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     } while (elapsed < 0.25);
@@ -473,19 +471,24 @@ int runBench(bool quick) {
     std::cout << "CPU backend: " << cpuBackendName() << ", " << threadCount() << " threads\n"
               << "GPU: " << (gpuAvailable() ? gpuName() + " (Metal)" : std::string("not available")) << "\n\n";
 
-    struct Backend {
-        const char* name;
-        void (*fn)(bool, bool, std::size_t, std::size_t, std::size_t, const float*, std::size_t, const float*,
-                   std::size_t, float*, std::size_t, bool);
+    using RawGemm = void (*)(bool, bool, std::size_t, std::size_t, std::size_t, const float*, std::size_t,
+                             const float*, std::size_t, float*, std::size_t, bool);
+    struct Column {
+        std::string name;
+        RawGemm raw;        // raw-pointer implementation, or
+        bool gpuMatmul;     // Matrix-level GPU path (page-backed operands mapped in place)
     };
-    std::vector<Backend> backends{{"blocked", gemmBlocked}};
-    if (cpuBackendName() != "NeuraCraft blocked kernel") backends.push_back({"accelerate", gemmCpu});
-    if (gpuAvailable()) backends.push_back({"metal", gemmGpu});
+    std::vector<Column> columns{{"blocked", gemmBlocked, false}};
+    if (cpuBackendName() != "NeuraCraft blocked kernel") columns.push_back({"accelerate", gemmCpu, false});
+    if (gpuAvailable()) {
+        columns.push_back({"metal copy", gemmGpu, false});
+        columns.push_back({"metal 0-copy", nullptr, true});
+    }
 
     const std::vector<std::size_t> sizes = quick ? std::vector<std::size_t>{64, 129}
                                                  : std::vector<std::size_t>{128, 256, 512, 1024, 2048};
     std::cout << "     n";
-    for (const auto& be : backends) std::cout << std::setw(14) << be.name;
+    for (const auto& col : columns) std::cout << std::setw(14) << col.name;
     std::cout << "   (GFLOPS)\n";
 
     int mismatches = 0;
@@ -494,9 +497,20 @@ int runBench(bool quick) {
         Matrix expected(n, n);
         gemmBlocked(false, false, n, n, n, a.data(), n, b.data(), n, expected.data(), n, false);
         std::cout << std::setw(6) << n;
-        for (const auto& be : backends) {
+        for (const auto& col : columns) {
             Matrix c(n, n);
-            const double gflops = timeGemm(be.fn, a, b, c);
+            double gflops = 0.0;
+            if (col.gpuMatmul) {
+                const Device savedDevice = currentDevice();
+                const std::size_t savedMin = gpuMinWork();
+                setDevice(Device::GPU);
+                setGpuMinWork(0);
+                gflops = timeGemm(n, [&] { matmul(a, false, b, false, c); });
+                setGpuMinWork(savedMin);
+                setDevice(savedDevice);
+            } else {
+                gflops = timeGemm(n, [&] { col.raw(false, false, n, n, n, a.data(), n, b.data(), n, c.data(), n, false); });
+            }
             const bool ok = c.approxEquals(expected, 1e-3f * static_cast<float>(n));
             mismatches += !ok;
             std::cout << std::setw(13) << std::fixed << std::setprecision(1) << gflops << (ok ? ' ' : '!');

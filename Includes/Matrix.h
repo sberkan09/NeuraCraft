@@ -9,13 +9,42 @@
 
 namespace nc {
 
+// Matrix storage. Buffers of at least kPageBackedBytes are page-aligned and
+// padded to whole pages, so on Apple silicon the Metal backend can hand them
+// to the GPU in place (unified memory, no copies). Smaller ones use malloc.
+constexpr std::size_t kStoragePage = 16384;          // Apple silicon page size (a multiple of 4 KB)
+constexpr std::size_t kPageBackedBytes = 64 * 1024;
+
+namespace detail {
+void* allocateStorage(std::size_t bytes);
+void freeStorage(void* p) noexcept;
+std::size_t storageBytesFor(std::size_t bytes);  // bytes actually reserved for a request
+} // namespace detail
+
+template <typename T>
+struct StorageAllocator {
+    using value_type = T;
+    StorageAllocator() noexcept = default;
+    template <typename U>
+    StorageAllocator(const StorageAllocator<U>&) noexcept {}
+    T* allocate(std::size_t n) { return static_cast<T*>(detail::allocateStorage(n * sizeof(T))); }
+    void deallocate(T* p, std::size_t) noexcept { detail::freeStorage(p); }
+};
+template <typename T, typename U>
+bool operator==(const StorageAllocator<T>&, const StorageAllocator<U>&) noexcept { return true; }
+template <typename T, typename U>
+bool operator!=(const StorageAllocator<T>&, const StorageAllocator<U>&) noexcept { return false; }
+
+using FloatVector = std::vector<float, StorageAllocator<float>>;
+
 // Dense, row-major float matrix. A batch of samples is stored one sample per row.
 class Matrix {
 public:
     Matrix() = default;
     Matrix(std::size_t rows, std::size_t cols, float fill = 0.0f);
     Matrix(std::initializer_list<std::initializer_list<float>> values);
-    Matrix(std::size_t rows, std::size_t cols, std::vector<float> data);
+    Matrix(std::size_t rows, std::size_t cols, const std::vector<float>& data);
+    Matrix(std::size_t rows, std::size_t cols, FloatVector data);
 
     static Matrix zeros(std::size_t rows, std::size_t cols);
     static Matrix ones(std::size_t rows, std::size_t cols);
@@ -29,8 +58,12 @@ public:
 
     float* data() { return data_.data(); }
     const float* data() const { return data_.data(); }
-    std::vector<float>& values() { return data_; }
-    const std::vector<float>& values() const { return data_; }
+    FloatVector& values() { return data_; }
+    const FloatVector& values() const { return data_; }
+    // True when the storage is page-aligned and padded (see kPageBackedBytes);
+    // storageBytes() is then the page-rounded size that may be mapped.
+    bool pageBacked() const { return data_.capacity() * sizeof(float) >= kPageBackedBytes; }
+    std::size_t storageBytes() const { return detail::storageBytesFor(data_.capacity() * sizeof(float)); }
 
     // Unchecked element access.
     float& operator()(std::size_t r, std::size_t c) { return data_[r * cols_ + c]; }
@@ -95,7 +128,7 @@ public:
 private:
     std::size_t rows_ = 0;
     std::size_t cols_ = 0;
-    std::vector<float> data_;
+    FloatVector data_;
 
     void requireSameShape(const Matrix& other, const char* op) const;
 };

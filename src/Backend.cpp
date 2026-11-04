@@ -295,6 +295,24 @@ void gemmGpu(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t
 #endif
 }
 
+void matmul(const Matrix& a, bool transA, const Matrix& b, bool transB, Matrix& c) {
+    const std::size_t M = transA ? a.cols() : a.rows();
+    const std::size_t K = transA ? a.rows() : a.cols();
+    const std::size_t N = transB ? b.rows() : b.cols();
+    if ((transB ? b.cols() : b.rows()) != K || c.rows() != M || c.cols() != N)
+        throw std::invalid_argument("matmul: shape mismatch");
+    if (M == 0 || N == 0) return;
+#ifdef NEURACRAFT_HAS_METAL
+    if (currentDevice() == Device::GPU && M * N * K >= gpuMinWork() && K > 0 && metal::available()) {
+        metal::gemm(transA, transB, M, N, K, a.data(), a.cols(), b.data(), b.cols(), c.data(), N, false,
+                    a.pageBacked() ? a.storageBytes() : 0, b.pageBacked() ? b.storageBytes() : 0,
+                    c.pageBacked() ? c.storageBytes() : 0);
+        return;
+    }
+#endif
+    gemm(transA, transB, M, N, K, a.data(), a.cols(), b.data(), b.cols(), c.data(), N, false);
+}
+
 void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
           const float* A, std::size_t lda, const float* B, std::size_t ldb,
           float* C, std::size_t ldc, bool accumulate) {

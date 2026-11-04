@@ -18,7 +18,10 @@ struct ImageShape {
 };
 
 // 2-D convolution (cross-correlation) with square kernels, implemented as
-// im2col + one GEMM per batch, so it runs on whichever backend is active.
+// im2col + GEMM, so it runs on whichever backend is active. Training keeps the
+// whole im2col matrix for backward; inference works in strips of output rows
+// (bounded memory, output written in place in channel-major order), and 1x1
+// convolutions are a single GEMM on the image itself.
 class Conv2D : public Layer {
 public:
     Conv2D(ImageShape input, std::size_t outChannels, std::size_t kernelSize,
@@ -37,7 +40,11 @@ public:
     Matrix& weights() { return weights_; }
     Matrix& bias() { return bias_; }
 
+    std::size_t kernelSize() const { return kernel_; }
+
 private:
+    Matrix forwardInference(const Matrix& input) const;
+
     ImageShape in_;
     std::size_t outChannels_, kernel_, stride_, padding_, outH_, outW_;
     Matrix weights_, bias_, weightGrad_, biasGrad_;

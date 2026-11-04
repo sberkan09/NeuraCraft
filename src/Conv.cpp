@@ -1,10 +1,13 @@
 #include "Conv.h"
+#include "Backend.h"
 #include "Parallel.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace nc {
 
@@ -35,6 +38,7 @@ Conv2D::Conv2D(ImageShape input, std::size_t outChannels, std::size_t kernelSize
     outW_ = (in_.width + 2 * padding - kernelSize) / stride + 1;
 
     const std::size_t fanIn = in_.channels * kernelSize * kernelSize;
+    if (SkipParameterInit::active()) return;  // a loader assigns the parameters
     switch (init) {
     case Init::He:
         weights_ = Matrix::normal(fanIn, outChannels, 0.0f, std::sqrt(2.0f / static_cast<float>(fanIn)));
@@ -54,8 +58,64 @@ Conv2D::Conv2D(ImageShape input, std::size_t outChannels, std::size_t kernelSize
     biasGrad_ = Matrix(1, outChannels);
 }
 
-Matrix Conv2D::forward(const Matrix& input, bool) {
+Matrix Conv2D::forwardInference(const Matrix& input) const {
+    const std::size_t B = input.rows(), P = outH_ * outW_, C = in_.channels, H = in_.height, W = in_.width;
+    const std::size_t patch = C * kernel_ * kernel_;
+    Matrix out(B, outChannels_ * P);
+    for (std::size_t b = 0; b < B; ++b) {
+        const float* img = input.data() + b * input.cols();
+        float* dst = out.data() + b * out.cols();
+        if (kernel_ == 1 && stride_ == 1 && padding_ == 0) {
+            // The image already is a (C x HW) matrix: out = W^T x image.
+            gemm(true, false, outChannels_, P, C, weights_.data(), outChannels_, img, P, dst, P, false);
+        } else {
+            // Strips of output rows: columns (patch x strip positions), then
+            // out[:, strip] = W^T x columns, written straight into place.
+            const std::size_t budget = std::size_t(1) << 23;  // floats per strip of columns (32 MB)
+            const std::size_t rows = std::max<std::size_t>(1, std::min(outH_, budget / std::max<std::size_t>(1, patch * outW_)));
+            std::vector<float> cols(patch * rows * outW_);
+            for (std::size_t oy0 = 0; oy0 < outH_; oy0 += rows) {
+                const std::size_t oy1 = std::min(outH_, oy0 + rows), n = (oy1 - oy0) * outW_;
+                parallelFor(0, patch, 8, [&](std::size_t r0, std::size_t r1) {
+                    for (std::size_t r = r0; r < r1; ++r) {
+                        const std::size_t c = r / (kernel_ * kernel_), ky = r / kernel_ % kernel_, kx = r % kernel_;
+                        float* row = cols.data() + r * n;
+                        for (std::size_t oy = oy0; oy < oy1; ++oy) {
+                            const long iy = static_cast<long>(oy * stride_ + ky) - static_cast<long>(padding_);
+                            float* o = row + (oy - oy0) * outW_;
+                            if (iy < 0 || iy >= static_cast<long>(H)) {
+                                std::fill(o, o + outW_, 0.0f);
+                                continue;
+                            }
+                            const float* src = img + (c * H + static_cast<std::size_t>(iy)) * W;
+                            for (std::size_t ox = 0; ox < outW_; ++ox) {
+                                const long ix = static_cast<long>(ox * stride_ + kx) - static_cast<long>(padding_);
+                                o[ox] = ix >= 0 && ix < static_cast<long>(W) ? src[ix] : 0.0f;
+                            }
+                        }
+                    }
+                });
+                gemm(true, false, outChannels_, n, patch, weights_.data(), outChannels_, cols.data(), n, dst + oy0 * outW_, P,
+                     false);
+            }
+        }
+        parallelFor(0, outChannels_, 4, [&](std::size_t c0, std::size_t c1) {
+            for (std::size_t oc = c0; oc < c1; ++oc) {
+                const float bias = bias_(0, oc);
+                float* plane = dst + oc * P;
+                for (std::size_t p = 0; p < P; ++p) plane[p] += bias;
+            }
+        });
+    }
+    return out;
+}
+
+Matrix Conv2D::forward(const Matrix& input, bool training) {
     checkInput(input, in_, "Conv2D");
+    if (!training) {
+        columns_ = Matrix();  // nothing kept for backward
+        return forwardInference(input);
+    }
     batch_ = input.rows();
     const std::size_t positions = outH_ * outW_;
     const std::size_t patch = in_.channels * kernel_ * kernel_;

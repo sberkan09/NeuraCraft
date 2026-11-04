@@ -529,7 +529,7 @@ void EulerScheduler::step(std::size_t i, const Matrix& noise, Matrix& latent) co
 
 // ---- Text to image -------------------------------------------------------------------------
 
-Image textToImage(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
+Matrix textToLatent(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
     using Clock = std::chrono::steady_clock;
     auto report = [&](const std::string& stage, Clock::time_point start) {
         if (o.progress) o.progress(stage, std::chrono::duration<double>(Clock::now() - start).count());
@@ -583,11 +583,29 @@ Image textToImage(const std::string& dir, const std::string& prompt, const TextT
             report("step " + std::to_string(i + 1) + "/" + std::to_string(sched.timesteps.size()), t);
         }
     }
-    auto t = Clock::now();
-    Vae vae = loadVae(dir, o.width, o.height, false, true);
-    const Matrix img = vae.decode(latent);
-    report("vae decode", t);
-    return tensorToImage(img.data(), vae.image);
+    return latent;
+}
+
+Image decodeLatent(const std::string& dir, const Matrix& latent, const TextToImageOptions& o) {
+    const auto t = std::chrono::steady_clock::now();
+    Matrix img;
+    ImageShape shape;
+    if (!o.tinyVae.empty()) {
+        TinyVae vae = loadTinyVae(o.tinyVae, o.width, o.height, false, true);
+        img = vae.decode(latent);
+        shape = vae.image;
+    } else {
+        Vae vae = loadVae(dir, o.width, o.height, false, true);
+        img = vae.decode(latent);
+        shape = vae.image;
+    }
+    if (o.progress) o.progress(o.tinyVae.empty() ? "vae decode" : "taesd decode",
+                               std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count());
+    return tensorToImage(img.data(), shape);
+}
+
+Image textToImage(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
+    return decodeLatent(dir, textToLatent(dir, prompt, o), o);
 }
 
 } // namespace nc

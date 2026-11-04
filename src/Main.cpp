@@ -944,6 +944,7 @@ void usage() {
               << "                 [--greedy | --temperature T] [--top-k K] [--top-p P] [--repeat-penalty R] [--seed N]\n"
               << "                               Llama 3.x / TinyLlama / Mistral, int8 by default (scripts/download_llama32.sh)\n"
               << "  NeuraCraft txt2img <dir> \"prompt\" [out.png] [--steps N] [--seed S] [--size N] [--guidance G --negative N]\n"
+              << "                 [--tiny-vae <taesd dir>]\n"
               << "                               text to image with Stable Diffusion (SD-Turbo: 1-4 steps)\n"
               << "  NeuraCraft vae <dir> [in.ppm] [out.png] [--size N]\n"
               << "                               encode and decode an image with Stable Diffusion's VAE\n"
@@ -1097,6 +1098,7 @@ int main(int argc, char** argv) {
                 else if (a == "--height") o.height = std::stoul(value());
                 else if (a == "--guidance") o.guidance = std::stof(value());
                 else if (a == "--negative") o.negativePrompt = value();
+                else if (a == "--tiny-vae") o.tinyVae = value();
                 else if (a.rfind("--", 0) != 0) output = a;
                 else {
                     std::cerr << "unknown txt2img option: " << a << "\n";

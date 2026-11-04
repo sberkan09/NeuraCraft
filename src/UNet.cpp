@@ -112,6 +112,7 @@ struct Weights {
         const std::size_t out = c.outputShape().channels, patch = c.inputShape().channels * c.kernelSize() * c.kernelSize();
         c.weights() = take(p + ".weight", out, patch).transpose();
         c.bias() = take(p + ".bias", 1, out);
+        if (int8) c.quantize();
     }
     void norm(GroupNorm& g, const std::string& p, std::size_t ch) {
         g.gamma() = take(p + ".weight", 1, ch);
@@ -125,9 +126,11 @@ struct Weights {
     void linear(Dense& d, const std::string& p) {
         d.weights() = take(p + ".weight", d.outputSize(), d.inputSize()).transpose();
         d.bias() = has(p + ".bias") ? take(p + ".bias", 1, d.outputSize()) : Matrix(1, d.outputSize());
+        if (int8) d.quantize();
     }
     std::string file;
     SafeTensors st;
+    bool int8 = false;
 };
 
 struct TimeResnet {
@@ -322,7 +325,7 @@ Matrix UNet2DCondition::forward(const Matrix& latent, float timestep, const Matr
     return m.convOut->forward(h, false);
 }
 
-UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, std::size_t latentHeight) {
+UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, std::size_t latentHeight, bool int8) {
     const std::string dir = exists(directory + "/config.json") ? directory : directory + "/unet";
     const json::Value c = json::parse(readFile(dir + "/config.json"));
     std::string file = dir + "/diffusion_pytorch_model.safetensors";
@@ -382,6 +385,7 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
     m.freqShift = static_cast<float>(c.numberOr("freq_shift", 0));
     const std::size_t tembDim = 4 * ch[0];
     Weights w(file);
+    w.int8 = int8;
     SkipParameterInit skip;
 
     m.t1 = std::make_unique<Dense>(m.timeDim, tembDim);
@@ -542,7 +546,7 @@ Matrix textToLatent(const std::string& dir, const std::string& prompt, const Tex
     {
         auto t = Clock::now();
         const ClipTokenizer tok = ClipTokenizer::fromDirectory(dir + "/tokenizer");
-        ClipTextEncoder enc = loadClipTextEncoder(dir);
+        ClipTextEncoder enc = loadClipTextEncoder(dir, o.int8);
         // SD 2 / Turbo pad with "!" (id 0); SD 1.x pads with <|endoftext|>.
         int pad = tok.endOfText();
         {
@@ -563,7 +567,7 @@ Matrix textToLatent(const std::string& dir, const std::string& prompt, const Tex
     Matrix latent;
     {
         auto t = Clock::now();
-        UNet2DCondition unet = loadUNet(dir, lw, lh);
+        UNet2DCondition unet = loadUNet(dir, lw, lh, o.int8);
         report("load unet", t);
         setSeed(o.seed);
         latent = Matrix::normal(1, unet.latentShape().size(), 0.0f, 1.0f);

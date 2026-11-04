@@ -1099,6 +1099,8 @@ int main(int argc, char** argv) {
                 else if (a == "--guidance") o.guidance = std::stof(value());
                 else if (a == "--negative") o.negativePrompt = value();
                 else if (a == "--tiny-vae") o.tinyVae = value();
+                else if (a == "--int8") o.int8 = true;
+                else if (a == "--fp32") o.int8 = false;
                 else if (a.rfind("--", 0) != 0) output = a;
                 else {
                     std::cerr << "unknown txt2img option: " << a << "\n";

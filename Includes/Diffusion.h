@@ -67,8 +67,8 @@ struct ClipTextEncoder {
 
 // Loads `directory`/text_encoder (or `directory` itself): config.json plus
 // model(.fp16).safetensors. Supports hidden_act gelu (OpenCLIP, SD 2 / Turbo)
-// and quick_gelu (OpenAI CLIP, SD 1.x).
-ClipTextEncoder loadClipTextEncoder(const std::string& directory);
+// and quick_gelu (OpenAI CLIP, SD 1.x). int8 quantizes its matrices.
+ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8 = false);
 
 // Multi-head scaled dot-product attention without a mask: q (N x C), k and v
 // (M x C) -> N x C, channels split into `heads` contiguous groups. Queries go
@@ -99,13 +99,14 @@ public:
 
 private:
     std::unique_ptr<Impl> impl_;
-    friend UNet2DCondition loadUNet(const std::string&, std::size_t, std::size_t);
+    friend UNet2DCondition loadUNet(const std::string&, std::size_t, std::size_t, bool);
 };
 
 // Loads `directory`/unet (or `directory` itself): config.json plus
 // diffusion_pytorch_model(.fp16).safetensors, for latents of the given size
-// (image size / 8).
-UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, std::size_t latentHeight);
+// (image size / 8). With int8, every convolution and linear layer is
+// quantized as soon as it is loaded (about a quarter of the memory).
+UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, std::size_t latentHeight, bool int8 = false);
 
 // diffusers' EulerDiscreteScheduler (epsilon prediction; "scaled_linear" or
 // "linear" betas; "trailing", "leading" or "linspace" timestep spacing).
@@ -129,6 +130,7 @@ struct TextToImageOptions {
     float guidance = 0.0f;                  // classifier-free guidance scale; <= 1 = off (SD-Turbo)
     std::string negativePrompt;             // used with guidance > 1
     std::string tinyVae;                    // TAESD directory: decode with it instead of the full VAE
+    bool int8 = true;                       // int8 UNet and text encoder weights (false: float32)
     std::function<void(const std::string& stage, double seconds)> progress;  // after each stage / step
 };
 

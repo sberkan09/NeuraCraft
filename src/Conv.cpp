@@ -58,7 +58,69 @@ Conv2D::Conv2D(ImageShape input, std::size_t outChannels, std::size_t kernelSize
     biasGrad_ = Matrix(1, outChannels);
 }
 
+std::size_t Conv2D::quantize() {
+    if (quantized() || weights_.empty()) return 0;
+    quantized_ = QuantizedWeights::fromInOut(weights_);  // (in*k*k) x out
+    weights_ = Matrix();
+    weightGrad_ = Matrix();
+    biasGrad_ = Matrix();
+    columns_ = Matrix();
+    return 1;
+}
+
+Matrix Conv2D::forwardQuantized(const Matrix& input) const {
+    const std::size_t B = input.rows(), P = outH_ * outW_, C = in_.channels, H = in_.height, W = in_.width;
+    const std::size_t patch = C * kernel_ * kernel_;
+    if (P >= QuantizedWeights::kGemmRows) {
+        // Large maps: expand the weights to float (out x patch) once per call and take the float strip path.
+        std::vector<float> wt(outChannels_ * patch);
+        quantized_.expandRows(0, outChannels_, wt.data());
+        return stripConvolution(input, wt.data(), true);
+    }
+    Matrix out(B, outChannels_ * P);
+    // Strips of ~512 positions: their im2col rows (positions x patch) stay in cache while every weight row meets them.
+    const std::size_t rows = std::max<std::size_t>(1, std::min(outH_, 512 / std::max<std::size_t>(1, outW_)));
+    for (std::size_t b = 0; b < B; ++b) {
+        const float* img = input.data() + b * input.cols();
+        float* dst = out.data() + b * out.cols();
+        for (std::size_t oy0 = 0; oy0 < outH_; oy0 += rows) {
+            const std::size_t oy1 = std::min(outH_, oy0 + rows), n = (oy1 - oy0) * outW_;
+            Matrix cols(n, patch);
+            parallelFor(0, n, 16, [&](std::size_t p0, std::size_t p1) {
+                for (std::size_t p = p0; p < p1; ++p) {
+                    const std::size_t oy = oy0 + p / outW_, ox = p % outW_;
+                    float* row = cols.data() + p * patch;
+                    for (std::size_t c = 0; c < C; ++c)
+                        for (std::size_t ky = 0; ky < kernel_; ++ky) {
+                            const long iy = static_cast<long>(oy * stride_ + ky) - static_cast<long>(padding_);
+                            for (std::size_t kx = 0; kx < kernel_; ++kx) {
+                                const long ix = static_cast<long>(ox * stride_ + kx) - static_cast<long>(padding_);
+                                *row++ = iy >= 0 && ix >= 0 && iy < static_cast<long>(H) && ix < static_cast<long>(W)
+                                             ? img[(c * H + static_cast<std::size_t>(iy)) * W + static_cast<std::size_t>(ix)]
+                                             : 0.0f;
+                            }
+                        }
+                }
+            });
+            const Matrix y = quantized_.multiply(cols);  // n x outC
+            parallelFor(0, outChannels_, 4, [&](std::size_t c0, std::size_t c1) {
+                for (std::size_t oc = c0; oc < c1; ++oc) {
+                    const float bias = bias_(0, oc);
+                    float* plane = dst + oc * P + oy0 * outW_;
+                    for (std::size_t p = 0; p < n; ++p) plane[p] = y(p, oc) + bias;
+                }
+            });
+        }
+    }
+    return out;
+}
+
 Matrix Conv2D::forwardInference(const Matrix& input) const {
+    if (quantized()) return forwardQuantized(input);
+    return stripConvolution(input, weights_.data(), false);
+}
+
+Matrix Conv2D::stripConvolution(const Matrix& input, const float* weights, bool outByPatch) const {
     const std::size_t B = input.rows(), P = outH_ * outW_, C = in_.channels, H = in_.height, W = in_.width;
     const std::size_t patch = C * kernel_ * kernel_;
     Matrix out(B, outChannels_ * P);
@@ -67,7 +129,7 @@ Matrix Conv2D::forwardInference(const Matrix& input) const {
         float* dst = out.data() + b * out.cols();
         if (kernel_ == 1 && stride_ == 1 && padding_ == 0) {
             // The image already is a (C x HW) matrix: out = W^T x image.
-            gemm(true, false, outChannels_, P, C, weights_.data(), outChannels_, img, P, dst, P, false);
+            gemm(outByPatch ? false : true, false, outChannels_, P, C, weights, outByPatch ? C : outChannels_, img, P, dst, P, false);
         } else {
             // Strips of output rows: columns (patch x strip positions), then
             // out[:, strip] = W^T x columns, written straight into place.
@@ -95,8 +157,8 @@ Matrix Conv2D::forwardInference(const Matrix& input) const {
                         }
                     }
                 });
-                gemm(true, false, outChannels_, n, patch, weights_.data(), outChannels_, cols.data(), n, dst + oy0 * outW_, P,
-                     false);
+                gemm(outByPatch ? false : true, false, outChannels_, n, patch, weights, outByPatch ? patch : outChannels_, cols.data(), n,
+                     dst + oy0 * outW_, P, false);
             }
         }
         parallelFor(0, outChannels_, 4, [&](std::size_t c0, std::size_t c1) {
@@ -112,7 +174,7 @@ Matrix Conv2D::forwardInference(const Matrix& input) const {
 
 Matrix Conv2D::forward(const Matrix& input, bool training) {
     checkInput(input, in_, "Conv2D");
-    if (!training) {
+    if (!training || quantized()) {
         columns_ = Matrix();  // nothing kept for backward
         return forwardInference(input);
     }
@@ -158,6 +220,7 @@ Matrix Conv2D::forward(const Matrix& input, bool training) {
 }
 
 Matrix Conv2D::backward(const Matrix& gradOutput) {
+    if (quantized()) throw std::logic_error("Conv2D: quantized layers are inference-only");
     if (columns_.empty()) throw std::logic_error("Conv2D::backward called before forward");
     const std::size_t positions = outH_ * outW_;
     const std::size_t patch = in_.channels * kernel_ * kernel_;
@@ -198,6 +261,7 @@ Matrix Conv2D::backward(const Matrix& gradOutput) {
 }
 
 std::vector<Param> Conv2D::parameters() {
+    if (quantized()) return {};
     return {{&weights_, &weightGrad_}, {&bias_, &biasGrad_}};
 }
 
@@ -206,6 +270,7 @@ std::string Conv2D::describe() const {
                     std::to_string(kernel_);
     if (stride_ != 1) s += " s" + std::to_string(stride_);
     if (padding_ != 0) s += " p" + std::to_string(padding_);
+    if (quantized()) s += ", int8";
     return s + ")";
 }
 

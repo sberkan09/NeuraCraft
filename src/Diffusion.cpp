@@ -318,7 +318,7 @@ Matrix ClipTextEncoder::encode(const std::vector<int>& ids) {
     return net.predict(x);
 }
 
-ClipTextEncoder loadClipTextEncoder(const std::string& directory) {
+ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8) {
     const std::string dir = exists(directory + "/config.json") ? directory : directory + "/text_encoder";
     const json::Value c = json::parse(readFile(dir + "/config.json"));
     std::string file = dir + "/model.safetensors";
@@ -392,6 +392,7 @@ ClipTextEncoder loadClipTextEncoder(const std::string& directory) {
         lnf.beta() = load(p + "final_layer_norm.bias", 1, D);
     }
     enc.net.releaseGradients();
+    if (int8) enc.net.quantize();
     return enc;
 }
 

@@ -31,12 +31,18 @@ public:
     bool empty() const { return q_.empty(); }
     std::size_t bytes() const { return q_.size() + scale_.size() * sizeof(float); }
 
-    // x (N x in) -> N x out. The inputs are quantized too, per group of the
-    // same `group` columns (as llama.cpp's q8_0 x q8_0), so every group is an
-    // integer dot product: AVX-VNNI / AVX2 on x86, NEON dot product on ARM,
-    // plain C++ elsewhere. Each weight row is read once and applied to all N
-    // inputs while it is in cache.
+    // x (N x in) -> N x out. Up to kGemmRows rows (token-by-token generation,
+    // prompts) the inputs are quantized too, per 32 columns (as llama.cpp's
+    // q8_0 x q8_0), so every block is an integer dot product: AVX-VNNI / AVX2
+    // on x86, NEON dot product on ARM, plain C++ elsewhere; each weight row is
+    // read once and applied to all N inputs while it is in cache. With more
+    // rows (image models: thousands of pixels) tiles of weights are expanded
+    // to float and multiplied with the float GEMM, which is then faster and
+    // keeps the inputs exact.
     Matrix multiply(const Matrix& x) const;
+    static constexpr std::size_t kGemmRows = 256;
+    // Rows j0..j1 as floats, (j1 - j0) x inputs(), into dst.
+    void expandRows(std::size_t j0, std::size_t j1, float* dst) const;
     // Same product with float inputs (each weight row expanded to float):
     // slower, without the input rounding. For checks and comparisons.
     Matrix multiplyFloat(const Matrix& x) const;

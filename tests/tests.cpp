@@ -2208,6 +2208,10 @@ TEST(clip_text_encoder_matches_reference_forward) {
     CHECK(got.rows() == T && got.cols() == D);
     for (std::size_t t = 0; t < T; ++t)
         for (std::size_t j = 0; j < D; ++j) CHECK_NEAR(got(t, j), ref[t][j], 1e-4);
+    ClipTextEncoder q = loadClipTextEncoder(dir, true);  // int8: close to the reference (final states are layer-normed, ~unit scale)
+    const Matrix gq = q.encode(ids);
+    for (std::size_t t = 0; t < T; ++t)
+        for (std::size_t j = 0; j < D; ++j) CHECK_NEAR(gq(t, j), ref[t][j], 0.15);
     CHECK_THROWS(enc.encode({1, 2, 3}), std::invalid_argument);
     std::filesystem::remove_all(dir);
 }
@@ -2385,6 +2389,10 @@ TEST(unet_loader_builds_and_conditions_on_text_and_time) {
     CHECK(unet.forward(z, 999.0f, ctxA).approxEquals(a, 0.0f));      // deterministic
     CHECK(!unet.forward(z, 999.0f, ctxB).approxEquals(a, 1e-4f));    // the text matters (cross-attention)
     CHECK(!unet.forward(z, 10.0f, ctxA).approxEquals(a, 1e-4f));     // the timestep matters
+    UNet2DCondition q = loadUNet(dir, 4, 6, true);                    // int8 weights stay close to float
+    double scale = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) scale = std::max(scale, static_cast<double>(std::fabs(a.data()[i])));
+    CHECK(q.forward(z, 999.0f, ctxA).approxEquals(a, static_cast<float>(0.05 * scale)));
     CHECK_THROWS(unet.forward(Matrix(1, 5), 1.0f, ctxA), std::invalid_argument);
     CHECK_THROWS(unet.forward(z, 1.0f, Matrix(5, 7)), std::invalid_argument);
     CHECK_THROWS(loadUNet(dir, 3, 6), std::invalid_argument);  // latent sides must be multiples of 2
@@ -2433,6 +2441,31 @@ void writeTinyTaesd(const std::string& dir, bool zeroButOutputBias) {
     saveAll(dir + "/diffusion_pytorch_model.safetensors", w);
 }
 } // namespace
+
+TEST(int8_convolutions_and_large_products) {
+    setSeed(100);
+    // Small maps use the integer kernel, large ones expand weights for the float GEMM; both stay close
+    // to the float layer, and the 1x1 / strided cases too.
+    struct Case { ImageShape in; std::size_t out, k, stride, pad; };
+    for (const Case& c : {Case{{8, 6, 5}, 12, 3, 1, 1}, Case{{16, 20, 20}, 8, 3, 1, 1}, Case{{8, 24, 24}, 6, 1, 1, 0},
+                          Case{{4, 34, 34}, 5, 3, 2, 1}}) {
+        Conv2D conv(c.in, c.out, c.k, c.stride, c.pad);
+        conv.bias() = Matrix::uniform(1, c.out, -1, 1);
+        const Matrix x = Matrix::uniform(1, c.in.size(), -1, 1);
+        const Matrix ref = conv.forward(x, false);
+        CHECK(conv.quantize() == 1 && conv.quantized() && conv.parameters().empty());
+        const Matrix q = conv.forward(x, false);
+        double scale = 0;
+        for (std::size_t i = 0; i < ref.size(); ++i) scale = std::max(scale, static_cast<double>(std::fabs(ref.data()[i])));
+        CHECK(q.approxEquals(ref, static_cast<float>(0.03 * scale)));
+        CHECK(conv.describe().find("int8") != std::string::npos);
+        CHECK_THROWS(conv.backward(q), std::logic_error);
+    }
+    // QuantizedWeights: from kGemmRows rows on, the product uses expanded weights with exact inputs.
+    const QuantizedWeights w = QuantizedWeights::fromOutIn(Matrix::uniform(37, 70, -1, 1));
+    const Matrix many = Matrix::uniform(QuantizedWeights::kGemmRows + 3, 70, -1, 1);
+    CHECK(w.multiply(many).approxEquals(w.multiplyFloat(many), 1e-4f));
+}
 
 TEST(tiny_vae_loader_layers_and_value_ranges) {
     const std::string dir = tempPath("taesd_tiny");

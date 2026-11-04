@@ -252,12 +252,30 @@ const char* QuantizedWeights::kernelName() {
 #endif
 }
 
+void QuantizedWeights::expandRows(std::size_t j0, std::size_t j1, float* dst) const {
+    parallelFor(j0, j1, 8, [&](std::size_t a, std::size_t b) {
+        for (std::size_t j = a; j < b; ++j) expandRow(j, dst + (j - j0) * in_);
+    });
+}
+
 Matrix QuantizedWeights::multiply(const Matrix& x) const {
     if (x.cols() != in_)
         throw std::invalid_argument("QuantizedWeights::multiply: expected " + std::to_string(in_) + " columns, got " +
                                     std::to_string(x.cols()));
-    if (!int8Inputs()) return multiplyFloat(x);
     const std::size_t n = x.rows();
+    if (n >= kGemmRows) {
+        // Many rows: expand tiles of weight rows (at most ~2M floats each) and use the float GEMM.
+        Matrix out(n, out_);
+        const std::size_t tileRows = std::max<std::size_t>(1, std::min(out_, (std::size_t(1) << 21) / std::max<std::size_t>(1, in_)));
+        std::vector<float> tile(tileRows * in_);
+        for (std::size_t j0 = 0; j0 < out_; j0 += tileRows) {
+            const std::size_t j1 = std::min(out_, j0 + tileRows);
+            expandRows(j0, j1, tile.data());
+            gemm(false, true, n, j1 - j0, in_, x.data(), in_, tile.data(), in_, out.data() + j0, out_, false);
+        }
+        return out;
+    }
+    if (!int8Inputs()) return multiplyFloat(x);
     Matrix out(n, out_);
     if (n == 0 || out_ == 0) return out;
 

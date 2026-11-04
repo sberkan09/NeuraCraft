@@ -3,6 +3,7 @@
 
 #include "Dense.h"  // Init
 #include "Layer.h"
+#include "Quantized.h"
 
 #include <vector>
 
@@ -41,9 +42,17 @@ public:
     Matrix& bias() { return bias_; }
 
     std::size_t kernelSize() const { return kernel_; }
+    // Int8 weights for inference (integer products on im2col rows); backward
+    // then throws and parameters() lists nothing.
+    std::size_t quantize() override;
+    bool quantized() const { return !quantized_.empty(); }
 
 private:
     Matrix forwardInference(const Matrix& input) const;
+    // Strip convolution with weights either (patch x out) (outByPatch = false) or (out x patch).
+    Matrix stripConvolution(const Matrix& input, const float* weights, bool outByPatch) const;
+    Matrix forwardQuantized(const Matrix& input) const;
+    QuantizedWeights quantized_;
 
     ImageShape in_;
     std::size_t outChannels_, kernel_, stride_, padding_, outH_, outW_;

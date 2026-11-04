@@ -558,7 +558,7 @@ $ ./build_and_run.sh txt2img data/animatediff "a wooden cabin in a sunny green s
       --steps 4 --sampler lcm --lora data/loras/lcm-lora-sdv1-5.safetensors
 ```
 
-<p><img src="docs/images/inpaint_input.jpg" width="200"> <img src="docs/images/controlnet_edges.jpg" width="200"> <img src="docs/images/controlnet_result.jpg" width="200"></p>
+<p><img src="docs/images/video_i2v_input.jpg" width="200"> <img src="docs/images/controlnet_edges.jpg" width="200"> <img src="docs/images/controlnet_result.jpg" width="200"></p>
 
 A diffusers `ControlNetModel` directory loads with `loadUNet()` as a UNet
 without up blocks: the conditioning embedding turns the control picture into

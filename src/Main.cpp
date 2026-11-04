@@ -332,7 +332,7 @@ struct GptOptions {
     bool cosine = false;  // warmup + cosine decay (helps long runs; constant is better for a few epochs)
     float learningRate = 1e-3f;
     std::size_t dim = 0, layers = 0, heads = 0, context = 0;  // 0 = default / saved
-    std::string arch = "classic";  // classic (GPT-2 style) or modern (RoPE, RMSNorm, SwiGLU, tied)
+    std::string arch = "modern";  // modern (RoPE, RMSNorm, SwiGLU, tied) or classic (GPT-2 style)
 };
 constexpr std::size_t kBpeVocab = 512;
 
@@ -593,7 +593,7 @@ void usage() {
               << "  NeuraCraft eval <dir> [mlp|cnn]\n"
               << "                               evaluate saved MNIST weights on the test set\n"
               << "  NeuraCraft gpt <text-file> [epochs] [bpe|char] [--resume] [--lr X] [--cosine]\n"
-              << "                 [--arch classic|modern] [--dim N] [--layers N] [--heads N] [--context N]\n"
+              << "                 [--arch modern|classic] [--dim N] [--layers N] [--heads N] [--context N]\n"
               << "                               train a GPT on a text file (BPE or character tokens)\n"
               << "  NeuraCraft generate <text-file> [prompt] [length]\n"
               << "                               sample text from the trained GPT\n"

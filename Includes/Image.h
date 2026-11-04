@@ -178,6 +178,11 @@ Image toRgb(const Image& image);
 Image resizeImage(const Image& image, std::size_t width, std::size_t height);
 // The largest centred crop with the aspect ratio of width : height, resized to width x height.
 Image fitImage(const Image& image, std::size_t width, std::size_t height);
+// Canny edges as OpenCV's cv2.Canny(image, low, high) computes them (the
+// ControlNet canny preprocessor): grey, 3x3 Sobel, L1 gradient magnitude,
+// non-maximum suppression, hysteresis between the two thresholds. Returns a
+// 3-channel image, edges white on black.
+Image cannyEdges(const Image& image, float low = 100.0f, float high = 200.0f);
 // Affine resampling about the image centre: scale > 1 zooms in, (dx, dy)
 // shifts the content by that many pixels, angle rotates it (degrees,
 // counter-clockwise). Bilinear, edges clamped. Same size as the input.

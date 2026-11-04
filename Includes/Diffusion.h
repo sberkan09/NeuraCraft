@@ -79,6 +79,13 @@ Matrix multiHeadAttention(const Matrix& q, const Matrix& k, const Matrix& v, std
 // Sinusoidal timestep embedding (diffusers' get_timestep_embedding): 1 x dim.
 Matrix timestepEmbedding(float timestep, std::size_t dim, bool flipSinToCos = true, float freqShift = 0.0f);
 
+// What a ControlNet adds to a UNet call: one residual per down-path skip and
+// one for the mid block output (already multiplied by the conditioning scale).
+struct ControlResiduals {
+    std::vector<Matrix> down;
+    Matrix mid;
+};
+
 // Stable Diffusion's denoiser (diffusers UNet2DConditionModel, SD 1.x / 2.x /
 // Turbo layouts): predicts the noise in a latent at a timestep, conditioned
 // on text hidden states through cross-attention. Built for one latent size.
@@ -92,6 +99,8 @@ public:
 
     // latent: 1 x (C h w); context: tokens x contextDim. Returns 1 x (C h w).
     Matrix forward(const Matrix& latent, float timestep, const Matrix& context);
+    // ... with ControlNet residuals added to the skips and the mid block (null: none).
+    Matrix forward(const Matrix& latent, float timestep, const Matrix& context, const ControlResiduals* residuals);
     // Several frames at once (AnimateDiff): latents has one frame per row and
     // the same text conditions every frame. With motion modules loaded,
     // temporal attention mixes the frames after every spatial block; without,
@@ -99,6 +108,16 @@ public:
     Matrix forwardFrames(const Matrix& latents, float timestep, const Matrix& context);
     // ... with one text condition per frame (prompt travel), or a single one for all.
     Matrix forwardFrames(const Matrix& latents, float timestep, const std::vector<Matrix>& contexts);
+    Matrix forwardFrames(const Matrix& latents, float timestep, const std::vector<Matrix>& contexts,
+                         const std::vector<ControlResiduals>* residuals);  // one set per frame
+    // ControlNet (a diffusers ControlNetModel directory loads with loadUNet as
+    // a UNet without up blocks): the conditioning image (1 x C*H*W at the
+    // image size, channel-major, values 0..1, e.g. canny edges) -> features,
+    // computed once per image ...
+    bool isControlNet() const;
+    Matrix controlEmbedding(const Matrix& conditionImage);
+    // ... and per step, the residuals for the UNet, multiplied by `scale`.
+    ControlResiduals control(const Matrix& latent, float timestep, const Matrix& context, const Matrix& embedding, float scale = 1.0f);
     ImageShape latentShape() const;  // the UNet's input (9 channels for inpainting models)
     std::size_t outputChannels() const;  // the predicted noise's channels (4)
     std::size_t contextDim() const;
@@ -167,6 +186,11 @@ struct TextToImageOptions {
     std::string sampler = "euler";          // "euler", or "lcm" for LCM models / LCM-LoRA (4 to 8 steps, guidance 1)
     float strength = 0.5f;                  // image to image: how much of the schedule runs (0 keeps the input)
     std::vector<Lora> loras;                // LoRA files merged into the UNet and text encoder
+    // ControlNet: a ControlNetModel directory and its conditioning image (e.g.
+    // cannyEdges of a photo), fitted to the output size; scale weights it.
+    std::string controlNet;
+    Image controlImage;
+    float controlScale = 1.0f;
     std::function<void(const std::string& stage, double seconds)> progress;  // after each stage / step
 };
 
@@ -317,6 +341,10 @@ struct TextToVideoOptions {
     // around it, so the scene changes over the clip.
     std::vector<std::pair<std::size_t, std::string>> promptAt;
     std::vector<Lora> loras;  // merged into the UNet and text encoder (not the motion module)
+    // ControlNet for every frame: one conditioning image for all, or one per frame.
+    std::string controlNet;
+    std::vector<Image> controlImages;
+    float controlScale = 1.0f;
     std::size_t steps = 4;                  // AnimateDiff-Lightning: the step count the module was distilled for
     unsigned seed = 0;
     float guidance = 1.0f;                  // <= 1: off (Lightning); else classifier-free guidance

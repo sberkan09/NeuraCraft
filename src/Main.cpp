@@ -956,6 +956,7 @@ void usage() {
               << "                 [--tiny-vae <taesd dir>] [--fp32]\n"
               << "  NeuraCraft img2img <dir> in.png \"prompt\" [out.png] [--strength S] [--steps N] [--seed S] [--size N] ...\n"
               << "        image commands also take [--lora file.safetensors[:scale]] ... [--sampler euler|lcm]\n"
+              << "        and [--controlnet DIR --control image.png [--canny] [--control-scale S]] (t2v: --control-dir frames/)\n"
               << "  NeuraCraft video <dir> morph \"prompt\" \"prompt\" ... [-o out.gif] [--seeds A,B,..] [--frames N] [--fps F] [--no-loop]\n"
               << "  NeuraCraft video <dir> zoom \"prompt\" ... [-o out.gif] [--frames N] [--zoom Z] [--pan DX,DY] [--rotate DEG]\n"
               << "  NeuraCraft video <dir> t2v \"prompt\" [-o out.gif] [--frames 16] [--steps 4] [--seed S] [--motion file] [--guidance G]\n"
@@ -1121,6 +1122,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
             TextToImageOptions o;
+            bool canny = false;
             if (img2img) o.steps = 2;  // SD-Turbo's image-to-image setting: 2 steps at strength 0.5
             std::string output = img2img ? "img2img.png" : "txt2img.png";
             const std::string prompt = args[img2img ? 3 : 2];
@@ -1143,12 +1145,17 @@ int main(int argc, char** argv) {
                 else if (a == "--fp32") o.int8 = false;
                 else if (a == "--lora") o.loras.push_back(parseLora(value()));
                 else if (a == "--sampler") o.sampler = value();
+                else if (a == "--controlnet") o.controlNet = value();
+                else if (a == "--control") o.controlImage = loadImage(value());
+                else if (a == "--control-scale") o.controlScale = std::stof(value());
+                else if (a == "--canny") canny = true;
                 else if (a.rfind("--", 0) != 0) output = a;
                 else {
                     std::cerr << "unknown txt2img option: " << a << "\n";
                     return 2;
                 }
             }
+            if (canny && !o.controlImage.pixels.empty()) o.controlImage = cannyEdges(o.controlImage);
             o.progress = [](const std::string& stage, double seconds) {
                 std::cerr << "  " << stage << ": " << std::fixed << std::setprecision(1) << seconds << " s" << std::defaultfloat << '\n';
             };
@@ -1182,7 +1189,7 @@ int main(int argc, char** argv) {
             std::vector<unsigned> seeds;
             std::string output = morph ? "morph.gif" : t2v ? "t2v.gif" : outpaint ? "outpaint.gif" : "zoom.gif", framesDir, start;
             float fps = morph ? 10.0f : 8.0f;
-            bool fullVae = false, framesSet = false, strengthSet = false;
+            bool fullVae = false, framesSet = false, strengthSet = false, cannyVideo = false;
             std::size_t frames = 0;
             auto split = [](const std::string& s) {
                 std::vector<std::string> parts;
@@ -1226,6 +1233,18 @@ int main(int argc, char** argv) {
                 else if (a == "--keyframes") oz.keyframes = std::stoul(value());
                 else if (a == "--shrink") oz.shrink = std::stof(value());
                 else if (a == "--zoom-in") oz.zoomIn = true;
+                else if (a == "--controlnet") vo.controlNet = value();
+                else if (a == "--control") vo.controlImages.push_back(loadImage(value()));
+                else if (a == "--control-dir") {
+                    std::vector<std::string> files;
+                    for (const auto& e : std::filesystem::directory_iterator(value())) {
+                        const std::string ext = e.path().extension().string();
+                        if (ext == ".png" || ext == ".ppm") files.push_back(e.path().string());
+                    }
+                    std::sort(files.begin(), files.end());
+                    for (const std::string& f : files) vo.controlImages.push_back(loadImage(f));
+                } else if (a == "--control-scale") vo.controlScale = std::stof(value());
+                else if (a == "--canny") cannyVideo = true;
                 else if (a == "--context") vo.context = std::stoul(value());
                 else if (a == "--lora") o.loras.push_back(parseLora(value()));
                 else if (a == "--sampler") o.sampler = vo.sampler = value();
@@ -1272,6 +1291,10 @@ int main(int argc, char** argv) {
                 vo.tinyVae = o.tinyVae;
                 vo.loras = o.loras;
                 if (framesSet) vo.frames = frames;
+                // --canny: edges of the control frames, or of the init frames when no control frames are given.
+                if (!vo.controlNet.empty() && vo.controlImages.empty()) vo.controlImages = vo.init;
+                if (cannyVideo)
+                    for (Image& c : vo.controlImages) c = cannyEdges(c);
             } else if (outpaint) {
                 oz.seed = seeds[0];
                 if (framesSet) oz.framesPerKey = frames;

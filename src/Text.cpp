@@ -299,6 +299,7 @@ struct IncrementalScope {
     ~IncrementalScope() {
         ctx.incremental = false;
         ctx.offset = 0;
+        ctx.window = 0;
     }
 };
 } // namespace
@@ -324,6 +325,10 @@ std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::siz
     }
 
     IncrementalScope scope(*kvCache);
+    // Rotary models slide the cache by one token per step (exactly like the
+    // uncached sliding window); learned positions need a rebuild when full.
+    const bool sliding = kvCache->slidingCacheSupported;
+    kvCache->window = sliding ? contextLength : 0;
     // Runs tokens[from..] through the network on top of the cache; returns the last logits row.
     auto feed = [&](std::size_t from) {
         const Matrix logits = net.predict(tokensRow(tokens, from));
@@ -336,7 +341,7 @@ std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::siz
         tokens.push_back(next);
         produced.push_back(next);
         if (step + 1 == newTokens) break;
-        if (kvCache->offset >= contextLength) {
+        if (!sliding && kvCache->offset >= contextLength) {
             kvCache->offset = 0;  // cache full: rebuild from the most recent half window
             last = feed(tokens.size() - std::max<std::size_t>(1, contextLength / 2));
         } else {

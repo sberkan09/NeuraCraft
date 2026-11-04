@@ -26,14 +26,17 @@ std::size_t requireLength(const SequenceContextPtr& ctx, std::size_t rows, const
 // ---- TokenEmbedding ---------------------------------------------------------------------
 
 TokenEmbedding::TokenEmbedding(std::size_t vocabSize, std::size_t dim, std::size_t maxContext,
-                               SequenceContextPtr context)
-    : vocab_(vocabSize), dim_(dim), maxContext_(maxContext), context_(std::move(context)) {
+                               SequenceContextPtr context, bool learnedPositions)
+    : vocab_(vocabSize), dim_(dim), maxContext_(maxContext), context_(std::move(context)),
+      learnedPositions_(learnedPositions) {
     if (vocabSize == 0 || dim == 0 || maxContext == 0) throw std::invalid_argument("TokenEmbedding: sizes must be > 0");
     if (!context_) throw std::invalid_argument("TokenEmbedding: context must not be null");
     tokens_ = Matrix::normal(vocabSize, dim, 0.0f, 0.02f);
-    positions_ = Matrix::normal(maxContext, dim, 0.0f, 0.02f);
     tokenGrad_ = Matrix(vocabSize, dim);
-    positionGrad_ = Matrix(maxContext, dim);
+    if (learnedPositions_) {
+        positions_ = Matrix::normal(maxContext, dim, 0.0f, 0.02f);
+        positionGrad_ = Matrix(maxContext, dim);
+    }
 }
 
 Matrix TokenEmbedding::forward(const Matrix& input, bool) {
@@ -42,7 +45,9 @@ Matrix TokenEmbedding::forward(const Matrix& input, bool) {
     const std::size_t offset = context_->incremental ? context_->offset : 0;
     if (context_->incremental && batch_ != 1)
         throw std::invalid_argument("TokenEmbedding: incremental inference handles one sequence at a time");
-    if (length_ == 0 || offset + length_ > maxContext_)
+    // Learned positions exist only up to maxContext; rotary positions are unbounded.
+    const std::size_t lastPosition = learnedPositions_ ? offset + length_ : length_;
+    if (length_ == 0 || lastPosition > maxContext_)
         throw std::invalid_argument("TokenEmbedding: positions " + std::to_string(offset) + ".." +
                                     std::to_string(offset + length_ - 1) + " exceed the context of " +
                                     std::to_string(maxContext_));
@@ -55,9 +60,13 @@ Matrix TokenEmbedding::forward(const Matrix& input, bool) {
             throw std::out_of_range("TokenEmbedding: token id " + std::to_string(id) + " outside the vocabulary");
         ids_[r] = static_cast<std::size_t>(id);
         const float* tok = tokens_.data() + ids_[r] * dim_;
-        const float* pos = positions_.data() + (offset + r % length_) * dim_;
         float* o = out.data() + r * dim_;
-        for (std::size_t j = 0; j < dim_; ++j) o[j] = tok[j] + pos[j];
+        if (learnedPositions_) {
+            const float* pos = positions_.data() + (offset + r % length_) * dim_;
+            for (std::size_t j = 0; j < dim_; ++j) o[j] = tok[j] + pos[j];
+        } else {
+            for (std::size_t j = 0; j < dim_; ++j) o[j] = tok[j];
+        }
     }
     return out;
 }
@@ -65,27 +74,148 @@ Matrix TokenEmbedding::forward(const Matrix& input, bool) {
 Matrix TokenEmbedding::backward(const Matrix& gradOutput) {
     if (gradOutput.rows() != ids_.size() || gradOutput.cols() != dim_)
         throw std::invalid_argument("TokenEmbedding::backward: gradient shape does not match the last forward");
-    tokenGrad_.fill(0.0f);
-    positionGrad_.fill(0.0f);
+    if (!tied_) tokenGrad_.fill(0.0f);  // tied: TiedOutput already wrote its share
+    if (learnedPositions_) positionGrad_.fill(0.0f);
     for (std::size_t r = 0; r < ids_.size(); ++r) {
         const float* g = gradOutput.data() + r * dim_;
         float* tg = tokenGrad_.data() + ids_[r] * dim_;
-        float* pg = positionGrad_.data() + (r % length_) * dim_;
-        for (std::size_t j = 0; j < dim_; ++j) {
-            tg[j] += g[j];
-            pg[j] += g[j];
+        for (std::size_t j = 0; j < dim_; ++j) tg[j] += g[j];
+        if (learnedPositions_) {
+            float* pg = positionGrad_.data() + (r % length_) * dim_;
+            for (std::size_t j = 0; j < dim_; ++j) pg[j] += g[j];
         }
     }
     return Matrix(batch_, length_);
 }
 
 std::vector<Param> TokenEmbedding::parameters() {
+    if (!learnedPositions_) return {{&tokens_, &tokenGrad_}};
     return {{&tokens_, &tokenGrad_}, {&positions_, &positionGrad_}};
 }
 
 std::string TokenEmbedding::describe() const {
     return "TokenEmbedding(" + std::to_string(vocab_) + " x " + std::to_string(dim_) + ", ctx " +
-           std::to_string(maxContext_) + ")";
+           std::to_string(maxContext_) + (learnedPositions_ ? "" : ", no positions") + ")";
+}
+
+// ---- TiedOutput ---------------------------------------------------------------------------
+
+TiedOutput::TiedOutput(TokenEmbedding& embedding) : embedding_(embedding) { embedding_.markTied(); }
+
+Matrix TiedOutput::forward(const Matrix& input, bool) {
+    input_ = input;
+    return input.matmulTranspose(embedding_.tokenTable());  // (N x D) * (V x D)^T
+}
+
+Matrix TiedOutput::backward(const Matrix& gradOutput) {
+    // Runs before the embedding's backward, which then adds the lookup gradient.
+    embedding_.tokenGradient() = gradOutput.transposeMatmul(input_);  // V x D
+    return gradOutput * embedding_.tokenTable();
+}
+
+std::string TiedOutput::describe() const {
+    return "TiedOutput(" + std::to_string(embedding_.tokenTable().cols()) + " -> " +
+           std::to_string(embedding_.vocabSize()) + ", shares embedding)";
+}
+
+// ---- RMSNorm ----------------------------------------------------------------------------
+
+RMSNorm::RMSNorm(std::size_t dim, float epsilon) : dim_(dim), epsilon_(epsilon), gamma_(1, dim, 1.0f), gammaGrad_(1, dim) {
+    if (dim == 0) throw std::invalid_argument("RMSNorm: dim must be > 0");
+}
+
+Matrix RMSNorm::forward(const Matrix& input, bool) {
+    if (input.cols() != dim_)
+        throw std::invalid_argument("RMSNorm: expected " + std::to_string(dim_) + " features, got " +
+                                    std::to_string(input.cols()));
+    const std::size_t n = input.rows();
+    input_ = input;
+    invRms_.assign(n, 0.0f);
+    Matrix out(n, dim_);
+    parallelFor(0, n, 64, [&](std::size_t r0, std::size_t r1) {
+        for (std::size_t r = r0; r < r1; ++r) {
+            const float* x = input.data() + r * dim_;
+            double sq = 0.0;
+            for (std::size_t j = 0; j < dim_; ++j) sq += static_cast<double>(x[j]) * x[j];
+            const float inv = static_cast<float>(1.0 / std::sqrt(sq / static_cast<double>(dim_) + epsilon_));
+            invRms_[r] = inv;
+            float* o = out.data() + r * dim_;
+            for (std::size_t j = 0; j < dim_; ++j) o[j] = x[j] * inv * gamma_.data()[j];
+        }
+    });
+    return out;
+}
+
+Matrix RMSNorm::backward(const Matrix& gradOutput) {
+    if (!gradOutput.sameShape(input_))
+        throw std::invalid_argument("RMSNorm::backward: gradient shape does not match the last forward");
+    const std::size_t n = gradOutput.rows();
+    gammaGrad_ = Matrix(1, dim_);
+    for (std::size_t r = 0; r < n; ++r) {
+        const float* g = gradOutput.data() + r * dim_;
+        const float* x = input_.data() + r * dim_;
+        for (std::size_t j = 0; j < dim_; ++j) gammaGrad_.data()[j] += g[j] * x[j] * invRms_[r];
+    }
+    Matrix dx(n, dim_);
+    const float d = static_cast<float>(dim_);
+    parallelFor(0, n, 64, [&](std::size_t r0, std::size_t r1) {
+        for (std::size_t r = r0; r < r1; ++r) {
+            const float* g = gradOutput.data() + r * dim_;
+            const float* x = input_.data() + r * dim_;
+            const float inv = invRms_[r];
+            float dot = 0.0f;  // sum_j g_j * gamma_j * x_j
+            for (std::size_t j = 0; j < dim_; ++j) dot += g[j] * gamma_.data()[j] * x[j];
+            float* out = dx.data() + r * dim_;
+            for (std::size_t j = 0; j < dim_; ++j)
+                out[j] = inv * (g[j] * gamma_.data()[j] - x[j] * inv * inv * dot / d);
+        }
+    });
+    return dx;
+}
+
+std::vector<Param> RMSNorm::parameters() { return {{&gamma_, &gammaGrad_}}; }
+
+std::string RMSNorm::describe() const { return "RMSNorm(" + std::to_string(dim_) + ")"; }
+
+// ---- SwiGLU -------------------------------------------------------------------------------
+
+Matrix SwiGLUGate::forward(const Matrix& input, bool) {
+    if (input.cols() % 2 != 0) throw std::invalid_argument("SwiGLU: input needs an even number of columns");
+    input_ = input;
+    const std::size_t h = input.cols() / 2;
+    Matrix out(input.rows(), h);
+    parallelFor(0, input.rows(), 64, [&](std::size_t r0, std::size_t r1) {
+        for (std::size_t r = r0; r < r1; ++r) {
+            const float* a = input.data() + r * 2 * h;
+            const float* b = a + h;
+            float* o = out.data() + r * h;
+            for (std::size_t j = 0; j < h; ++j) o[j] = a[j] * sigmoid(a[j]) * b[j];
+        }
+    });
+    return out;
+}
+
+Matrix SwiGLUGate::backward(const Matrix& gradOutput) {
+    const std::size_t h = input_.cols() / 2;
+    if (gradOutput.rows() != input_.rows() || gradOutput.cols() != h)
+        throw std::invalid_argument("SwiGLU::backward: gradient shape does not match the last forward");
+    Matrix dx(input_.rows(), 2 * h);
+    parallelFor(0, input_.rows(), 64, [&](std::size_t r0, std::size_t r1) {
+        for (std::size_t r = r0; r < r1; ++r) {
+            const float* a = input_.data() + r * 2 * h;
+            const float* b = a + h;
+            const float* g = gradOutput.data() + r * h;
+            float* da = dx.data() + r * 2 * h;
+            float* db = da + h;
+            for (std::size_t j = 0; j < h; ++j) {
+                const float s = sigmoid(a[j]);
+                const float silu = a[j] * s;
+                da[j] = g[j] * b[j] * s * (1.0f + a[j] * (1.0f - s));
+                db[j] = g[j] * silu;
+            }
+        }
+    });
+    return dx;
 }
 
 // ---- LayerNorm --------------------------------------------------------------------------
@@ -197,10 +327,13 @@ Matrix GELU::backward(const Matrix& gradOutput) {
 
 // ---- CausalSelfAttention ------------------------------------------------------------------
 
-CausalSelfAttention::CausalSelfAttention(std::size_t dim, std::size_t heads, SequenceContextPtr context)
-    : dim_(dim), heads_(heads), headDim_(heads ? dim / heads : 0), context_(std::move(context)) {
+CausalSelfAttention::CausalSelfAttention(std::size_t dim, std::size_t heads, SequenceContextPtr context,
+                                         bool rotary, float ropeBase)
+    : dim_(dim), heads_(heads), headDim_(heads ? dim / heads : 0), context_(std::move(context)), rotary_(rotary),
+      ropeBase_(ropeBase) {
     if (dim == 0 || heads == 0 || dim % heads != 0)
         throw std::invalid_argument("CausalSelfAttention: dim must be a positive multiple of heads");
+    if (rotary && headDim_ % 2 != 0) throw std::invalid_argument("CausalSelfAttention: rotary needs an even head size");
     if (!context_) throw std::invalid_argument("CausalSelfAttention: context must not be null");
     const float limitQkv = std::sqrt(6.0f / static_cast<float>(dim + 3 * dim));
     const float limitOut = std::sqrt(6.0f / static_cast<float>(2 * dim));
@@ -212,6 +345,48 @@ CausalSelfAttention::CausalSelfAttention(std::size_t dim, std::size_t heads, Seq
     bQkvGrad_ = Matrix(1, 3 * dim);
     wOutGrad_ = Matrix(dim, dim);
     bOutGrad_ = Matrix(1, dim);
+}
+
+void CausalSelfAttention::ensureRopeTable(std::size_t positions) {
+    const std::size_t half = headDim_ / 2;
+    const std::size_t have = half ? ropeCos_.size() / half : 0;
+    if (positions <= have) return;
+    const std::size_t target = std::max(positions, have * 2);
+    ropeCos_.resize(target * half);
+    ropeSin_.resize(target * half);
+    for (std::size_t p = have; p < target; ++p)
+        for (std::size_t i = 0; i < half; ++i) {
+            const double freq = std::pow(static_cast<double>(ropeBase_), -2.0 * static_cast<double>(i) / static_cast<double>(headDim_));
+            const double angle = static_cast<double>(p) * freq;
+            ropeCos_[p * half + i] = static_cast<float>(std::cos(angle));
+            ropeSin_[p * half + i] = static_cast<float>(std::sin(angle));
+        }
+}
+
+template <typename PositionOf>
+void CausalSelfAttention::rotate(float* qkv, std::size_t rows, std::size_t ld, PositionOf positionOf, bool inverse,
+                                 bool keys) {
+    const std::size_t half = headDim_ / 2;
+    std::size_t maxPos = 0;
+    for (std::size_t r = 0; r < rows; ++r) maxPos = std::max(maxPos, positionOf(r));
+    ensureRopeTable(maxPos + 1);
+    const float sign = inverse ? -1.0f : 1.0f;
+    const std::size_t parts = keys ? 2 : 1;  // Q (and K)
+    parallelFor(0, rows, 64, [&](std::size_t r0, std::size_t r1) {
+        for (std::size_t r = r0; r < r1; ++r) {
+            const float* c = ropeCos_.data() + positionOf(r) * half;
+            const float* s = ropeSin_.data() + positionOf(r) * half;
+            for (std::size_t part = 0; part < parts; ++part)
+                for (std::size_t h = 0; h < heads_; ++h) {
+                    float* x = qkv + r * ld + part * dim_ + h * headDim_;
+                    for (std::size_t i = 0; i < half; ++i) {
+                        const float x1 = x[i], x2 = x[i + half], sn = sign * s[i];
+                        x[i] = x1 * c[i] - x2 * sn;
+                        x[i + half] = x1 * sn + x2 * c[i];
+                    }
+                }
+        }
+    });
 }
 
 Matrix CausalSelfAttention::forward(const Matrix& input, bool) {
@@ -226,6 +401,7 @@ Matrix CausalSelfAttention::forward(const Matrix& input, bool) {
 
     input_ = input;
     qkv_ = (input * wQkv_).addRowVector(bQkv_);   // (B*L) x 3D: [Q | K | V]
+    if (rotary_) rotate(qkv_.data(), qkv_.rows(), ld, [L](std::size_t r) { return r % L; }, false);
     attention_ = Matrix(batch_ * heads_ * L, L);  // softmax probabilities per (sequence, head)
     merged_ = Matrix(batch_ * L, D);              // concatenated head outputs
 
@@ -265,19 +441,29 @@ Matrix CausalSelfAttention::forwardIncremental(const Matrix& input) {
     if (past == 0) {
         cacheK_.clear();
         cacheV_.clear();
-        cachedPositions_ = 0;
+        cacheStart_ = 0;
     }
-    if (cachedPositions_ != past)
-        throw std::logic_error("CausalSelfAttention: KV cache holds " + std::to_string(cachedPositions_) +
-                               " positions but the context offset is " + std::to_string(past));
-    const Matrix qkv = (input * wQkv_).addRowVector(bQkv_);
+    const std::size_t cachedRows = cacheK_.size() / D;
+    if (cacheStart_ + cachedRows != past)
+        throw std::logic_error("CausalSelfAttention: KV cache ends at position " + std::to_string(cacheStart_ + cachedRows) +
+                               " but the context offset is " + std::to_string(past));
+    Matrix qkv = (input * wQkv_).addRowVector(bQkv_);
+    if (rotary_) rotate(qkv.data(), n, ld, [past](std::size_t r) { return past + r; }, false);
+
+    // Sliding window: keep at most `window` positions including the new ones.
+    const std::size_t window = context_->window;
+    if (window > 0 && cachedRows + n > window) {
+        const std::size_t drop = std::min(cachedRows, cachedRows + n - window);
+        cacheK_.erase(cacheK_.begin(), cacheK_.begin() + static_cast<long>(drop * D));
+        cacheV_.erase(cacheV_.begin(), cacheV_.begin() + static_cast<long>(drop * D));
+        cacheStart_ += drop;
+    }
     for (std::size_t r = 0; r < n; ++r) {
         const float* row = qkv.data() + r * ld;
         cacheK_.insert(cacheK_.end(), row + D, row + 2 * D);
         cacheV_.insert(cacheV_.end(), row + 2 * D, row + 3 * D);
     }
-    cachedPositions_ += n;
-    const std::size_t total = cachedPositions_;
+    const std::size_t total = cacheK_.size() / D;
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
     Matrix merged(n, D);
@@ -287,7 +473,7 @@ Matrix CausalSelfAttention::forwardIncremental(const Matrix& input) {
         gemmCpu(false, true, n, total, hd, q, ld, cacheK_.data() + h * hd, D, scores.data(), total);
         for (std::size_t i = 0; i < n; ++i) {
             float* row = scores.data() + i * total;
-            const std::size_t visible = past + i + 1;  // causal: earlier positions and itself
+            const std::size_t visible = past + i + 1 - cacheStart_;  // causal: earlier positions and itself
             float maxVal = -std::numeric_limits<float>::infinity();
             for (std::size_t j = 0; j < visible; ++j) {
                 row[j] *= scale;
@@ -347,6 +533,8 @@ Matrix CausalSelfAttention::backward(const Matrix& gradOutput) {
         }
     });
 
+    // Gradients so far are w.r.t. the rotated Q and K: rotate them back.
+    if (rotary_) rotate(dQkv.data(), dQkv.rows(), ld, [L](std::size_t r) { return r % L; }, true);
     wQkvGrad_ = input_.transposeMatmul(dQkv);
     bQkvGrad_ = dQkv.sumRows();
     return dQkv.matmulTranspose(wQkv_);
@@ -357,7 +545,8 @@ std::vector<Param> CausalSelfAttention::parameters() {
 }
 
 std::string CausalSelfAttention::describe() const {
-    return "CausalSelfAttention(" + std::to_string(dim_) + ", " + std::to_string(heads_) + " heads)";
+    return "CausalSelfAttention(" + std::to_string(dim_) + ", " + std::to_string(heads_) + " heads" +
+           (rotary_ ? ", RoPE" : "") + ")";
 }
 
 // ---- Residual -------------------------------------------------------------------------------
@@ -386,7 +575,11 @@ void saveGPTConfig(const std::string& path, const GPTConfig& c) {
     if (!out) throw std::runtime_error("saveGPTConfig: cannot open " + path);
     out << "vocab_size = " << c.vocabSize << "\ncontext_length = " << c.contextLength << "\ndim = " << c.dim
         << "\nheads = " << c.heads << "\nlayers = " << c.layers << "\nmlp_ratio = " << c.mlpRatio
-        << "\ndropout = " << c.dropout << '\n';
+        << "\ndropout = " << c.dropout
+        << "\nposition = " << (c.position == PositionEncoding::Rotary ? "rotary" : "learned")
+        << "\nnorm = " << (c.norm == Normalization::RMSNorm ? "rmsnorm" : "layernorm")
+        << "\nmlp = " << (c.mlp == FeedForward::SwiGLU ? "swiglu" : "gelu")
+        << "\ntie_embeddings = " << (c.tieEmbeddings ? 1 : 0) << "\nrope_base = " << c.ropeBase << '\n';
     if (!out) throw std::runtime_error("saveGPTConfig: write failed for " + path);
 }
 
@@ -411,6 +604,17 @@ GPTConfig loadGPTConfig(const std::string& path) {
             else if (key == "layers") c.layers = std::stoul(value);
             else if (key == "mlp_ratio") c.mlpRatio = std::stoul(value);
             else if (key == "dropout") c.dropout = std::stof(value);
+            else if (key == "position") {
+                if (value != "rotary" && value != "learned") throw std::invalid_argument(value);
+                c.position = value == "rotary" ? PositionEncoding::Rotary : PositionEncoding::Learned;
+            } else if (key == "norm") {
+                if (value != "rmsnorm" && value != "layernorm") throw std::invalid_argument(value);
+                c.norm = value == "rmsnorm" ? Normalization::RMSNorm : Normalization::LayerNorm;
+            } else if (key == "mlp") {
+                if (value != "swiglu" && value != "gelu") throw std::invalid_argument(value);
+                c.mlp = value == "swiglu" ? FeedForward::SwiGLU : FeedForward::GELU;
+            } else if (key == "tie_embeddings") c.tieEmbeddings = std::stoi(value) != 0;
+            else if (key == "rope_base") c.ropeBase = std::stof(value);
         } catch (const std::exception&) {
             throw std::runtime_error("loadGPTConfig: bad value for " + key + " in " + path);
         }
@@ -418,27 +622,49 @@ GPTConfig loadGPTConfig(const std::string& path) {
     return c;
 }
 
+std::size_t GPTConfig::mlpHidden() const {
+    if (mlp == FeedForward::GELU) return mlpRatio * dim;
+    // SwiGLU has three matrices instead of two: 2/3 of the width keeps the
+    // parameter count equal; rounded up to a multiple of 8.
+    const std::size_t h = (2 * mlpRatio * dim + 2) / 3;
+    return (h + 7) / 8 * 8;
+}
+
 SequenceContextPtr buildGPT(Network& net, const GPTConfig& c) {
     if (c.vocabSize == 0 || c.contextLength == 0 || c.dim == 0 || c.heads == 0 || c.dim % c.heads != 0)
         throw std::invalid_argument("buildGPT: invalid configuration");
+    const bool rotary = c.position == PositionEncoding::Rotary;
     auto context = std::make_shared<SequenceContext>();
-    net.add<TokenEmbedding>(c.vocabSize, c.dim, c.contextLength, context);
+    context->slidingCacheSupported = rotary;
+    auto& embedding = net.add<TokenEmbedding>(c.vocabSize, c.dim, c.contextLength, context, !rotary);
     if (c.dropout > 0.0f) net.add<Dropout>(c.dropout);
+    auto addNorm = [&](Residual& block) {
+        if (c.norm == Normalization::RMSNorm) block.add<RMSNorm>(c.dim);
+        else block.add<LayerNorm>(c.dim);
+    };
+    const std::size_t hidden = c.mlpHidden();
     for (std::size_t i = 0; i < c.layers; ++i) {
         auto& attention = net.add<Residual>();
-        attention.add<LayerNorm>(c.dim);
-        attention.add<CausalSelfAttention>(c.dim, c.heads, context);
+        addNorm(attention);
+        attention.add<CausalSelfAttention>(c.dim, c.heads, context, rotary, c.ropeBase);
         if (c.dropout > 0.0f) attention.add<Dropout>(c.dropout);
 
         auto& mlp = net.add<Residual>();
-        mlp.add<LayerNorm>(c.dim);
-        mlp.add<Dense>(c.dim, c.mlpRatio * c.dim);
-        mlp.add<GELU>();
-        mlp.add<Dense>(c.mlpRatio * c.dim, c.dim);
+        addNorm(mlp);
+        if (c.mlp == FeedForward::SwiGLU) {
+            mlp.add<Dense>(c.dim, 2 * hidden);
+            mlp.add<SwiGLUGate>();
+        } else {
+            mlp.add<Dense>(c.dim, hidden);
+            mlp.add<GELU>();
+        }
+        mlp.add<Dense>(hidden, c.dim);
         if (c.dropout > 0.0f) mlp.add<Dropout>(c.dropout);
     }
-    net.add<LayerNorm>(c.dim);
-    net.add<Dense>(c.dim, c.vocabSize);
+    if (c.norm == Normalization::RMSNorm) net.add<RMSNorm>(c.dim);
+    else net.add<LayerNorm>(c.dim);
+    if (c.tieEmbeddings) net.add<TiedOutput>(embedding);
+    else net.add<Dense>(c.dim, c.vocabSize);
     return context;
 }
 

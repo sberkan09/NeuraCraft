@@ -93,10 +93,10 @@ struct SamplingOptions {
 // `contextLength` tokens as context. Returns only the newly generated ids.
 //
 // Passing the SequenceContext returned by buildGPT enables the KV cache: each
-// step then runs only the new token through the network. When the cache is
-// full it is rebuilt from the last contextLength / 2 tokens, so after that
-// point the context window is between half and full length rather than
-// sliding by one token as in the uncached path.
+// step then runs only the new token through the network. Rotary models slide
+// the cache by one token per step, which matches the uncached path exactly.
+// With learned positions a full cache is rebuilt from the last
+// contextLength / 2 tokens, so the window is then between half and full length.
 std::vector<int> generate(Network& net, const std::vector<int>& prompt, std::size_t newTokens,
                           std::size_t contextLength, const SamplingOptions& options = SamplingOptions{},
                           const std::shared_ptr<SequenceContext>& kvCache = nullptr);

@@ -332,6 +332,7 @@ struct GptOptions {
     bool cosine = false;  // warmup + cosine decay (helps long runs; constant is better for a few epochs)
     float learningRate = 1e-3f;
     std::size_t dim = 0, layers = 0, heads = 0, context = 0;  // 0 = default / saved
+    std::string arch = "classic";  // classic (GPT-2 style) or modern (RoPE, RMSNorm, SwiGLU, tied)
 };
 constexpr std::size_t kBpeVocab = 512;
 
@@ -399,6 +400,7 @@ int runGpt(const std::string& path, const GptOptions& o) {
 
     GPTConfig cfg = o.resume ? savedOrDefaultConfig(path, tok->vocabSize()) : textModelConfig(tok->vocabSize());
     if (!o.resume) {
+        if (o.arch == "modern") cfg.modern();
         if (o.dim) cfg.dim = o.dim;
         if (o.layers) cfg.layers = o.layers;
         if (o.heads) cfg.heads = o.heads;
@@ -591,7 +593,7 @@ void usage() {
               << "  NeuraCraft eval <dir> [mlp|cnn]\n"
               << "                               evaluate saved MNIST weights on the test set\n"
               << "  NeuraCraft gpt <text-file> [epochs] [bpe|char] [--resume] [--lr X] [--cosine]\n"
-              << "                 [--dim N] [--layers N] [--heads N] [--context N]\n"
+              << "                 [--arch classic|modern] [--dim N] [--layers N] [--heads N] [--context N]\n"
               << "                               train a GPT on a text file (BPE or character tokens)\n"
               << "  NeuraCraft generate <text-file> [prompt] [length]\n"
               << "                               sample text from the trained GPT\n"
@@ -669,6 +671,13 @@ int main(int argc, char** argv) {
                 };
                 if (a == "--resume") o.resume = true;
                 else if (a == "--cosine") o.cosine = true;
+                else if (a == "--arch") {
+                    o.arch = value();
+                    if (o.arch != "classic" && o.arch != "modern") {
+                        std::cerr << "--arch must be classic or modern\n";
+                        return 2;
+                    }
+                }
                 else if (a == "--lr") o.learningRate = std::stof(value());
                 else if (a == "--dim") o.dim = std::stoul(value());
                 else if (a == "--layers") o.layers = std::stoul(value());

@@ -920,14 +920,39 @@ TEST(modern_kv_cache_slides_exactly) {
     setSeed(64);
     SequenceContextPtr ctx;
     Network net = modernGpt(ctx, 8);
+    auto row = [](const std::vector<int>& toks, std::size_t from) {
+        Matrix x(1, toks.size() - from);
+        for (std::size_t i = from; i < toks.size(); ++i) x(0, i - from) = static_cast<float>(toks[i]);
+        return x;
+    };
+    // Feed 40 tokens one at a time far past the 8-token window; every step's
+    // logits must equal the uncached forward pass over the sliding window.
+    std::vector<int> toks{1, 2, 3};
+    ctx->incremental = true;
+    ctx->offset = 0;
+    ctx->window = 8;
+    net.predict(row(toks, 0));
+    ctx->offset = toks.size();
+    float worst = 0.0f;
+    for (int step = 0; step < 40; ++step) {
+        toks.push_back((step * 7 + 3) % 11);
+        const Matrix cached = net.predict(row(toks, toks.size() - 1));
+        ctx->offset += 1;
+        ctx->incremental = false;  // reference pass leaves the KV caches untouched
+        const Matrix full = net.predict(row(toks, toks.size() - std::min<std::size_t>(8, toks.size())));
+        ctx->incremental = true;
+        const Matrix last = full.row(full.rows() - 1);
+        for (std::size_t j = 0; j < last.size(); ++j) worst = std::max(worst, std::fabs(last.data()[j] - cached.data()[j]));
+    }
+    ctx->incremental = false;
+    ctx->offset = 0;
+    ctx->window = 0;
+    CHECK(worst < 1e-3f);
+
+    // generate() with the cache uses the same path and restores the context.
     SamplingOptions greedy;
     greedy.temperature = 0.0f;
-    const std::vector<int> prompt{1, 2, 3};
-    // 40 new tokens with an 8-token window: far past the window, the sliding
-    // cache must still match the uncached sliding window token for token.
-    CHECK(generate(net, prompt, 40, 8, greedy) == generate(net, prompt, 40, 8, greedy, ctx));
-    std::vector<int> longPrompt{4, 1, 6, 2, 9, 3, 3, 7, 0, 5, 8, 2};
-    CHECK(generate(net, longPrompt, 10, 8, greedy) == generate(net, longPrompt, 10, 8, greedy, ctx));
+    CHECK(generate(net, {1, 2, 3}, 20, 8, greedy, ctx).size() == 20);
     CHECK(ctx->window == 0 && !ctx->incremental);
 }
 

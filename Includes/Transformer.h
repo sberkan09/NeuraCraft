@@ -49,7 +49,12 @@ public:
 
     std::size_t vocabSize() const { return vocab_; }
     std::size_t maxContext() const { return maxContext_; }
-    Matrix& tokenTable() { return tokens_; }
+    Matrix& tokenTable() { return tokens_; }  // empty once quantized
+    // Int8 token table: lookups expand rows on the fly (a tied output reuses
+    // it), training is no longer possible. Learned positions stay float.
+    std::size_t quantize() override;
+    bool quantized() const { return !quantizedTokens_.empty(); }
+    const QuantizedWeights& quantizedTable() const { return quantizedTokens_; }
     Matrix& positionTable() { return positions_; }
     bool learnedPositions() const { return learnedPositions_; }
 
@@ -64,6 +69,7 @@ private:
     bool learnedPositions_ = true;
     bool tied_ = false;
     Matrix tokens_, positions_, tokenGrad_, positionGrad_;
+    QuantizedWeights quantizedTokens_;
     std::vector<std::size_t> ids_;
     std::size_t batch_ = 0, length_ = 0;
 };
@@ -136,6 +142,20 @@ private:
     Matrix tanh_;  // tanh term from forward, reused by backward
 };
 
+// Llama 3-style RoPE frequency scaling ("rope_type": "llama3"): pairs with
+// wavelengths longer than originalContext / lowFreqFactor rotate `factor`
+// times slower, those shorter than originalContext / highFreqFactor keep
+// their speed, and the band between is interpolated. factor = 1 disables it.
+struct RopeScaling {
+    float factor = 1.0f;
+    float lowFreqFactor = 1.0f;
+    float highFreqFactor = 4.0f;
+    std::size_t originalContext = 8192;
+    bool enabled() const { return factor != 1.0f; }
+};
+// Rotation frequency (radians per position) of each of the headDim / 2 pairs.
+std::vector<double> ropeFrequencies(std::size_t headDim, double base, const RopeScaling& scaling = RopeScaling{});
+
 // Multi-head causal self-attention: each position attends to itself and
 // earlier positions of the same sequence.
 //
@@ -162,6 +182,7 @@ public:
     // matrices, or ready-made int8 ones.
     void setWeights(Matrix qkv, Matrix out);
     void setQuantized(QuantizedWeights qkv, QuantizedWeights out);
+    void setRopeScaling(const RopeScaling& scaling);
 
     // Fused [Q | K | V] projection (dim x (dim + 2 * kvHeads * headDim), heads
     // contiguous within each block) and the output projection (dim x dim), as in
@@ -193,6 +214,7 @@ private:
     void ensureRopeTable(std::size_t positions);
     bool rotary_ = false;
     float ropeBase_ = 10000.0f;
+    RopeScaling ropeScaling_;
     std::vector<float> ropeCos_, ropeSin_;  // positions x headDim/2
 };
 
@@ -206,13 +228,12 @@ public:
     Matrix backward(const Matrix& gradOutput) override;
     std::string name() const override { return "TiedOutput"; }
     std::string describe() const override;
-    // Keeps an int8 copy of the table for the output product (lookups stay float).
-    std::size_t quantize() override;
+    // Quantizes the shared embedding table (one int8 copy serves lookups and logits).
+    std::size_t quantize() override { return embedding_.quantize(); }
 
 private:
     TokenEmbedding& embedding_;
     Matrix input_;
-    QuantizedWeights quantized_;
 };
 
 // y = x + f(x), where f is a stack of layers (a pre-norm transformer sub-block).
@@ -258,6 +279,7 @@ struct GPTConfig {
     std::size_t kvHeads = 0;         // grouped-query attention; 0 = same as heads
     float normEpsilon = 1e-5f;
     std::size_t mlpHiddenSize = 0;   // explicit MLP width (e.g. Llama's intermediate_size); 0 = derived
+    RopeScaling ropeScaling;         // Llama 3.1+ long-context frequencies (rotary only)
 
     GPTConfig& modern() {
         position = PositionEncoding::Rotary;

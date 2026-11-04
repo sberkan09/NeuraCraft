@@ -14,7 +14,7 @@
 //   NeuraCraft gpt2 <dir> [prompt] [tokens] [options]
 //                              run pretrained GPT-2 weights (scripts/download_gpt2.sh)
 //   NeuraCraft llama <dir> [prompt] [tokens] [options]
-//                              run a Llama-family checkpoint (scripts/download_tinyllama.sh)
+//                              run a Llama-family checkpoint (scripts/download_llama32.sh, download_tinyllama.sh)
 //   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
 //
 // Global options: --gpu (Metal on Apple silicon), --threads N
@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -605,7 +606,7 @@ int runLlama(const std::string& dir, const LlamaOptions& o) {
         tok = std::make_unique<LlamaTokenizer>(dir + "/tokenizer.json");
         model = loadLlama(dir, o.int8);
     } catch (const std::exception& e) {
-        std::cerr << e.what() << "\ndownload TinyLlama with: scripts/download_tinyllama.sh " << dir << '\n';
+        std::cerr << e.what() << "\ndownload a model with: scripts/download_llama32.sh (or download_tinyllama.sh) " << dir << '\n';
         return 2;
     }
     const double loadSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -613,9 +614,18 @@ int runLlama(const std::string& dir, const LlamaOptions& o) {
               << " heads, " << model.config.kvHeads << " kv heads, " << (o.int8 ? "int8" : "float32") << ") in "
               << std::fixed << std::setprecision(1) << loadSeconds << " s" << std::defaultfloat << '\n';
 
-    // Zephyr-style template used by TinyLlama-Chat: <|system|>/<|user|>/<|assistant|> turns ended by </s>.
     std::string text = o.prompt;
-    if (o.chat) {
+    if (o.chat && tok->tokenId("<|start_header_id|>") >= 0) {
+        // Llama 3 chat template (as Hugging Face renders it): a system turn with
+        // the knowledge cutoff and today's date, then the user turn.
+        char today[32];
+        const std::time_t now = std::time(nullptr);
+        std::strftime(today, sizeof(today), "%d %b %Y", std::localtime(&now));
+        text = "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: " +
+               std::string(today) + "\n\n" + o.system + "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n" + o.prompt +
+               "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+    } else if (o.chat) {
+        // Zephyr-style template used by TinyLlama-Chat: <|system|>/<|user|>/<|assistant|> turns ended by </s>.
         text.clear();
         if (!o.system.empty()) text += "<|system|>\n" + o.system + "</s>\n";
         text += "<|user|>\n" + o.prompt + "</s>\n<|assistant|>\n";
@@ -639,6 +649,7 @@ int runLlama(const std::string& dir, const LlamaOptions& o) {
         SamplingOptions greedy;
         greedy.temperature = 0.0f;
         greedy.stopToken = tok->eos();
+        greedy.stopTokens = model.stopTokens;
         const auto more = generate(model.net, ids, o.tokens, model.config.contextLength, greedy, model.context);
         std::cout << "greedy: " << quoted(tok->decode(more)) << '\n';
         return 0;
@@ -646,6 +657,7 @@ int runLlama(const std::string& dir, const LlamaOptions& o) {
 
     SamplingOptions sampling = o.sampling;
     sampling.stopToken = tok->eos();
+    sampling.stopTokens = model.stopTokens;
     bool first = true;
     sampling.onToken = [&](int id) {
         std::string piece = tok->decodePiece(id);
@@ -751,7 +763,7 @@ void usage() {
               << "  NeuraCraft gpt2 <dir> [prompt] [tokens] [--temperature T] [--top-k K] [--greedy] [--int8] [--check]\n"
               << "                               run pretrained GPT-2 (scripts/download_gpt2.sh)\n"
               << "  NeuraCraft llama <dir> [prompt] [tokens] [--chat] [--system S] [--fp32] [--greedy] [--check]\n"
-              << "                               run a Llama-family model, int8 by default (scripts/download_tinyllama.sh)\n"
+              << "                               Llama 3.x / TinyLlama / Mistral, int8 by default (scripts/download_llama32.sh)\n"
               << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
               << "options:\n"
               << "  --gpu          run large matrix products on the GPU (Metal)\n"

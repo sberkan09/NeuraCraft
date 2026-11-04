@@ -35,6 +35,9 @@ public:
     // all N inputs, so a forward pass reads the weights once whatever N is.
     Matrix multiply(const Matrix& x) const;
     Matrix dequantize() const;  // back to (in x out) floats
+    // Output feature j's weights as floats (dst holds inputs() values), e.g. an
+    // embedding row when the table is stored quantized.
+    void expandRow(std::size_t j, float* dst) const;
 
 private:
     std::size_t in_ = 0, out_ = 0, group_ = kDefaultGroup, groupsPerRow_ = 0;

@@ -46,6 +46,16 @@ QuantizedWeights QuantizedWeights::fromInOut(const Matrix& w, std::size_t group)
     return fromOutIn(w.transpose(), group);
 }
 
+void QuantizedWeights::expandRow(std::size_t j, float* dst) const {
+    if (j >= out_) throw std::out_of_range("QuantizedWeights::expandRow: row " + std::to_string(j) + " out of range");
+    const std::int8_t* src = q_.data() + j * in_;
+    const float* scales = scale_.data() + j * groupsPerRow_;
+    for (std::size_t g = 0; g < groupsPerRow_; ++g) {
+        const std::size_t k0 = g * group_, k1 = std::min(in_, k0 + group_);
+        for (std::size_t k = k0; k < k1; ++k) dst[k] = scales[g] * static_cast<float>(src[k]);
+    }
+}
+
 Matrix QuantizedWeights::multiply(const Matrix& x) const {
     if (x.cols() != in_)
         throw std::invalid_argument("QuantizedWeights::multiply: expected " + std::to_string(in_) + " columns, got " +

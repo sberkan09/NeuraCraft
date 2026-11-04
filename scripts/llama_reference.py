@@ -6,45 +6,73 @@
 
 Prints the prompt's token ids, the top-5 next-token logits and a greedy
 continuation, in the same format as `NeuraCraft llama ... --check --fp32`.
-Needs about 4 x the parameter count in bytes of memory (TinyLlama: ~4.5 GB).
+Handles TinyLlama / Llama 2 and Llama 3 (llama3 RoPE scaling, tied
+embeddings, the Llama 3 chat template). Weights stay memory-mapped and are
+converted to float32 when used, so memory stays near one layer's worth plus
+the embedding table.
 """
 import json
+import math
 import struct
 import sys
+import time
 
 import numpy as np
 from tokenizers import Tokenizer
 
 
-def load_safetensors(path):
-    """Reads F32 / F16 / BF16 tensors into float32 arrays (no extra packages)."""
-    with open(path, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
-        header = json.loads(f.read(n))
-    header.pop("__metadata__", None)
-    data = np.memmap(path, dtype=np.uint8, mode="r", offset=8 + n)
-    out = {}
-    for name, t in header.items():
+class LazyTensors:
+    """F32 / F16 / BF16 safetensors, converted to float32 on each access."""
+
+    def __init__(self, path):
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            self.header = json.loads(f.read(n))
+        self.header.pop("__metadata__", None)
+        self.data = np.memmap(path, dtype=np.uint8, mode="r", offset=8 + n)
+
+    def __contains__(self, name):
+        return name in self.header
+
+    def __getitem__(self, name):
+        t = self.header[name]
         a, b = t["data_offsets"]
-        raw = data[a:b]
+        raw = self.data[a:b]
         if t["dtype"] == "BF16":
             arr = (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
         elif t["dtype"] == "F16":
             arr = raw.view(np.float16).astype(np.float32)
         else:
             arr = np.array(raw.view(np.float32))
-        out[name] = arr.reshape(t["shape"])
-    return out
+        return arr.reshape(t["shape"])
+
+
+def inv_frequencies(cfg, hd):
+    """RoPE frequencies, with Hugging Face's "llama3" rope_scaling if configured."""
+    theta = cfg.get("rope_theta", 10000.0)
+    inv = theta ** (-np.arange(0, hd, 2, dtype=np.float64) / hd)
+    rs = cfg.get("rope_scaling")
+    if not rs:
+        return inv
+    if rs.get("rope_type", rs.get("type")) != "llama3":
+        raise SystemExit("unsupported rope_scaling")
+    factor, low, high = rs["factor"], rs.get("low_freq_factor", 1.0), rs.get("high_freq_factor", 4.0)
+    old = rs.get("original_max_position_embeddings", 8192)
+    wavelen = 2 * math.pi / inv
+    scaled = np.where(wavelen > old / low, inv / factor, inv)
+    smooth = (old / wavelen - low) / (high - low)
+    smoothed = (1 - smooth) * scaled / factor + smooth * scaled
+    medium = ~(wavelen < old / high) & ~(wavelen > old / low)
+    return np.where(medium, smoothed, scaled)
 
 
 def rms_norm(x, w, eps):
     return x / np.sqrt((x * x).mean(-1, keepdims=True) + eps) * w
 
 
-def rope(x, positions, theta):
+def rope(x, positions, inv):
     # x: (T, heads, hd); "rotate half" layout as in Hugging Face Llama.
     hd = x.shape[-1]
-    inv = theta ** (-np.arange(0, hd, 2, dtype=np.float64) / hd)
     ang = positions[:, None].astype(np.float64) * inv[None, :]
     cos = np.cos(ang).astype(np.float32)[:, None, :]
     sin = np.sin(ang).astype(np.float32)[:, None, :]
@@ -55,7 +83,8 @@ def rope(x, positions, theta):
 def forward(w, cfg, ids):
     D, H = cfg["hidden_size"], cfg["num_attention_heads"]
     KV = cfg.get("num_key_value_heads", H)
-    hd, eps, theta = D // H, cfg["rms_norm_eps"], cfg.get("rope_theta", 10000.0)
+    hd, eps = cfg.get("head_dim", D // H), cfg["rms_norm_eps"]
+    inv = inv_frequencies(cfg, hd)
     T = len(ids)
     pos = np.arange(T)
     x = w["model.embed_tokens.weight"][ids].astype(np.float32)
@@ -66,7 +95,7 @@ def forward(w, cfg, ids):
         q = (h @ w[p + "self_attn.q_proj.weight"].T).reshape(T, H, hd)
         k = (h @ w[p + "self_attn.k_proj.weight"].T).reshape(T, KV, hd)
         v = (h @ w[p + "self_attn.v_proj.weight"].T).reshape(T, KV, hd)
-        q, k = rope(q, pos, theta), rope(k, pos, theta)
+        q, k = rope(q, pos, inv), rope(k, pos, inv)
         heads = []
         for hh in range(H):
             g = hh // (H // KV)
@@ -90,10 +119,23 @@ def main():
     prompt = args[0] if args else "What is the capital of Turkey?"
     steps = int(args[1]) if len(args) > 1 else 20
     cfg = json.load(open(f"{model_dir}/config.json"))
-    w = load_safetensors(f"{model_dir}/model.safetensors")
+    w = LazyTensors(f"{model_dir}/model.safetensors")
     tok = Tokenizer.from_file(f"{model_dir}/tokenizer.json")
-    text = f"<|user|>\n{prompt}</s>\n<|assistant|>\n" if chat else prompt
-    ids = tok.encode(text).ids  # adds <s>
+    text = prompt
+    if chat and tok.token_to_id("<|start_header_id|>") is not None:  # Llama 3
+        today = time.strftime("%d %b %Y")
+        text = ("<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n"
+                f"Today Date: {today}\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}"
+                "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n")
+    elif chat:
+        text = f"<|user|>\n{prompt}</s>\n<|assistant|>\n"
+    ids = tok.encode(text).ids  # adds <s> / <|begin_of_text|>
+    stops = cfg.get("eos_token_id", 2)
+    try:
+        stops = json.load(open(f"{model_dir}/generation_config.json")).get("eos_token_id", stops)
+    except OSError:
+        pass
+    stops = set(stops if isinstance(stops, list) else [stops])
     print("prompt ids:", " ".join(map(str, ids)))
     logits = forward(w, cfg, ids)[-1]
     top = np.argsort(-logits)[:5]
@@ -102,7 +144,7 @@ def main():
     for _ in range(steps):
         nxt = int(np.argmax(forward(w, cfg, ids + out)[-1]))
         out.append(nxt)
-        if nxt == cfg.get("eos_token_id", 2):
+        if nxt in stops:
             break
     print("greedy:", repr(tok.decode(out, skip_special_tokens=True)))
 

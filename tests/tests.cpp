@@ -1308,7 +1308,7 @@ std::string tinyLlamaTokenizer(bool withPreTokenizer = false) {
       << R"({"id":264,"content":"<|user|>"}],)"
       << R"("normalizer":{"type":"Sequence","normalizers":[{"type":"Prepend","prepend":")" << S
       << R"("},{"type":"Replace","pattern":{"String":" "},"content":")" << S << R"("}]},)"
-      << R"("pre_tokenizer":)" << (withPreTokenizer ? R"({"type":"ByteLevel"})" : "null") << ','
+      << R"("pre_tokenizer":)" << (withPreTokenizer ? R"({"type":"Metaspace","replacement":"_"})" : "null") << ','
       << R"("model":{"type":"BPE","vocab":{"<unk>":0,"<s>":1,"</s>":2,)";
     for (int b = 0; b < 256; ++b) {
         char name[8];
@@ -1343,17 +1343,26 @@ std::map<std::string, Matrix> tinyLlamaWeights(bool tied) {
     return w;
 }
 
-void writeLlamaConfig(const std::string& dir, bool tied) {
+// Llama 3-style scaling small enough to matter here: with head size 4 the two
+// rotation pairs fall in the interpolated band and the slowed-down band.
+const RopeScaling kTestScaling{8.0f, 1.0f, 4.0f, 16};
+
+void writeLlamaConfig(const std::string& dir, bool tied, bool scaled = false) {
     std::ofstream cfg(dir + "/config.json");
     cfg << R"({"model_type":"llama","vocab_size":)" << llamaVocab << R"(,"hidden_size":)" << llamaDim
         << R"(,"num_attention_heads":)" << llamaHeads << R"(,"num_key_value_heads":)" << llamaKv
         << R"(,"num_hidden_layers":)" << llamaLayers << R"(,"intermediate_size":)" << llamaHidden
         << R"(,"max_position_embeddings":32,"rms_norm_eps":1e-5,"rope_theta":500.0,"hidden_act":"silu",)"
-        << R"("rope_scaling":null,"attention_bias":false,"tie_word_embeddings":)" << (tied ? "true" : "false") << '}';
+        << R"("attention_bias":false,"eos_token_id":2,"tie_word_embeddings":)" << (tied ? "true" : "false")
+        << R"(,"rope_scaling":)"
+        << (scaled ? R"({"rope_type":"llama3","factor":8.0,"low_freq_factor":1.0,"high_freq_factor":4.0,"original_max_position_embeddings":16})"
+                   : "null")
+        << '}';
 }
 
 // Straightforward Llama forward pass (Hugging Face layout, double precision).
-std::vector<std::vector<double>> llamaReference(std::map<std::string, Matrix>& w, const std::vector<int>& ids, bool tied) {
+std::vector<std::vector<double>> llamaReference(std::map<std::string, Matrix>& w, const std::vector<int>& ids, bool tied,
+                                                bool scaled = false) {
     const std::size_t T = ids.size(), D = llamaDim, Hh = llamaHeads, hd = D / Hh, group = Hh / llamaKv;
     const double eps = 1e-5, theta = 500.0;
     using Rows = std::vector<std::vector<double>>;
@@ -1374,11 +1383,22 @@ std::vector<std::vector<double>> llamaReference(std::map<std::string, Matrix>& w
         }
         return y;
     };
+    // Hugging Face's _compute_llama3_parameters, written out separately from the library.
+    auto frequency = [&](std::size_t j) {
+        const double inv = std::pow(theta, -2.0 * static_cast<double>(j) / static_cast<double>(hd));
+        if (!scaled) return inv;
+        const double factor = kTestScaling.factor, low = kTestScaling.lowFreqFactor, high = kTestScaling.highFreqFactor;
+        const double old = static_cast<double>(kTestScaling.originalContext), wavelen = 2 * 3.14159265358979323846 / inv;
+        const double llama = wavelen > old / low ? inv / factor : inv;
+        const double smooth = (old / wavelen - low) / (high - low);
+        const bool medium = !(wavelen < old / high) && !(wavelen > old / low);
+        return medium ? (1 - smooth) * llama / factor + smooth * llama : llama;
+    };
     auto rope = [&](Rows& x, std::size_t heads) {
         for (std::size_t t = 0; t < T; ++t)
             for (std::size_t h = 0; h < heads; ++h)
                 for (std::size_t j = 0; j < hd / 2; ++j) {
-                    const double a = static_cast<double>(t) * std::pow(theta, -2.0 * static_cast<double>(j) / static_cast<double>(hd));
+                    const double a = static_cast<double>(t) * frequency(j);
                     double& x1 = x[t][h * hd + j];
                     double& x2 = x[t][h * hd + j + hd / 2];
                     const double r1 = x1 * std::cos(a) - x2 * std::sin(a), r2 = x1 * std::sin(a) + x2 * std::cos(a);
@@ -1459,24 +1479,152 @@ TEST(llama_tokenizer_specials_merges_and_byte_fallback) {
     std::filesystem::remove_all(pre);
 }
 
+// A byte-level tokenizer.json in the Llama 3 format.
+std::string tinyByteLevelTokenizer(bool ignoreMerges) {
+    const std::string dir = tempPath(ignoreMerges ? "bltok" : "bltok_merges");
+    std::filesystem::create_directories(dir);
+    const std::string pattern =
+        R"PAT((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)PAT";
+    std::string escaped;
+    for (char c : pattern) escaped += c == '\\' ? std::string("\\\\") : std::string(1, c);
+    const std::string G = gpt2ByteSymbol(' ');
+    std::ofstream f(dir + "/tokenizer.json");
+    f << R"({"added_tokens":[{"id":260,"content":"<|begin_of_text|>"},{"id":261,"content":"<|eot_id|>"}],"normalizer":null,)"
+      << R"("pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":")" << escaped
+      << R"("},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"use_regex":false}]},)"
+      << R"("post_processor":{"type":"Sequence","processors":[{"type":"ByteLevel"},{"type":"TemplateProcessing",)"
+      << R"("single":[{"SpecialToken":{"id":"<|begin_of_text|>","type_id":0}},{"Sequence":{"id":"A","type_id":0}}]}]},)"
+      << R"("model":{"type":"BPE","ignore_merges":)" << (ignoreMerges ? "true" : "false") << R"(,"vocab":{)";
+    for (int b = 0; b < 256; ++b) {
+        std::string sym = gpt2ByteSymbol(b);
+        if (sym == "\"" || sym == "\\") sym = "\\" + sym;
+        f << '"' << sym << "\":" << b << ',';
+    }
+    f << R"("he":256,")" << G << R"(he":257,"llo":258,")" << G << R"(w":259},)"
+      << R"("merges":[["h","e"],[")" << G << R"(","he"],[")" << G << R"(","w"]]}})";
+    return dir;
+}
+
+TEST(llama3_pretokenizer_matches_huggingface) {
+    using V = std::vector<std::string>;
+    // Expected splits produced by Hugging Face tokenizers with the Llama 3.2 pattern.
+    CHECK(LlamaTokenizer::splitLlama3("Hello world") == V({"Hello", " world"}));
+    CHECK(LlamaTokenizer::splitLlama3("DON'T we'Re") == V({"DON", "'T", " we", "'Re"}));
+    CHECK(LlamaTokenizer::splitLlama3("1234567 x") == V({"123", "456", "7", " x"}));
+    CHECK(LlamaTokenizer::splitLlama3(" 123") == V({" ", "123"}));
+    CHECK(LlamaTokenizer::splitLlama3("a  b") == V({"a", " ", " b"}));
+    CHECK(LlamaTokenizer::splitLlama3("x\n\ny") == V({"x", "\n\n", "y"}));
+    CHECK(LlamaTokenizer::splitLlama3("  \n  z") == V({"  \n", " ", " z"}));
+    CHECK(LlamaTokenizer::splitLlama3("!hello ...") == V({"!hello", " ..."}));
+    CHECK(LlamaTokenizer::splitLlama3("end   ") == V({"end", "   "}));
+    CHECK(LlamaTokenizer::splitLlama3("v2.0!!\n") == V({"v", "2", ".", "0", "!!\n"}));
+    CHECK(LlamaTokenizer::splitLlama3("\tq") == V({"\tq"}));
+    CHECK(LlamaTokenizer::splitLlama3(" g\xc3\xbc" "zel \xf0\x9f\x9a\x80") == V({" g\xc3\xbc" "zel", " \xf0\x9f\x9a\x80"}));
+    CHECK(LlamaTokenizer::splitLlama3("e\xcc\x81") == V({"e", "\xcc\x81"}));  // a combining mark is not a letter
+    CHECK(LlamaTokenizer::splitLlama3("12345", 1) == V({"1", "2", "3", "4", "5"}));  // Qwen 2 variant
+    std::string joined;
+    for (const auto& w : LlamaTokenizer::splitLlama3("Mixed\t text\r\n with 123 and \xe2\x80\x9cquotes\xe2\x80\x9d  \n")) joined += w;
+    CHECK(joined == "Mixed\t text\r\n with 123 and \xe2\x80\x9cquotes\xe2\x80\x9d  \n");
+}
+
+TEST(byte_level_llama_tokenizer) {
+    const std::string dir = tinyByteLevelTokenizer(true);
+    const LlamaTokenizer tok(dir + "/tokenizer.json");
+    CHECK(tok.byteLevel() && tok.bos() == 260 && tok.eos() == 261 && tok.vocabSize() == 262);
+    CHECK(tok.encode(" he", true) == std::vector<int>({260, 257}));
+    CHECK(tok.encode("he w") == std::vector<int>({256, 259}));
+    CHECK(tok.encode("llo") == std::vector<int>({258}));  // whole word in the vocabulary: merges skipped
+    CHECK(tok.encode("he<|eot_id|>") == std::vector<int>({256, 261}));
+    CHECK(tok.encode("123456") == std::vector<int>({'1', '2', '3', '4', '5', '6'}));
+    const std::string text = "caf\xc3\xa9 \xf0\x9f\x9a\x80 x\n\ty";
+    CHECK(tok.decode(tok.encode(text)) == text);
+    CHECK(tok.decode({260, 257, 261}) == " he");  // specials are skipped, no space stripping
+    CHECK(tok.decodePiece(257) == " he" && tok.isSpecial(261));
+    const std::string plain = tinyByteLevelTokenizer(false);
+    CHECK(LlamaTokenizer(plain + "/tokenizer.json").encode("llo") == std::vector<int>({'l', 'l', 'o'}));
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(plain);
+}
+
+TEST(rope_scaling_matches_llama3_formula) {
+    const auto plain = ropeFrequencies(64, 500000.0);
+    CHECK(plain.size() == 32);
+    for (std::size_t i = 0; i < plain.size(); ++i)
+        CHECK_NEAR(plain[i], std::pow(500000.0, -2.0 * static_cast<double>(i) / 64.0), 1e-15);
+    // Llama 3.2's configuration; expected values from Hugging Face's formula.
+    const RopeScaling llama32{32.0f, 1.0f, 4.0f, 8192};
+    const auto f = ropeFrequencies(64, 500000.0, llama32);
+    const std::pair<std::size_t, double> expected[] = {{0, 1.0},
+                                                       {14, 0.003211445994752591},     // fast: unchanged
+                                                       {15, 0.001290547928209264},     // interpolated
+                                                       {16, 0.00042955679655936815},
+                                                       {17, 9.70828780262767e-05},
+                                                       {18, 1.9461638184831125e-05},   // slow: divided by 32
+                                                       {31, 9.41830672543491e-08}};
+    for (const auto& [i, v] : expected) CHECK_NEAR(f[i] / v, 1.0, 1e-9);
+    auto ctx = std::make_shared<SequenceContext>();
+    CausalSelfAttention att(8, 2, ctx, true);
+    CHECK_THROWS(att.setRopeScaling(RopeScaling{8.0f, 4.0f, 1.0f, 16}), std::invalid_argument);
+    // The scaling survives a config round trip.
+    GPTConfig c;
+    c.modern();
+    c.vocabSize = 10;
+    c.ropeScaling = llama32;
+    const std::string path = tempPath("scaled.config");
+    saveGPTConfig(path, c);
+    const GPTConfig back = loadGPTConfig(path);
+    CHECK(back.ropeScaling.factor == 32.0f && back.ropeScaling.highFreqFactor == 4.0f && back.ropeScaling.originalContext == 8192);
+    std::filesystem::remove(path);
+}
+
+TEST(embedding_quantization_serves_lookup_and_tied_output) {
+    setSeed(73);
+    GPTConfig c;
+    c.modern();
+    c.vocabSize = 50;
+    c.contextLength = 8;
+    c.dim = 64;
+    c.heads = 2;
+    c.layers = 1;
+    Network net;
+    buildGPT(net, c);
+    const Matrix x{{3, 14, 15, 9, 2}};
+    const Matrix before = net.predict(x);
+    auto& emb = dynamic_cast<TokenEmbedding&>(net.layer(0));
+    const Matrix table = emb.tokenTable();
+    CHECK(net.quantize() >= 4);  // embedding (shared with the output), attention, two MLP matrices
+    CHECK(emb.quantized() && emb.tokenTable().empty() && net.parameterCount() < table.size());
+    std::vector<float> row(64);
+    emb.quantizedTable().expandRow(14, row.data());
+    for (std::size_t j = 0; j < 64; ++j) CHECK_NEAR(row[j], table(14, j), 0.01);
+    const Matrix after = net.predict(x);
+    CHECK(after.approxEquals(before, 0.05f));
+    net.forward(x, true);
+    CHECK_THROWS(net.backward(Matrix(5, 50, 1.0f)), std::logic_error);
+}
+
 TEST(llama_loader_matches_reference_forward) {
     setSeed(71);
     const std::vector<int> ids{1, 5, 11, 0, 7, 7, 3};
-    for (bool tied : {false, true}) {
-        const std::string dir = tempPath(tied ? "llama_tied" : "llama_tiny");
+    for (int variant = 0; variant < 3; ++variant) {
+        const bool tied = variant >= 1, scaled = variant == 2;  // 2: Llama 3 style (tied, RoPE scaling)
+        const std::string dir = tempPath("llama_tiny" + std::to_string(variant));
         std::filesystem::create_directories(dir);
-        writeLlamaConfig(dir, tied);
+        writeLlamaConfig(dir, tied, scaled);
+        if (scaled) std::ofstream(dir + "/generation_config.json") << R"({"eos_token_id":[5,7]})";
         auto w = tinyLlamaWeights(tied);
         std::vector<std::pair<std::string, const Matrix*>> refs;
         for (const auto& [n, m] : w) refs.emplace_back(n, &m);
         saveSafeTensors(dir + "/model.safetensors", refs);
-        const auto ref = llamaReference(w, ids, tied);
+        const auto ref = llamaReference(w, ids, tied, scaled);
         double scale = 0;
         for (const auto& r : ref)
             for (double v : r) scale = std::max(scale, std::fabs(v));
 
         PretrainedModel fp = loadLlama(dir, false);
         CHECK(fp.config.kvHeads == llamaKv && fp.config.layers == llamaLayers && fp.config.tieEmbeddings == tied);
+        CHECK(fp.config.ropeScaling.enabled() == scaled);
+        CHECK(fp.stopTokens == (scaled ? std::vector<int>({5, 7}) : std::vector<int>({2})));
         CHECK(maxLogitError(fp, ref, ids) < 1e-4 * std::max(1.0, scale));
         PretrainedModel q = loadLlama(dir, true);
         // Random untrained weights amplify rounding more than a real model (TinyLlama: +0.1% perplexity).
@@ -1488,6 +1636,9 @@ TEST(llama_loader_matches_reference_forward) {
         const auto withCache = generate(fp.net, ids, 4, fp.config.contextLength, greedy, fp.context);
         const auto without = generate(fp.net, ids, 4, fp.config.contextLength, greedy);
         CHECK(withCache == without);
+        // Any listed stop token ends generation.
+        greedy.stopTokens = {withCache[0]};
+        CHECK(generate(fp.net, ids, 4, fp.config.contextLength, greedy, fp.context).size() == 1);
 
         // Sharded checkpoint: the same tensors split over two files plus an index.
         if (!tied) {

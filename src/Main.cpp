@@ -37,6 +37,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -958,6 +959,7 @@ void usage() {
               << "  NeuraCraft video <dir> zoom \"prompt\" ... [-o out.gif] [--frames N] [--zoom Z] [--pan DX,DY] [--rotate DEG]\n"
               << "  NeuraCraft video <dir> t2v \"prompt\" [-o out.gif] [--frames 16] [--steps 4] [--seed S] [--motion file] [--guidance G]\n"
               << "        [--context 16 --overlap 4] [--init image.png | --init-dir frames/] [--strength 0.75]\n"
+              << "  video output: .gif (256 colours), .png (animated PNG, full colour) or .mov (QuickTime Motion-JPEG)\n"
               << "        [--strength S] [--steps N] [--start in.png] [--seed S] [--size N] [--frames-dir DIR] [--full-vae]\n"
               << "        [--sharpen A] [--noise N] [--no-color-match]\n"
               << "                               image to image (input: PNG or PPM, cropped to the size)\n"
@@ -1133,7 +1135,9 @@ int main(int argc, char** argv) {
             const auto start = std::chrono::steady_clock::now();
             try {
                 const Image img = img2img ? imageToImage(args[1], loadImage(args[2]), prompt, o) : textToImage(args[1], prompt, o);
-                savePng(output, img);
+                if (output.size() > 4 && (output.compare(output.size() - 4, 4, ".jpg") == 0 || output.compare(output.size() - 4, 4, ".JPG") == 0))
+                    saveJpeg(output, img, 92);
+                else savePng(output, img);
             } catch (const std::exception& e) {
                 std::cerr << e.what() << "\ndownload SD-Turbo with: scripts/download_sd_turbo.sh " << args[1] << '\n';
                 return 2;
@@ -1265,8 +1269,12 @@ int main(int argc, char** argv) {
                 std::cerr << e.what() << "\ndownload SD-Turbo with: scripts/download_sd_turbo.sh " << args[1] << '\n';
                 return 2;
             }
-            const bool apng = output.size() >= 4 && output.compare(output.size() - 4, 4, ".png") == 0;
-            if (apng) saveApng(output, video, fps);  // full colour
+            auto endsWith = [&](const char* ext) {
+                const std::size_t n = std::strlen(ext);
+                return output.size() >= n && output.compare(output.size() - n, n, ext) == 0;
+            };
+            if (endsWith(".png")) saveApng(output, video, fps);           // full colour, lossless
+            else if (endsWith(".mov")) saveMjpegMov(output, video, fps);  // QuickTime, Motion-JPEG
             else saveGif(output, video, fps);
             if (!framesDir.empty()) {
                 std::filesystem::create_directories(framesDir);

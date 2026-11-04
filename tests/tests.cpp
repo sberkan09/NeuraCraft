@@ -2724,6 +2724,63 @@ TEST(compressed_png_and_animated_png) {
     std::filesystem::remove(path);
 }
 
+TEST(jpeg_encoder_and_quicktime_movie) {
+    Image img;
+    img.width = 37;  // not a multiple of the 16x16 MCU
+    img.height = 21;
+    for (std::size_t y = 0; y < 21; ++y)
+        for (std::size_t x = 0; x < 37; ++x)
+            for (int c = 0; c < 3; ++c) img.pixels.push_back(static_cast<std::uint8_t>(c == 0 ? x * 7 : c == 1 ? y * 12 : (x * y) % 256));
+    const auto hi = encodeJpeg(img, 95), lo = encodeJpeg(img, 30);
+    CHECK(lo.size() < hi.size());
+    // Markers: SOI, APP0, 2 DQT, SOF0 with the size and 4:2:0 luma sampling, 4 DHT, SOS ... EOI.
+    std::vector<int> markers;
+    std::size_t p = 2, sos = 0;
+    CHECK(hi[0] == 0xFF && hi[1] == 0xD8);
+    while (p + 4 <= hi.size() && !sos) {
+        CHECK(hi[p] == 0xFF);
+        const int m = hi[p + 1], len = (hi[p + 2] << 8) | hi[p + 3];
+        markers.push_back(m);
+        if (m == 0xC0) CHECK(((hi[p + 5] << 8) | hi[p + 6]) == 21 && ((hi[p + 7] << 8) | hi[p + 8]) == 37 && hi[p + 9] == 3 && hi[p + 11] == 0x22);
+        if (m == 0xDA) sos = p + 2 + static_cast<std::size_t>(len);
+        p += 2 + static_cast<std::size_t>(len);
+    }
+    CHECK(markers == std::vector<int>({0xE0, 0xDB, 0xDB, 0xC0, 0xC4, 0xC4, 0xC4, 0xC4, 0xDA}));
+    CHECK(hi[hi.size() - 2] == 0xFF && hi.back() == 0xD9);
+    for (std::size_t i = sos; i + 2 < hi.size(); ++i)
+        if (hi[i] == 0xFF) CHECK(hi[i + 1] == 0x00);  // every 0xFF in the entropy data is stuffed
+    CHECK_THROWS(encodeJpeg(img, 0), std::invalid_argument);
+
+    // QuickTime: ftyp, mdat with the JPEGs, moov whose sample table points at them.
+    const std::string path = tempPath("m.mov");
+    Image other = img;
+    for (auto& v : other.pixels) v = static_cast<std::uint8_t>(255 - v);
+    saveMjpegMov(path, {img, other, img}, 12.0f, 80);
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<std::uint8_t> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    auto be32 = [&](std::size_t q) {
+        return (std::uint32_t{d[q]} << 24) | (std::uint32_t{d[q + 1]} << 16) | (std::uint32_t{d[q + 2]} << 8) | d[q + 3];
+    };
+    auto find = [&](const char* tag) {
+        for (std::size_t q = 4; q + 4 <= d.size(); ++q)
+            if (std::equal(tag, tag + 4, d.begin() + static_cast<long>(q))) return q - 4;
+        return d.size();
+    };
+    std::vector<std::string> top;
+    for (std::size_t q = 0; q + 8 <= d.size(); q += be32(q)) top.emplace_back(d.begin() + static_cast<long>(q + 4), d.begin() + static_cast<long>(q + 8));
+    CHECK(top == std::vector<std::string>({"ftyp", "mdat", "moov"}));
+    const std::size_t stsz = find("stsz"), stco = find("stco"), stts = find("stts"), mdhd = find("mdhd");
+    CHECK(stsz < d.size() && stco < d.size() && be32(stsz + 16) == 3 && be32(stco + 12) == 3);
+    CHECK(be32(stts + 16) == 3 && be32(mdhd + 20) == 12000 && be32(stts + 20) == 1000);  // 12 fps
+    for (std::size_t k = 0; k < 3; ++k) {
+        const std::size_t off = be32(stco + 16 + 4 * k), size = be32(stsz + 20 + 4 * k);
+        CHECK(d[off] == 0xFF && d[off + 1] == 0xD8 && d[off + size - 2] == 0xFF && d[off + size - 1] == 0xD9);
+    }
+    CHECK(find("jpeg") < d.size());
+    CHECK_THROWS(saveMjpegMov(path, {img, Image{}}, 8.0f), std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
 TEST(png_reader_and_image_resizing) {
     const Image rgb = pngFromBytes(kPngRgb);
     CHECK(rgb.width == 9 && rgb.height == 7 && rgb.channels == 3 && rgb.pixels == kPngRgbPixels);

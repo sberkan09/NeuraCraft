@@ -157,6 +157,12 @@ void savePng(const std::string& path, const Image& image);
 // Animated PNG (APNG): full-colour frames of one size, no palette or dither;
 // browsers and most viewers play it, others show the first frame.
 void saveApng(const std::string& path, const std::vector<Image>& frames, float framesPerSecond = 8.0f, bool loop = true);
+// Baseline JPEG (4:2:0, standard Huffman tables, libjpeg's quality scaling).
+std::vector<std::uint8_t> encodeJpeg(const Image& image, int quality = 90);
+void saveJpeg(const std::string& path, const Image& image, int quality = 90);
+// A QuickTime movie of JPEG frames (Photo-JPEG / Motion-JPEG): QuickTime,
+// macOS Finder previews, VLC and ffmpeg play it; frames of one size.
+void saveMjpegMov(const std::string& path, const std::vector<Image>& frames, float framesPerSecond = 8.0f, int quality = 90);
 // A zlib stream (RFC 1950 / 1951) of `data`.
 std::vector<std::uint8_t> deflateCompress(const std::vector<std::uint8_t>& data);
 // PNG reader: 8-bit grey, grey + alpha, RGB, RGBA and palette images (also

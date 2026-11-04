@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <fstream>
 #include <functional>
@@ -85,7 +86,7 @@ std::string tempPath(const std::string& name) {
 
 // Compares analytic parameter and input gradients with central differences.
 void gradientCheck(Network& net, Loss& loss, const Matrix& x, const Matrix& y) {
-    const Matrix out = net.forward(x, false);
+    const Matrix out = net.forward(x, true);  // training mode keeps what backward needs (no dropout here)
     loss.compute(out, y);
     const Matrix inputGrad = net.backward(loss.gradient());
 
@@ -1289,6 +1290,266 @@ TEST(gpt2_loader_maps_huggingface_tensors) {
     saveSafeTensors(dir + "/model.safetensors", refs);
     CHECK_THROWS(loadGPT2(dir), std::runtime_error);
     std::filesystem::remove_all(dir);
+}
+
+// ---- Llama ---------------------------------------------------------------------------------
+
+namespace {
+const char* kSp = "\xe2\x96\x81";  // "▁"
+
+// A small tokenizer.json in the Llama / TinyLlama format: specials, 256 byte
+// tokens, a few merges and the Prepend + Replace normalizer.
+std::string tinyLlamaTokenizer(bool withPreTokenizer = false) {
+    const std::string dir = tempPath(withPreTokenizer ? "llamatok_pre" : "llamatok");
+    std::filesystem::create_directories(dir);
+    const std::string S = kSp;
+    std::ofstream f(dir + "/tokenizer.json");
+    f << R"({"added_tokens":[{"id":0,"content":"<unk>"},{"id":1,"content":"<s>"},{"id":2,"content":"</s>"},)"
+      << R"({"id":264,"content":"<|user|>"}],)"
+      << R"("normalizer":{"type":"Sequence","normalizers":[{"type":"Prepend","prepend":")" << S
+      << R"("},{"type":"Replace","pattern":{"String":" "},"content":")" << S << R"("}]},)"
+      << R"("pre_tokenizer":)" << (withPreTokenizer ? R"({"type":"ByteLevel"})" : "null") << ','
+      << R"("model":{"type":"BPE","vocab":{"<unk>":0,"<s>":1,"</s>":2,)";
+    for (int b = 0; b < 256; ++b) {
+        char name[8];
+        std::snprintf(name, sizeof(name), "<0x%02X>", b);
+        f << '"' << name << "\":" << 3 + b << ',';
+    }
+    f << '"' << S << "\":259,\"h\":260,\"i\":261,\"" << S << "h\":262,\"" << S << "hi\":263},"
+      << R"("merges":[")" << S << R"( h",[")" << S << R"(h","i"]]}})";
+    return dir;
+}
+
+std::size_t llamaVocab = 12, llamaDim = 16, llamaHeads = 4, llamaKv = 2, llamaHidden = 12, llamaLayers = 2;
+
+std::map<std::string, Matrix> tinyLlamaWeights(bool tied) {
+    const std::size_t D = llamaDim, kv = llamaKv * (llamaDim / llamaHeads), H = llamaHidden;
+    std::map<std::string, Matrix> w;
+    w["model.embed_tokens.weight"] = Matrix::uniform(llamaVocab, D, -1, 1);
+    for (std::size_t i = 0; i < llamaLayers; ++i) {
+        const std::string p = "model.layers." + std::to_string(i) + ".";
+        w[p + "input_layernorm.weight"] = Matrix::uniform(1, D, 0.5f, 1.5f);
+        w[p + "post_attention_layernorm.weight"] = Matrix::uniform(1, D, 0.5f, 1.5f);
+        w[p + "self_attn.q_proj.weight"] = Matrix::uniform(D, D, -0.5f, 0.5f);
+        w[p + "self_attn.k_proj.weight"] = Matrix::uniform(kv, D, -0.5f, 0.5f);
+        w[p + "self_attn.v_proj.weight"] = Matrix::uniform(kv, D, -0.5f, 0.5f);
+        w[p + "self_attn.o_proj.weight"] = Matrix::uniform(D, D, -0.5f, 0.5f);
+        w[p + "mlp.gate_proj.weight"] = Matrix::uniform(H, D, -0.5f, 0.5f);
+        w[p + "mlp.up_proj.weight"] = Matrix::uniform(H, D, -0.5f, 0.5f);
+        w[p + "mlp.down_proj.weight"] = Matrix::uniform(D, H, -0.5f, 0.5f);
+    }
+    w["model.norm.weight"] = Matrix::uniform(1, D, 0.5f, 1.5f);
+    if (!tied) w["lm_head.weight"] = Matrix::uniform(llamaVocab, D, -1, 1);
+    return w;
+}
+
+void writeLlamaConfig(const std::string& dir, bool tied) {
+    std::ofstream cfg(dir + "/config.json");
+    cfg << R"({"model_type":"llama","vocab_size":)" << llamaVocab << R"(,"hidden_size":)" << llamaDim
+        << R"(,"num_attention_heads":)" << llamaHeads << R"(,"num_key_value_heads":)" << llamaKv
+        << R"(,"num_hidden_layers":)" << llamaLayers << R"(,"intermediate_size":)" << llamaHidden
+        << R"(,"max_position_embeddings":32,"rms_norm_eps":1e-5,"rope_theta":500.0,"hidden_act":"silu",)"
+        << R"("rope_scaling":null,"attention_bias":false,"tie_word_embeddings":)" << (tied ? "true" : "false") << '}';
+}
+
+// Straightforward Llama forward pass (Hugging Face layout, double precision).
+std::vector<std::vector<double>> llamaReference(std::map<std::string, Matrix>& w, const std::vector<int>& ids, bool tied) {
+    const std::size_t T = ids.size(), D = llamaDim, Hh = llamaHeads, hd = D / Hh, group = Hh / llamaKv;
+    const double eps = 1e-5, theta = 500.0;
+    using Rows = std::vector<std::vector<double>>;
+    auto linear = [](const Rows& x, const Matrix& W) {  // W is out x in
+        Rows y(x.size(), std::vector<double>(W.rows(), 0.0));
+        for (std::size_t t = 0; t < x.size(); ++t)
+            for (std::size_t o = 0; o < W.rows(); ++o)
+                for (std::size_t i = 0; i < W.cols(); ++i) y[t][o] += x[t][i] * W(o, i);
+        return y;
+    };
+    auto rms = [&](const Rows& x, const Matrix& g) {
+        Rows y = x;
+        for (auto& r : y) {
+            double ss = 0;
+            for (double v : r) ss += v * v;
+            const double inv = 1.0 / std::sqrt(ss / static_cast<double>(r.size()) + eps);
+            for (std::size_t i = 0; i < r.size(); ++i) r[i] *= inv * g(0, i);
+        }
+        return y;
+    };
+    auto rope = [&](Rows& x, std::size_t heads) {
+        for (std::size_t t = 0; t < T; ++t)
+            for (std::size_t h = 0; h < heads; ++h)
+                for (std::size_t j = 0; j < hd / 2; ++j) {
+                    const double a = static_cast<double>(t) * std::pow(theta, -2.0 * static_cast<double>(j) / static_cast<double>(hd));
+                    double& x1 = x[t][h * hd + j];
+                    double& x2 = x[t][h * hd + j + hd / 2];
+                    const double r1 = x1 * std::cos(a) - x2 * std::sin(a), r2 = x1 * std::sin(a) + x2 * std::cos(a);
+                    x1 = r1;
+                    x2 = r2;
+                }
+    };
+    Rows x(T, std::vector<double>(D));
+    for (std::size_t t = 0; t < T; ++t)
+        for (std::size_t i = 0; i < D; ++i) x[t][i] = w["model.embed_tokens.weight"](static_cast<std::size_t>(ids[t]), i);
+    for (std::size_t l = 0; l < llamaLayers; ++l) {
+        const std::string p = "model.layers." + std::to_string(l) + ".";
+        const Rows h = rms(x, w[p + "input_layernorm.weight"]);
+        Rows q = linear(h, w[p + "self_attn.q_proj.weight"]), k = linear(h, w[p + "self_attn.k_proj.weight"]);
+        const Rows v = linear(h, w[p + "self_attn.v_proj.weight"]);
+        rope(q, Hh);
+        rope(k, llamaKv);
+        Rows merged(T, std::vector<double>(D, 0.0));
+        for (std::size_t hh = 0; hh < Hh; ++hh) {
+            const std::size_t g = hh / group;
+            for (std::size_t t = 0; t < T; ++t) {
+                std::vector<double> s(t + 1);
+                double mx = -1e300, sum = 0;
+                for (std::size_t u = 0; u <= t; ++u) {
+                    for (std::size_t j = 0; j < hd; ++j) s[u] += q[t][hh * hd + j] * k[u][g * hd + j];
+                    s[u] /= std::sqrt(static_cast<double>(hd));
+                    mx = std::max(mx, s[u]);
+                }
+                for (double& e : s) sum += (e = std::exp(e - mx));
+                for (std::size_t u = 0; u <= t; ++u)
+                    for (std::size_t j = 0; j < hd; ++j) merged[t][hh * hd + j] += s[u] / sum * v[u][g * hd + j];
+            }
+        }
+        const Rows o = linear(merged, w[p + "self_attn.o_proj.weight"]);
+        for (std::size_t t = 0; t < T; ++t)
+            for (std::size_t i = 0; i < D; ++i) x[t][i] += o[t][i];
+        const Rows h2 = rms(x, w[p + "post_attention_layernorm.weight"]);
+        Rows gate = linear(h2, w[p + "mlp.gate_proj.weight"]);
+        const Rows up = linear(h2, w[p + "mlp.up_proj.weight"]);
+        for (std::size_t t = 0; t < T; ++t)
+            for (std::size_t i = 0; i < gate[t].size(); ++i) gate[t][i] = gate[t][i] / (1.0 + std::exp(-gate[t][i])) * up[t][i];
+        const Rows down = linear(gate, w[p + "mlp.down_proj.weight"]);
+        for (std::size_t t = 0; t < T; ++t)
+            for (std::size_t i = 0; i < D; ++i) x[t][i] += down[t][i];
+    }
+    return linear(rms(x, w["model.norm.weight"]), tied ? w["model.embed_tokens.weight"] : w["lm_head.weight"]);
+}
+
+double maxLogitError(PretrainedModel& model, const std::vector<std::vector<double>>& ref, const std::vector<int>& ids) {
+    Matrix x(1, ids.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) x(0, i) = static_cast<float>(ids[i]);
+    const Matrix logits = model.net.predict(x);
+    double err = 0;
+    for (std::size_t t = 0; t < ids.size(); ++t)
+        for (std::size_t j = 0; j < llamaVocab; ++j) err = std::max(err, std::fabs(logits(t, j) - ref[t][j]));
+    return err;
+}
+} // namespace
+
+TEST(llama_tokenizer_specials_merges_and_byte_fallback) {
+    const std::string dir = tinyLlamaTokenizer();
+    const LlamaTokenizer tok(dir + "/tokenizer.json");
+    CHECK(tok.vocabSize() == 265 && tok.bos() == 1 && tok.eos() == 2);
+    CHECK(tok.encode("hi", true) == std::vector<int>({1, 263}));
+    CHECK(tok.encode("hi hi") == std::vector<int>({263, 263}));
+    CHECK(tok.encode("ih") == std::vector<int>({259, 261, 260}));  // no merge for "▁ i"
+    // "é" is not in the vocabulary: its two UTF-8 bytes become <0xC3> <0xA9>.
+    CHECK(tok.encode("h\xc3\xa9") == std::vector<int>({262, 3 + 0xC3, 3 + 0xA9}));
+    // Special tokens in the text are matched verbatim; text after them gets its own "▁".
+    CHECK(tok.encode("<|user|>\nhi</s>") == std::vector<int>({264, 259, 3 + '\n', 260, 261, 2}));
+    CHECK(tok.decode({1, 263, 263, 2}) == "hi hi");
+    CHECK(tok.decode(tok.encode("h\xc3\xa9 hi")) == "h\xc3\xa9 hi");
+    CHECK(tok.decodePiece(263) == " hi" && tok.decodePiece(2).empty() && tok.isSpecial(264) && !tok.isSpecial(263));
+    CHECK_THROWS(tok.decodePiece(999), std::out_of_range);
+    const std::string pre = tinyLlamaTokenizer(true);
+    CHECK_THROWS(LlamaTokenizer(pre + "/tokenizer.json"), std::runtime_error);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(pre);
+}
+
+TEST(llama_loader_matches_reference_forward) {
+    setSeed(71);
+    const std::vector<int> ids{1, 5, 11, 0, 7, 7, 3};
+    for (bool tied : {false, true}) {
+        const std::string dir = tempPath(tied ? "llama_tied" : "llama_tiny");
+        std::filesystem::create_directories(dir);
+        writeLlamaConfig(dir, tied);
+        auto w = tinyLlamaWeights(tied);
+        std::vector<std::pair<std::string, const Matrix*>> refs;
+        for (const auto& [n, m] : w) refs.emplace_back(n, &m);
+        saveSafeTensors(dir + "/model.safetensors", refs);
+        const auto ref = llamaReference(w, ids, tied);
+        double scale = 0;
+        for (const auto& r : ref)
+            for (double v : r) scale = std::max(scale, std::fabs(v));
+
+        PretrainedModel fp = loadLlama(dir, false);
+        CHECK(fp.config.kvHeads == llamaKv && fp.config.layers == llamaLayers && fp.config.tieEmbeddings == tied);
+        CHECK(maxLogitError(fp, ref, ids) < 1e-4 * std::max(1.0, scale));
+        PretrainedModel q = loadLlama(dir, true);
+        // Random untrained weights amplify rounding more than a real model (TinyLlama: +0.1% perplexity).
+        CHECK(maxLogitError(q, ref, ids) < 0.1 * scale);
+
+        // The KV cache gives the same last-position logits as the full pass.
+        SamplingOptions greedy;
+        greedy.temperature = 0.0f;
+        const auto withCache = generate(fp.net, ids, 4, fp.config.contextLength, greedy, fp.context);
+        const auto without = generate(fp.net, ids, 4, fp.config.contextLength, greedy);
+        CHECK(withCache == without);
+
+        // Sharded checkpoint: the same tensors split over two files plus an index.
+        if (!tied) {
+            std::filesystem::remove(dir + "/model.safetensors");
+            std::vector<std::pair<std::string, const Matrix*>> a, b;
+            std::ofstream index(dir + "/model.safetensors.index.json");
+            index << R"({"metadata":{},"weight_map":{)";
+            bool first = true;
+            for (const auto& [n, m] : w) {
+                const bool second = n.find("layers.1.") != std::string::npos || n == "lm_head.weight";
+                (second ? b : a).emplace_back(n, &m);
+                index << (first ? "" : ",") << '"' << n << "\":\"" << (second ? "part-2.safetensors" : "part-1.safetensors") << '"';
+                first = false;
+            }
+            index << "}}";
+            index.close();
+            saveSafeTensors(dir + "/part-1.safetensors", a);
+            saveSafeTensors(dir + "/part-2.safetensors", b);
+            PretrainedModel sharded = loadLlama(dir, false);
+            CHECK(maxLogitError(sharded, ref, ids) < 1e-4 * std::max(1.0, scale));
+        }
+
+        // Mismatched shapes and unsupported configurations are reported.
+        w["model.layers.0.self_attn.k_proj.weight"] = Matrix(llamaDim, llamaDim);
+        refs.clear();
+        for (const auto& [n, m] : w) refs.emplace_back(n, &m);
+        std::filesystem::remove(dir + "/model.safetensors.index.json");
+        saveSafeTensors(dir + "/model.safetensors", refs);
+        CHECK_THROWS(loadLlama(dir, false), std::runtime_error);
+        {
+            std::ofstream cfg(dir + "/config.json");
+            cfg << R"({"model_type":"llama","vocab_size":12,"hidden_size":8,"num_attention_heads":4,)"
+                << R"("num_hidden_layers":1,"intermediate_size":12,"rope_scaling":{"type":"linear","factor":2.0}})";
+        }
+        CHECK_THROWS(loadLlama(dir, false), std::runtime_error);
+        std::filesystem::remove_all(dir);
+    }
+}
+
+TEST(inference_forward_keeps_no_backward_state) {
+    setSeed(72);
+    Network net;
+    net.add<Dense>(4, 6);
+    net.add<GELU>();
+    net.add<LayerNorm>(6);
+    net.add<Dense>(6, 3);
+    const Matrix x = Matrix::uniform(5, 4, -1, 1);
+    const Matrix inference = net.forward(x, false);
+    CHECK_THROWS(net.backward(Matrix(5, 3, 1.0f)), std::logic_error);  // nothing cached for backward
+    CHECK(net.forward(x, true).approxEquals(inference, 1e-6f));        // same result in training mode
+    CHECK(net.backward(Matrix(5, 3, 1.0f)).rows() == 5);
+    // A later inference pass drops what the training pass cached.
+    net.forward(x, false);
+    CHECK_THROWS(net.backward(Matrix(5, 3, 1.0f)), std::logic_error);
+
+    auto ctx = std::make_shared<SequenceContext>();
+    ctx->length = 3;
+    CausalSelfAttention att(8, 2, ctx, true, 10000.0f, 1);
+    const Matrix seq = Matrix::uniform(6, 8, -1, 1);  // 2 sequences x 3 positions
+    const Matrix y = att.forward(seq, false);
+    CHECK_THROWS(att.backward(Matrix(6, 8, 1.0f)), std::logic_error);
+    CHECK(att.forward(seq, true).approxEquals(y, 1e-5f));
 }
 
 // ---- Training robustness ------------------------------------------------------------------

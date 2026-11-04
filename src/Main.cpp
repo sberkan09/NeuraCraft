@@ -13,6 +13,8 @@
 //                              sample from the trained GPT
 //   NeuraCraft gpt2 <dir> [prompt] [tokens] [options]
 //                              run pretrained GPT-2 weights (scripts/download_gpt2.sh)
+//   NeuraCraft llama <dir> [prompt] [tokens] [options]
+//                              run a Llama-family checkpoint (scripts/download_tinyllama.sh)
 //   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
 //
 // Global options: --gpu (Metal on Apple silicon), --threads N
@@ -587,6 +589,81 @@ int runGpt2(const std::string& dir, const std::string& prompt, std::size_t token
     return 0;
 }
 
+struct LlamaOptions {
+    std::string prompt = "What is the capital of Turkey?";
+    std::string system;
+    std::size_t tokens = 128;
+    bool chat = false, check = false, int8 = true;
+    SamplingOptions sampling;
+};
+
+int runLlama(const std::string& dir, const LlamaOptions& o) {
+    const auto t0 = std::chrono::steady_clock::now();
+    PretrainedModel model;
+    std::unique_ptr<LlamaTokenizer> tok;
+    try {
+        tok = std::make_unique<LlamaTokenizer>(dir + "/tokenizer.json");
+        model = loadLlama(dir, o.int8);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\ndownload TinyLlama with: scripts/download_tinyllama.sh " << dir << '\n';
+        return 2;
+    }
+    const double loadSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::cerr << "loaded " << model.config.layers << "-layer Llama (dim " << model.config.dim << ", " << model.config.heads
+              << " heads, " << model.config.kvHeads << " kv heads, " << (o.int8 ? "int8" : "float32") << ") in "
+              << std::fixed << std::setprecision(1) << loadSeconds << " s" << std::defaultfloat << '\n';
+
+    // Zephyr-style template used by TinyLlama-Chat: <|system|>/<|user|>/<|assistant|> turns ended by </s>.
+    std::string text = o.prompt;
+    if (o.chat) {
+        text.clear();
+        if (!o.system.empty()) text += "<|system|>\n" + o.system + "</s>\n";
+        text += "<|user|>\n" + o.prompt + "</s>\n<|assistant|>\n";
+    }
+    const std::vector<int> ids = tok->encode(text, true);
+
+    if (o.check) {
+        std::cout << "prompt ids:";
+        for (int id : ids) std::cout << ' ' << id;
+        std::cout << '\n';
+        Matrix x(1, ids.size());
+        for (std::size_t i = 0; i < ids.size(); ++i) x(0, i) = static_cast<float>(ids[i]);
+        const Matrix logits = model.net.predict(x);
+        const float* last = logits.data() + (logits.rows() - 1) * logits.cols();
+        std::vector<int> order(logits.cols());
+        std::iota(order.begin(), order.end(), 0);
+        std::partial_sort(order.begin(), order.begin() + 5, order.end(), [&](int a, int b) { return last[a] > last[b]; });
+        std::cout << "top-5 next:" << std::fixed << std::setprecision(4);
+        for (int k = 0; k < 5; ++k) std::cout << ' ' << order[static_cast<std::size_t>(k)] << ':' << last[order[static_cast<std::size_t>(k)]];
+        std::cout << std::defaultfloat << '\n';
+        SamplingOptions greedy;
+        greedy.temperature = 0.0f;
+        greedy.stopToken = tok->eos();
+        const auto more = generate(model.net, ids, o.tokens, model.config.contextLength, greedy, model.context);
+        std::cout << "greedy: " << quoted(tok->decode(more)) << '\n';
+        return 0;
+    }
+
+    SamplingOptions sampling = o.sampling;
+    sampling.stopToken = tok->eos();
+    bool first = true;
+    sampling.onToken = [&](int id) {
+        std::string piece = tok->decodePiece(id);
+        if (first && !piece.empty() && piece[0] == ' ') piece.erase(0, 1);
+        first = false;
+        std::cout << piece << std::flush;
+    };
+    if (!o.chat) std::cout << o.prompt << std::flush;
+    const auto start = std::chrono::steady_clock::now();
+    const auto out = generate(model.net, ids, o.tokens, model.config.contextLength, sampling, model.context);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::cout << '\n';
+    std::cerr << out.size() << " tokens in " << std::fixed << std::setprecision(2) << seconds << " s ("
+              << std::setprecision(1) << static_cast<double>(out.size()) / seconds << " tokens/s incl. a "
+              << ids.size() << "-token prompt)" << std::defaultfloat << '\n';
+    return 0;
+}
+
 // Times `run` (one n x n x n product); returns GFLOPS.
 double timeGemm(std::size_t n, const std::function<void()>& run) {
     run();  // warm-up
@@ -673,6 +750,8 @@ void usage() {
               << "                               sample text from the trained GPT\n"
               << "  NeuraCraft gpt2 <dir> [prompt] [tokens] [--temperature T] [--top-k K] [--greedy] [--int8] [--check]\n"
               << "                               run pretrained GPT-2 (scripts/download_gpt2.sh)\n"
+              << "  NeuraCraft llama <dir> [prompt] [tokens] [--chat] [--system S] [--fp32] [--greedy] [--check]\n"
+              << "                               run a Llama-family model, int8 by default (scripts/download_tinyllama.sh)\n"
               << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
               << "options:\n"
               << "  --gpu          run large matrix products on the GPU (Metal)\n"
@@ -802,6 +881,38 @@ int main(int argc, char** argv) {
                 }
             }
             return runGpt2(args[1], prompt, tokens, sampling, check, int8);
+        }
+        if (cmd == "llama") {
+            if (args.size() < 2) {
+                usage();
+                return 2;
+            }
+            LlamaOptions o;
+            o.sampling.temperature = 0.7f;
+            o.sampling.topK = 40;
+            std::size_t positional = 0;
+            for (std::size_t i = 2; i < args.size(); ++i) {
+                const std::string& a = args[i];
+                auto value = [&]() -> std::string {
+                    if (i + 1 >= args.size()) throw std::invalid_argument(a + " needs a value");
+                    return args[++i];
+                };
+                if (a == "--chat") o.chat = true;
+                else if (a == "--system") { o.system = value(); o.chat = true; }
+                else if (a == "--fp32") o.int8 = false;
+                else if (a == "--int8") o.int8 = true;
+                else if (a == "--check") o.check = true;
+                else if (a == "--greedy") o.sampling.temperature = 0.0f;
+                else if (a == "--temperature") o.sampling.temperature = std::stof(value());
+                else if (a == "--top-k") o.sampling.topK = std::stoul(value());
+                else if (positional == 0) { o.prompt = a; ++positional; }
+                else if (positional == 1) { o.tokens = std::stoul(a); ++positional; }
+                else {
+                    std::cerr << "unknown llama option: " << a << "\n";
+                    return 2;
+                }
+            }
+            return runLlama(args[1], o);
         }
         if (cmd == "generate") {
             if (args.size() < 2) {

@@ -157,6 +157,11 @@ public:
 
     std::size_t quantize() override;  // int8 projections; inference-only afterwards
     std::size_t keyValueHeads() const { return kvHeads_; }
+    std::size_t qkvColumns() const { return dim_ + 2 * kvDim_; }
+    // Install weights from a checkpoint, with zero biases: float (in x out)
+    // matrices, or ready-made int8 ones.
+    void setWeights(Matrix qkv, Matrix out);
+    void setQuantized(QuantizedWeights qkv, QuantizedWeights out);
 
     // Fused [Q | K | V] projection (dim x (dim + 2 * kvHeads * headDim), heads
     // contiguous within each block) and the output projection (dim x dim), as in

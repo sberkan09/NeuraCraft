@@ -42,6 +42,37 @@ private:
     mutable std::unordered_map<std::string, std::vector<int>> cache_;
 };
 
+// Llama / Mistral SentencePiece-style BPE tokenizer from a Hugging Face
+// `tokenizer.json`: special tokens are split out first, each piece of text is
+// normalized (prepend "▁", spaces -> "▁"), BPE merges run over characters, and
+// characters missing from the vocabulary fall back to <0xXX> byte tokens.
+class LlamaTokenizer : public Tokenizer {
+public:
+    explicit LlamaTokenizer(const std::string& tokenizerJsonPath);
+
+    // Special token names in the text (e.g. "</s>") become their ids.
+    std::vector<int> encode(const std::string& text) const override { return encode(text, false); }
+    std::vector<int> encode(const std::string& text, bool addBos) const;
+    std::string decode(const std::vector<int>& ids) const override;  // skips special tokens
+    std::string decodePiece(int id) const;  // one token, for streaming (no leading-space strip)
+    std::size_t vocabSize() const override { return idToToken_.size(); }
+    int bos() const { return bos_; }
+    int eos() const { return eos_; }
+    bool isSpecial(int id) const;
+
+private:
+    std::vector<int> encodeSegment(const std::string& text) const;
+
+    std::unordered_map<std::string, int> vocab_;
+    std::vector<std::string> idToToken_;
+    std::unordered_map<std::string, int> ranks_;  // "left right" -> merge rank
+    std::vector<std::pair<std::string, int>> specials_;  // added tokens matched verbatim
+    std::array<int, 256> byteTokens_{};          // <0xXX> ids, -1 if absent
+    std::string prepend_ = "\xe2\x96\x81";      // "▁"
+    bool replaceSpaces_ = true;
+    int bos_ = -1, eos_ = -1, unk_ = -1;
+};
+
 struct PretrainedModel {
     Network net;
     SequenceContextPtr context;  // pass to generate() for the KV cache
@@ -53,6 +84,13 @@ struct PretrainedModel {
 // network built with buildGPT. Gradient buffers are released, so the model
 // takes about as much memory as its weights; training it still works.
 PretrainedModel loadGPT2(const std::string& directory);
+
+// Loads a Hugging Face Llama-architecture checkpoint (Llama 2, TinyLlama,
+// Mistral without sliding windows, ...): config.json plus model.safetensors
+// or a sharded model.safetensors.index.json, BF16/F16/F32. With int8 the
+// linear layers are quantized while loading, so the float weights are never
+// all in memory (TinyLlama-1.1B: ~1.5 GB instead of 4.4 GB).
+PretrainedModel loadLlama(const std::string& directory, bool int8 = true);
 
 } // namespace nc
 

@@ -4,9 +4,12 @@
 #include "Json.h"
 #include "SafeTensors.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 
@@ -285,6 +288,183 @@ std::string Gpt2Tokenizer::decode(const std::vector<int>& ids) const {
     return out;
 }
 
+// ---- Llama tokenizer ---------------------------------------------------------------------
+
+LlamaTokenizer::LlamaTokenizer(const std::string& tokenizerJsonPath) {
+    byteTokens_.fill(-1);
+    const json::Value root = json::parse(readFile(tokenizerJsonPath));
+    const json::Value& model = root.at("model");
+    if (model.at("type").string != "BPE") throw std::runtime_error("LlamaTokenizer: only BPE tokenizer.json is supported");
+
+    const json::Value& vocab = model.at("vocab");
+    idToToken_.resize(vocab.object.size());
+    for (const auto& [token, id] : vocab.object) {
+        const auto i = static_cast<std::size_t>(id.number);
+        if (i >= idToToken_.size()) idToToken_.resize(i + 1);
+        idToToken_[i] = token;
+        vocab_[token] = static_cast<int>(i);
+    }
+    int rank = 0;
+    for (const auto& m : model.at("merges").array) {
+        // Either "a b" strings or ["a", "b"] pairs, depending on the tokenizers version.
+        if (m.isString()) ranks_.emplace(m.string, rank++);
+        else if (m.isArray() && m.array.size() == 2) ranks_.emplace(m.array[0].string + " " + m.array[1].string, rank++);
+        else throw std::runtime_error("LlamaTokenizer: bad merge entry");
+    }
+    for (int b = 0; b < 256; ++b) {
+        char name[8];
+        std::snprintf(name, sizeof(name), "<0x%02X>", b);
+        auto it = vocab_.find(name);
+        if (it != vocab_.end()) byteTokens_[static_cast<std::size_t>(b)] = it->second;
+    }
+    if (const json::Value* added = root.find("added_tokens")) {
+        for (const auto& a : added->array) {
+            const int id = static_cast<int>(a.at("id").number);
+            const std::string& content = a.at("content").string;
+            specials_.emplace_back(content, id);
+            if (static_cast<std::size_t>(id) >= idToToken_.size()) idToToken_.resize(static_cast<std::size_t>(id) + 1);
+            idToToken_[static_cast<std::size_t>(id)] = content;
+            vocab_[content] = id;
+        }
+    }
+    // Longest first, so overlapping names match greedily.
+    std::sort(specials_.begin(), specials_.end(), [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+    auto findId = [&](const char* name) { auto it = vocab_.find(name); return it == vocab_.end() ? -1 : it->second; };
+    bos_ = findId("<s>");
+    eos_ = findId("</s>");
+    unk_ = findId("<unk>");
+
+    // Normalizer: the Llama/Mistral one is Sequence[Prepend("▁"), Replace(" ", "▁")].
+    prepend_.clear();
+    replaceSpaces_ = false;
+    const json::Value* norm = root.find("normalizer");
+    std::vector<const json::Value*> steps;
+    if (norm && norm->isObject()) {
+        if (norm->at("type").string == "Sequence") for (const auto& s : norm->at("normalizers").array) steps.push_back(&s);
+        else steps.push_back(norm);
+    }
+    for (const auto* s : steps) {
+        const std::string& type = s->at("type").string;
+        if (type == "Prepend") prepend_ = s->at("prepend").string;
+        else if (type == "Replace" && s->at("pattern").find("String") && s->at("pattern").at("String").string == " ")
+            replaceSpaces_ = true;
+        else throw std::runtime_error("LlamaTokenizer: unsupported normalizer step '" + type + "'");
+    }
+    const json::Value* pre = root.find("pre_tokenizer");
+    if (pre && pre->isObject())
+        throw std::runtime_error("LlamaTokenizer: tokenizers with a pre_tokenizer (e.g. Llama 3) are not supported");
+}
+
+bool LlamaTokenizer::isSpecial(int id) const {
+    for (const auto& s : specials_)
+        if (s.second == id) return true;
+    return false;
+}
+
+std::vector<int> LlamaTokenizer::encodeSegment(const std::string& text) const {
+    std::vector<int> ids;
+    if (text.empty()) return ids;
+    std::string normalized = prepend_;
+    for (char c : text) {
+        if (replaceSpaces_ && c == ' ') normalized += "\xe2\x96\x81";
+        else normalized += c;
+    }
+    // BPE over UTF-8 characters.
+    std::vector<std::string> symbols;
+    for (std::size_t i = 0; i < normalized.size();) {
+        std::size_t len = 1;
+        decodeUtf8(normalized, i, len);
+        symbols.push_back(normalized.substr(i, len));
+        i += len;
+    }
+    for (;;) {
+        int best = std::numeric_limits<int>::max();
+        std::size_t at = 0;
+        for (std::size_t i = 0; i + 1 < symbols.size(); ++i) {
+            auto it = ranks_.find(symbols[i] + " " + symbols[i + 1]);
+            if (it != ranks_.end() && it->second < best) {
+                best = it->second;
+                at = i;
+            }
+        }
+        if (best == std::numeric_limits<int>::max()) break;
+        const std::string left = symbols[at], right = symbols[at + 1];
+        std::vector<std::string> merged;
+        merged.reserve(symbols.size());
+        for (std::size_t i = 0; i < symbols.size(); ++i) {
+            if (i + 1 < symbols.size() && symbols[i] == left && symbols[i + 1] == right) {
+                merged.push_back(left + right);
+                ++i;
+            } else {
+                merged.push_back(symbols[i]);
+            }
+        }
+        symbols = std::move(merged);
+    }
+    for (const auto& s : symbols) {
+        auto it = vocab_.find(s);
+        if (it != vocab_.end()) {
+            ids.push_back(it->second);
+            continue;
+        }
+        for (unsigned char b : s) {  // byte fallback
+            const int id = byteTokens_[b];
+            ids.push_back(id >= 0 ? id : unk_);
+        }
+    }
+    return ids;
+}
+
+std::vector<int> LlamaTokenizer::encode(const std::string& text, bool addBos) const {
+    std::vector<int> ids;
+    if (addBos && bos_ >= 0) ids.push_back(bos_);
+    std::size_t start = 0, i = 0;
+    while (i < text.size()) {
+        bool matched = false;
+        for (const auto& [content, id] : specials_) {
+            if (!content.empty() && text.compare(i, content.size(), content) == 0) {
+                const auto part = encodeSegment(text.substr(start, i - start));
+                ids.insert(ids.end(), part.begin(), part.end());
+                ids.push_back(id);
+                i += content.size();
+                start = i;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) ++i;
+    }
+    const auto part = encodeSegment(text.substr(start));
+    ids.insert(ids.end(), part.begin(), part.end());
+    return ids;
+}
+
+std::string LlamaTokenizer::decodePiece(int id) const {
+    if (id < 0 || static_cast<std::size_t>(id) >= idToToken_.size())
+        throw std::out_of_range("LlamaTokenizer: id " + std::to_string(id) + " out of range");
+    if (isSpecial(id)) return std::string();
+    const std::string& tok = idToToken_[static_cast<std::size_t>(id)];
+    if (tok.size() == 6 && tok.compare(0, 3, "<0x") == 0 && tok[5] == '>')  // byte token
+        return std::string(1, static_cast<char>(std::stoi(tok.substr(3, 2), nullptr, 16)));
+    std::string out;
+    for (std::size_t i = 0; i < tok.size();) {
+        if (tok.compare(i, 3, "\xe2\x96\x81") == 0) {
+            out += ' ';
+            i += 3;
+        } else {
+            out += tok[i++];
+        }
+    }
+    return out;
+}
+
+std::string LlamaTokenizer::decode(const std::vector<int>& ids) const {
+    std::string out;
+    for (int id : ids) out += decodePiece(id);
+    if (!prepend_.empty() && !out.empty() && out[0] == ' ') out.erase(0, 1);  // undo the prepended "▁"
+    return out;
+}
+
 // ---- Model -----------------------------------------------------------------------------------
 
 namespace {
@@ -370,6 +550,154 @@ PretrainedModel loadGPT2(const std::string& directory) {
     auto& lnf = layerAs<LayerNorm>(net, 1 + 2 * cfg.layers, "ln_f");
     assign(lnf.gamma(), load("ln_f.weight"), 1, cfg.dim, "ln_f.weight");
     assign(lnf.beta(), load("ln_f.bias"), 1, cfg.dim, "ln_f.bias");
+    net.releaseGradients();
+    return model;
+}
+
+namespace {
+// Tensor access across a single-file or sharded safetensors checkpoint.
+class CheckpointFiles {
+public:
+    explicit CheckpointFiles(const std::string& dir) : dir_(dir) {
+        std::ifstream index(dir + "/model.safetensors.index.json");
+        if (index) {
+            const json::Value root = json::parse(readFile(dir + "/model.safetensors.index.json"));
+            for (const auto& [name, file] : root.at("weight_map").object) fileOf_[name] = file.string;
+        }
+    }
+    Matrix load(const std::string& name) {
+        const std::string file = fileOf_.count(name) ? fileOf_.at(name) : "model.safetensors";
+        auto it = open_.find(file);
+        if (it == open_.end()) it = open_.emplace(file, std::make_unique<SafeTensors>(dir_ + "/" + file)).first;
+        return it->second->load(name);
+    }
+
+private:
+    std::string dir_;
+    std::unordered_map<std::string, std::string> fileOf_;
+    std::unordered_map<std::string, std::unique_ptr<SafeTensors>> open_;
+};
+
+Matrix stackRows(const std::vector<const Matrix*>& parts) {
+    std::size_t rows = 0;
+    const std::size_t cols = parts.front()->cols();
+    for (const Matrix* m : parts) {
+        if (m->cols() != cols) throw std::runtime_error("loadLlama: projections disagree in width");
+        rows += m->rows();
+    }
+    FloatVector data;
+    data.reserve(rows * cols);
+    for (const Matrix* m : parts) data.insert(data.end(), m->values().begin(), m->values().end());
+    return Matrix(rows, cols, std::move(data));
+}
+
+void expectShape(const Matrix& m, std::size_t rows, std::size_t cols, const std::string& name) {
+    if (m.rows() != rows || m.cols() != cols)
+        throw std::runtime_error("loadLlama: " + name + " is " + std::to_string(m.rows()) + "x" + std::to_string(m.cols()) +
+                                 ", expected " + std::to_string(rows) + "x" + std::to_string(cols));
+}
+
+// out x in (PyTorch Linear) -> layer weights, quantized or as float in x out.
+void setDense(Dense& d, const Matrix& outIn, bool int8) {
+    if (int8) {
+        d.setQuantized(QuantizedWeights::fromOutIn(outIn));
+    } else {
+        d.weights() = outIn.transpose();
+        d.bias() = Matrix(1, d.outputSize());
+    }
+}
+} // namespace
+
+PretrainedModel loadLlama(const std::string& directory, bool int8) {
+    const json::Value c = json::parse(readFile(directory + "/config.json"));
+    const std::string type = c.find("model_type") ? c.at("model_type").string : "llama";
+    if (type != "llama" && type != "mistral")
+        throw std::runtime_error("loadLlama: model_type is '" + type + "', expected llama or mistral");
+    if (const json::Value* act = c.find("hidden_act"); act && act->string != "silu")
+        throw std::runtime_error("loadLlama: activation '" + act->string + "' is not supported (silu only)");
+    if (const json::Value* rs = c.find("rope_scaling"); rs && rs->type != json::Value::Type::Null)
+        throw std::runtime_error("loadLlama: rope_scaling is not supported");
+    if (const json::Value* ab = c.find("attention_bias"); ab && ab->boolean)
+        throw std::runtime_error("loadLlama: attention biases are not supported");
+    if (const json::Value* sw = c.find("sliding_window"); sw && sw->isNumber())
+        throw std::runtime_error("loadLlama: sliding-window attention is not supported");
+
+    GPTConfig cfg;
+    cfg.modern();
+    cfg.vocabSize = static_cast<std::size_t>(c.at("vocab_size").number);
+    cfg.dim = static_cast<std::size_t>(c.at("hidden_size").number);
+    cfg.heads = static_cast<std::size_t>(c.at("num_attention_heads").number);
+    cfg.kvHeads = static_cast<std::size_t>(c.numberOr("num_key_value_heads", static_cast<double>(cfg.heads)));
+    cfg.layers = static_cast<std::size_t>(c.at("num_hidden_layers").number);
+    cfg.mlpHiddenSize = static_cast<std::size_t>(c.at("intermediate_size").number);
+    cfg.contextLength = static_cast<std::size_t>(c.numberOr("max_position_embeddings", 2048));
+    cfg.normEpsilon = static_cast<float>(c.numberOr("rms_norm_eps", 1e-6));
+    cfg.ropeBase = static_cast<float>(c.numberOr("rope_theta", 10000.0));
+    cfg.tieEmbeddings = c.find("tie_word_embeddings") && c.at("tie_word_embeddings").boolean;
+    cfg.dropout = 0.0f;
+    if (const json::Value* hd = c.find("head_dim"); hd && hd->isNumber() && static_cast<std::size_t>(hd->number) * cfg.heads != cfg.dim)
+        throw std::runtime_error("loadLlama: head_dim * heads must equal hidden_size");
+
+    PretrainedModel model;
+    model.config = cfg;
+    {
+        SkipParameterInit skip;
+        model.context = buildGPT(model.net, cfg);
+    }
+    CheckpointFiles files(directory);
+    const std::size_t D = cfg.dim, kv = cfg.kvHeads * (cfg.dim / cfg.heads), H = cfg.mlpHidden(), V = cfg.vocabSize;
+    Network& net = model.net;
+
+    auto& emb = layerAs<TokenEmbedding>(net, 0, "embedding");
+    Matrix table = files.load("model.embed_tokens.weight");
+    expectShape(table, V, D, "embed_tokens");
+    emb.tokenTable() = std::move(table);
+
+    for (std::size_t i = 0; i < cfg.layers; ++i) {
+        const std::string p = "model.layers." + std::to_string(i) + ".";
+        Network& att = layerAs<Residual>(net, 1 + 2 * i, "attention block").inner();
+        Matrix g = files.load(p + "input_layernorm.weight");
+        expectShape(g, 1, D, p + "input_layernorm");
+        layerAs<RMSNorm>(att, 0, "input_layernorm").gamma() = std::move(g);
+        auto& sa = layerAs<CausalSelfAttention>(att, 1, "attention");
+        {
+            const Matrix q = files.load(p + "self_attn.q_proj.weight"), k = files.load(p + "self_attn.k_proj.weight"),
+                         v = files.load(p + "self_attn.v_proj.weight"), o = files.load(p + "self_attn.o_proj.weight");
+            expectShape(q, D, D, p + "q_proj");
+            expectShape(k, kv, D, p + "k_proj");
+            expectShape(v, kv, D, p + "v_proj");
+            expectShape(o, D, D, p + "o_proj");
+            const Matrix qkv = stackRows({&q, &k, &v});  // (D + 2kv) x D, out x in
+            if (int8) sa.setQuantized(QuantizedWeights::fromOutIn(qkv), QuantizedWeights::fromOutIn(o));
+            else sa.setWeights(qkv.transpose(), o.transpose());
+        }
+
+        Network& mlp = layerAs<Residual>(net, 2 + 2 * i, "MLP block").inner();
+        Matrix g2 = files.load(p + "post_attention_layernorm.weight");
+        expectShape(g2, 1, D, p + "post_attention_layernorm");
+        layerAs<RMSNorm>(mlp, 0, "post_attention_layernorm").gamma() = std::move(g2);
+        {
+            const Matrix gate = files.load(p + "mlp.gate_proj.weight"), up = files.load(p + "mlp.up_proj.weight");
+            expectShape(gate, H, D, p + "gate_proj");
+            expectShape(up, H, D, p + "up_proj");
+            setDense(layerAs<Dense>(mlp, 1, "gate/up"), stackRows({&gate, &up}), int8);  // SwiGLU input [gate | up]
+        }
+        {
+            const Matrix down = files.load(p + "mlp.down_proj.weight");
+            expectShape(down, D, H, p + "down_proj");
+            setDense(layerAs<Dense>(mlp, 3, "down_proj"), down, int8);
+        }
+    }
+    Matrix gf = files.load("model.norm.weight");
+    expectShape(gf, 1, D, "model.norm");
+    layerAs<RMSNorm>(net, 1 + 2 * cfg.layers, "final norm").gamma() = std::move(gf);
+    if (cfg.tieEmbeddings) {
+        if (int8) net.layer(2 + 2 * cfg.layers).quantize();
+    } else {
+        const Matrix head = files.load("lm_head.weight");
+        expectShape(head, V, D, "lm_head");
+        setDense(layerAs<Dense>(net, 2 + 2 * cfg.layers, "lm_head"), head, int8);
+    }
     net.releaseGradients();
     return model;
 }

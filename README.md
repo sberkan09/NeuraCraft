@@ -39,8 +39,9 @@ Trains a 784-128-64-10 ReLU network with dropout and Adam, reports validation
 accuracy on the 10k test set every epoch and saves the weights to
 `data/mnist/mnist.weights`.
 
-Reference run (10 epochs, seed 42, single CPU core, Release build): **97.97 %
-test accuracy**, about 7 seconds per epoch.
+Reference run (10 epochs, seed 42): **97.97 % test accuracy**. With the v1.0
+single-threaded kernel an epoch took ~7 s; the current backends take ~2.3 s on
+the same 2-core machine (see below).
 
 | epoch | train loss | train acc | test loss | test acc |
 |---:|---:|---:|---:|---:|

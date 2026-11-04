@@ -509,6 +509,46 @@ $ ./build_and_run.sh video data/animatediff t2v "a red fox walking through a sno
 
 (16 frames at 384 x 384, 4 steps: 10 minutes on the 2-core machine.)
 
+### Inpainting and outpaint zoom
+
+```
+$ scripts/download_sd_inpaint.sh data/sd-inpaint          # SD 1.5 inpainting, fp16 (~2.1 GB) + TAESD
+$ ./build_and_run.sh inpaint data/sd-inpaint cabin.png mask.png "a snowman with a red scarf in a snowy forest at night, photo" \
+      out.png --steps 20 --guidance 7.5
+```
+
+<p><img src="docs/images/inpaint_input.jpg" width="256"> <img src="docs/images/inpaint_result.jpg" width="256"></p>
+
+`StableDiffusion::inpaint()` / `inpaint()` work like diffusers'
+`StableDiffusionInpaintPipeline` on a 9-channel inpainting UNet: the
+masked picture is encoded, the mask is brought to latent size, and both are
+fed to the UNet next to the noisy latent at every step; kept pixels are
+pasted back through a feathered mask (`--feather`). Above: the cabin with
+the white area of the mask (left, shown lighter) redrawn as a snowman
+(20 Euler steps with guidance 7.5, 9 minutes on the 2-core machine). LoRAs
+and `--sampler lcm` work here too; LCM-LoRA on this inpainting model is
+faster (6 steps) but draws objects less well, which is fine for scenery.
+
+**Outpaint zoom** (`outpaintZoom()`, `video DIR outpaint`): the classic
+infinite zoom. Each keyframe is the previous one shrunk into the middle, its
+new border mirrored outwards, noised and redrawn by inpainting; the frames in
+between are rendered by zooming geometrically through the nested keyframes
+(the sharper inner picture drawn over the outer one), so a long, smooth zoom
+costs one inpainting per keyframe:
+
+```
+$ ./build_and_run.sh video data/sd-inpaint outpaint "a snowy pine forest at night with warm lights, photo" \
+      --start cabin.png --keyframes 5 --shrink 0.7 --frames 16 --fps 16 \
+      --steps 6 --guidance 1.8 --sampler lcm --lora data/loras/lcm-lora-sdv1-5.safetensors
+```
+
+<p><img src="docs/images/video_outpaint.gif" width="256"></p>
+
+(65 frames from 4 inpainted keyframes, 512 x 512: 9.5 minutes on the 2-core
+machine. `--zoom-in` plays it the other way.) Starting the border from pure
+noise (`--strength 1`) tends to make the model paint a frame around the old
+picture; the mirrored start avoids that.
+
 **Output formats**, all written by the library itself: `.gif` (`saveGif`,
 256 colours, plays everywhere), `.png` (`saveApng`, animated PNG, full
 colour and lossless, plays in browsers), `.mov` (`saveMjpegMov`, a QuickTime

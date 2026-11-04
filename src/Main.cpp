@@ -961,6 +961,8 @@ void usage() {
               << "  NeuraCraft video <dir> t2v \"prompt\" [-o out.gif] [--frames 16] [--steps 4] [--seed S] [--motion file] [--guidance G]\n"
               << "        [--context 16 --overlap 4] [--init image.png | --init-dir frames/] [--strength 0.75]\n"
               << "        [--prompt-at FRAME:prompt ...]   (prompt travel)\n"
+              << "  NeuraCraft video <dir> outpaint \"prompt\" ... [--keyframes 6] [--shrink 0.75] [--frames 12] [--zoom-in] [--start in.png]\n"
+              << "  NeuraCraft inpaint <dir> in.png mask.png \"prompt\" [out.png] [--steps 25] [--strength 1] [--feather 4] [--guidance G]\n"
               << "  video output: .gif (256 colours), .png (animated PNG, full colour) or .mov (QuickTime Motion-JPEG)\n"
               << "        [--strength S] [--steps N] [--start in.png] [--seed S] [--size N] [--frames-dir DIR] [--full-vae]\n"
               << "        [--sharpen A] [--noise N] [--no-color-match]\n"
@@ -1166,20 +1168,21 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (cmd == "video") {
-            if (args.size() < 4 || (args[2] != "morph" && args[2] != "zoom" && args[2] != "t2v")) {
+            if (args.size() < 4 || (args[2] != "morph" && args[2] != "zoom" && args[2] != "t2v" && args[2] != "outpaint")) {
                 usage();
                 return 2;
             }
-            const bool morph = args[2] == "morph", t2v = args[2] == "t2v";
+            const bool morph = args[2] == "morph", t2v = args[2] == "t2v", outpaint = args[2] == "outpaint";
+            OutpaintZoomOptions oz;
             TextToImageOptions o;
             TextToVideoOptions vo;
             MorphOptions mo;
             ZoomOptions zo;
             std::vector<std::string> prompts;
             std::vector<unsigned> seeds;
-            std::string output = morph ? "morph.gif" : t2v ? "t2v.gif" : "zoom.gif", framesDir, start;
+            std::string output = morph ? "morph.gif" : t2v ? "t2v.gif" : outpaint ? "outpaint.gif" : "zoom.gif", framesDir, start;
             float fps = morph ? 10.0f : 8.0f;
-            bool fullVae = false, framesSet = false;
+            bool fullVae = false, framesSet = false, strengthSet = false;
             std::size_t frames = 0;
             auto split = [](const std::string& s) {
                 std::vector<std::string> parts;
@@ -1202,8 +1205,8 @@ int main(int argc, char** argv) {
                     for (const std::string& s : split(value())) seeds.push_back(static_cast<unsigned>(std::stoul(s)));
                 } else if (a == "--no-loop") mo.loop = false;
                 else if (a == "--steps") mo.steps = zo.steps = vo.steps = std::stoul(value());
-                else if (a == "--guidance") vo.guidance = std::stof(value());
-                else if (a == "--negative") vo.negativePrompt = value();
+                else if (a == "--guidance") vo.guidance = o.guidance = std::stof(value());
+                else if (a == "--negative") vo.negativePrompt = o.negativePrompt = value();
                 else if (a == "--motion") vo.motion = value();
                 else if (a == "--schedule") vo.betaSchedule = value();
                 else if (a == "--zoom") zo.zoom = std::stof(value());
@@ -1213,13 +1216,16 @@ int main(int argc, char** argv) {
                     zo.dx = std::stof(parts[0]);
                     zo.dy = std::stof(parts[1]);
                 } else if (a == "--rotate") zo.rotate = std::stof(value());
-                else if (a == "--strength") zo.strength = vo.strength = std::stof(value());
+                else if (a == "--strength") zo.strength = vo.strength = std::stof(value()), strengthSet = true;
                 else if (a == "--prompt-at") {  // FRAME:prompt
                     const std::string s = value();
                     const std::size_t colon = s.find(':');
                     if (colon == std::string::npos) throw std::invalid_argument("--prompt-at takes FRAME:prompt");
                     vo.promptAt.emplace_back(std::stoul(s.substr(0, colon)), s.substr(colon + 1));
                 }
+                else if (a == "--keyframes") oz.keyframes = std::stoul(value());
+                else if (a == "--shrink") oz.shrink = std::stof(value());
+                else if (a == "--zoom-in") oz.zoomIn = true;
                 else if (a == "--context") vo.context = std::stoul(value());
                 else if (a == "--lora") o.loras.push_back(parseLora(value()));
                 else if (a == "--sampler") o.sampler = vo.sampler = value();
@@ -1266,6 +1272,11 @@ int main(int argc, char** argv) {
                 vo.tinyVae = o.tinyVae;
                 vo.loras = o.loras;
                 if (framesSet) vo.frames = frames;
+            } else if (outpaint) {
+                oz.seed = seeds[0];
+                if (framesSet) oz.framesPerKey = frames;
+                oz.steps = mo.steps == 1 ? 25 : mo.steps;  // --steps (default 25; 4-6 with --sampler lcm and LCM-LoRA)
+                if (strengthSet) oz.strength = zo.strength;
             } else if (morph) {
                 if (seeds.size() == 1 && prompts.size() == 1) throw std::invalid_argument("video morph: give two prompts or several --seeds");
                 if (seeds.size() > 1 && prompts.size() == 1) prompts.resize(seeds.size(), prompts[0]);
@@ -1286,7 +1297,11 @@ int main(int argc, char** argv) {
                 }
             } else try {
                 StableDiffusion sd(args[1], o, !morph);
-                if (morph) video = morphAnimation(sd, prompts, seeds, mo);
+                if (outpaint) {
+                    Image first;
+                    if (!start.empty()) first = loadImage(start);
+                    video = outpaintZoom(sd, prompts, oz, start.empty() ? nullptr : &first);
+                } else if (morph) video = morphAnimation(sd, prompts, seeds, mo);
                 else {
                     Image first;
                     if (!start.empty()) first = loadImage(start);
@@ -1316,6 +1331,59 @@ int main(int argc, char** argv) {
             std::cout << "wrote " << output << " (" << video.size() << " frames, " << o.width << "x" << o.height << ", " << fps
                       << " fps) in " << std::fixed << std::setprecision(1)
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() << " s" << std::defaultfloat << '\n';
+            return 0;
+        }
+        if (cmd == "inpaint") {
+            if (args.size() < 5) {
+                usage();
+                return 2;
+            }
+            TextToImageOptions o;
+            o.steps = 25;
+            o.strength = 1.0f;
+            float feather = 4.0f;
+            std::string output = "inpaint.png";
+            for (std::size_t i = 5; i < args.size(); ++i) {
+                const std::string& a = args[i];
+                auto value = [&]() -> std::string {
+                    if (i + 1 >= args.size()) throw std::invalid_argument(a + " needs a value");
+                    return args[++i];
+                };
+                if (a == "--steps") o.steps = std::stoul(value());
+                else if (a == "--seed") o.seed = static_cast<unsigned>(std::stoul(value()));
+                else if (a == "--size") o.width = o.height = std::stoul(value());
+                else if (a == "--width") o.width = std::stoul(value());
+                else if (a == "--height") o.height = std::stoul(value());
+                else if (a == "--guidance") o.guidance = std::stof(value());
+                else if (a == "--negative") o.negativePrompt = value();
+                else if (a == "--tiny-vae") o.tinyVae = value();
+                else if (a == "--strength") o.strength = std::stof(value());
+                else if (a == "--feather") feather = std::stof(value());
+                else if (a == "--lora") o.loras.push_back(parseLora(value()));
+                else if (a == "--sampler") o.sampler = value();
+                else if (a == "--fp32") o.int8 = false;
+                else if (a.rfind("--", 0) != 0) output = a;
+                else {
+                    std::cerr << "unknown inpaint option: " << a << "\n";
+                    return 2;
+                }
+            }
+            if (o.tinyVae.empty() && std::ifstream(args[1] + "/taesd/config.json")) o.tinyVae = args[1] + "/taesd";
+            o.progress = [](const std::string& stage, double seconds) {
+                std::cerr << "  " << stage << ": " << std::fixed << std::setprecision(1) << seconds << " s" << std::defaultfloat << '\n';
+            };
+            const auto start = std::chrono::steady_clock::now();
+            try {
+                StableDiffusion sd(args[1], o, true);
+                const Image img = sd.inpaint(loadImage(args[2]), loadImage(args[3]), args[4], o.seed, o.steps, o.strength, feather);
+                if (output.size() > 4 && output.compare(output.size() - 4, 4, ".jpg") == 0) saveJpeg(output, img, 92);
+                else savePng(output, img);
+            } catch (const std::exception& e) {
+                std::cerr << e.what() << "\ndownload an inpainting model with: scripts/download_sd_inpaint.sh " << args[1] << '\n';
+                return 2;
+            }
+            std::cout << "wrote " << output << " in " << std::fixed << std::setprecision(1)
+                      << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() << " s" << std::defaultfloat << '\n';
             return 0;
         }
         if (cmd == "vae") {

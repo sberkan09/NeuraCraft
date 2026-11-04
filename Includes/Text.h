@@ -5,27 +5,75 @@
 #include "Network.h"
 
 #include <array>
+#include <cstdint>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace nc {
 
+// Common interface for tokenizers (text <-> token ids).
+class Tokenizer {
+public:
+    virtual ~Tokenizer() = default;
+    virtual std::vector<int> encode(const std::string& text) const = 0;
+    virtual std::string decode(const std::vector<int>& ids) const = 0;
+    virtual std::size_t vocabSize() const = 0;
+};
+
 // Character-level tokenizer: the vocabulary is the sorted set of bytes in the
 // text it was built from, so the same text always gives the same ids.
-class CharTokenizer {
+class CharTokenizer : public Tokenizer {
 public:
     CharTokenizer() = default;
     explicit CharTokenizer(const std::string& text);
 
-    std::size_t vocabSize() const { return idToChar_.size(); }
+    std::size_t vocabSize() const override { return idToChar_.size(); }
     bool contains(char c) const { return charToId_[static_cast<unsigned char>(c)] >= 0; }
-    std::vector<int> encode(const std::string& text) const;  // throws on unknown characters
-    std::string decode(const std::vector<int>& ids) const;
+    std::vector<int> encode(const std::string& text) const override;  // throws on unknown characters
+    std::string decode(const std::vector<int>& ids) const override;
 
 private:
     std::vector<char> idToChar_;
     std::array<int, 256> charToId_{};
 };
+
+// Byte-level byte-pair encoding (GPT-2 style). Ids 0..255 are raw bytes, so any
+// input can be encoded; each learned merge adds one id. Text is first split
+// into words (letters, digits, punctuation runs, each with an optional leading
+// space, and whitespace runs) and merges never cross word boundaries.
+// encode() caches word encodings, so share one instance between threads only
+// for decoding.
+class BpeTokenizer : public Tokenizer {
+public:
+    BpeTokenizer();  // bytes only, no merges
+
+    // Learns merges until the vocabulary has `vocabSize` (>= 256) entries or
+    // no pair occurs at least twice.
+    static BpeTokenizer train(const std::string& text, std::size_t vocabSize);
+
+    std::vector<int> encode(const std::string& text) const override;
+    std::string decode(const std::vector<int>& ids) const override;
+    std::size_t vocabSize() const override { return pieces_.size(); }
+    std::size_t mergeCount() const { return merges_.size(); }
+    const std::string& piece(int id) const { return pieces_.at(static_cast<std::size_t>(id)); }
+
+    void save(const std::string& path) const;
+    static BpeTokenizer load(const std::string& path);
+
+private:
+    void addMerge(int a, int b);
+    std::vector<int> encodeWord(const std::string& word) const;
+
+    std::vector<std::pair<int, int>> merges_;   // merge i creates id 256 + i
+    std::vector<std::string> pieces_;           // bytes of every id
+    std::unordered_map<std::uint64_t, int> rank_;  // pair -> merge index
+    mutable std::unordered_map<std::string, std::vector<int>> cache_;
+};
+
+// Splits text into the words BPE works on (concatenating them gives the text back).
+std::vector<std::string> splitWords(const std::string& text);
 
 std::string loadText(const std::string& path);
 

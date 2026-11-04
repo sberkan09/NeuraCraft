@@ -286,9 +286,10 @@ tokenizer.json files with other pre-tokenizers (e.g. Metaspace).
 ### Text to image: Stable Diffusion (SD-Turbo)
 
 ```
-$ scripts/download_sd_turbo.sh data/sd-turbo                  # SD-Turbo, fp16 (~2.6 GB)
+$ scripts/download_sd_turbo.sh data/sd-turbo                  # SD-Turbo, fp16 (~2.6 GB) + TAESD
 $ ./build_and_run.sh txt2img data/sd-turbo "A cinematic photo of a red fox sitting in the snow, golden hour" fox.png --seed 42
 $ ./build_and_run.sh txt2img data/sd-turbo "The Istanbul skyline at sunset, oil painting" ist.png --steps 2 --seed 7
+$ ./build_and_run.sh txt2img data/sd-turbo "A watercolor lighthouse" l.png --tiny-vae data/sd-turbo/taesd   # 10x faster decode
 $ ./build_and_run.sh vae data/sd-turbo photo.ppm out.png      # the autoencoder alone: encode + decode
 ```
 
@@ -299,12 +300,12 @@ prompts shown (1 and 2 steps). `textToImage()` runs the whole Stable Diffusion
 pipeline on a diffusers directory, loading each model only for its stage
 (peak memory 3.6 GB, the UNet's):
 
-| SD-Turbo, 512 x 512, 2-core x86 | time |
-|---|---:|
-| CLIP text encoder (load + encode) | 15 s |
-| UNet: load / one denoising step | 28 s / 14 s |
-| VAE decode | 50 s |
-| total for one image (1 step) | 107 s |
+| SD-Turbo, 512 x 512, 2-core x86 | full VAE | `--tiny-vae` (TAESD) |
+|---|---:|---:|
+| CLIP text encoder (load + encode) | 6.5 s | 6.5 s |
+| UNet: load / one denoising step | 16 s / 13 s | 16 s / 13 s |
+| decode | 50 s | **4.8 s** |
+| total for one image (1 step) | 86 s | **41 s** |
 
 Pieces, each checked against an independent NumPy implementation (`scripts/`):
 
@@ -330,10 +331,17 @@ Pieces, each checked against an independent NumPy implementation (`scripts/`):
   stays bounded at 512 x 512; 1x1 convolutions are one GEMM). It agrees with
   `vae_reference.py` within 5.4e-6; an encode/decode round trip keeps a
   picture at 29-32 dB PSNR. PNG output and PPM input are built in.
+- **Preview decoder:** `loadTinyVae()` builds TAESD (diffusers
+  `AutoencoderTiny`, madebyollin/taesd, ~1 M parameters: 3x3 convolutions,
+  ReLU residual blocks); decoding a 512 x 512 latent takes 4.8 s instead of
+  50 s and looks nearly the same (fine textures soften a little). Decoder and
+  encoder agree with `taesd_reference.py` within 5e-6 / 1e-5.
+  `textToLatent()` and `decodeLatent()` expose the two halves of the pipeline.
 
-The VAE decoder (~2.5 TFLOP at 512 x 512) is the slowest stage on a CPU; on
-Apple silicon the products go to Accelerate. Next: GPU convolutions, int8
-UNet weights, a tiny preview decoder, image-to-image.
+The full VAE decoder (~2.5 TFLOP at 512 x 512) is the slowest stage on a CPU;
+on Apple silicon the products go to Accelerate. Loading got faster with a
+tiled, parallel `Matrix::transpose` (0.3 -> 1.2 GB/s; UNet load 28 -> 16 s).
+Next: int8 UNet weights, image-to-image, GPU convolutions.
 
 ## Performance and devices
 
@@ -427,7 +435,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
 | Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE with Llama 3 scaling, grouped-query attention, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
 | Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales; integer AVX-VNNI / AVX2 / NEON products), `Network::quantize()` for Dense, attention and embeddings (shared with tied outputs), `setInt8Inputs` |
-| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG / PPM files, `loadVae()`, `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` |
+| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG / PPM files, `loadVae()`, `loadTinyVae()` (TAESD), `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` / `textToLatent()` / `decodeLatent()` |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
 | Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k, top-p, repetition penalty, streaming callback, stop tokens), `Generator` (multi-turn, KV cache kept between calls) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |
@@ -486,7 +494,8 @@ tokenizer (cleanup, splitting, merges, added tokens, padding), the CLIP text
 encoder against a naive reference on a synthetic checkpoint, chunked
 multi-head attention against a naive one, the timestep embedding, the Euler
 scheduler against diffusers' values, a synthetic UNet (text and time
-conditioning), and the whole text-to-image pipeline on tiny synthetic models. CI runs
+conditioning), TAESD (layer layout and value ranges), and the whole
+text-to-image pipeline on tiny synthetic models, with either decoder. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
 kernels).
 
@@ -497,6 +506,6 @@ Includes/   public headers (NeuraCraft.h includes everything)
 src/        library sources + Main.cpp (demo CLI -> bin/NeuraCraft)
 tests/      unit tests
 scripts/    download_{mnist,shakespeare,gpt2,tinyllama,llama32,sd_turbo}.sh, gpt2_reference.py, llama_reference.py,
-            vae_reference.py, clip_reference.py, unet_reference.py,
+            vae_reference.py, clip_reference.py, unet_reference.py, taesd_reference.py,
             gen_unicode_tables.py (src/UnicodeTables.cpp)
 ```

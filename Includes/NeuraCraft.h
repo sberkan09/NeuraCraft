@@ -23,6 +23,6 @@
 #include "Text.h"
 #include "Transformer.h"
 
-#define NEURACRAFT_VERSION "1.8.0"
+#define NEURACRAFT_VERSION "1.9.0"
 
 #endif // NEURACRAFT_H

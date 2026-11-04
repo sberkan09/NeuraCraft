@@ -1,4 +1,5 @@
 #include "Matrix.h"
+#include "Parallel.h"
 #include "Backend.h"
 #include "Random.h"
 
@@ -167,8 +168,22 @@ Matrix Matrix::matmulTranspose(const Matrix& rhs) const {
 
 Matrix Matrix::transpose() const {
     Matrix result(cols_, rows_);
-    for (std::size_t i = 0; i < rows_; ++i)
-        for (std::size_t j = 0; j < cols_; ++j) result(j, i) = (*this)(i, j);
+    // 32 x 32 tiles keep both the reads and the writes within a few cache lines;
+    // bands of tile rows run in parallel.
+    constexpr std::size_t B = 32;
+    const float* src = data_.data();
+    float* dst = result.data_.data();
+    const std::size_t R = rows_, C = cols_;
+    parallelFor(0, (R + B - 1) / B, std::max<std::size_t>(1, 4096 / std::max<std::size_t>(1, C)), [&](std::size_t b0, std::size_t b1) {
+        for (std::size_t bi = b0; bi < b1; ++bi) {
+            const std::size_t i0 = bi * B, i1 = std::min(R, i0 + B);
+            for (std::size_t j0 = 0; j0 < C; j0 += B) {
+                const std::size_t j1 = std::min(C, j0 + B);
+                for (std::size_t i = i0; i < i1; ++i)
+                    for (std::size_t j = j0; j < j1; ++j) dst[j * R + i] = src[i * C + j];
+            }
+        }
+    });
     return result;
 }
 

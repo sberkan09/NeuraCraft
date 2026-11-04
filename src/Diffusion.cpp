@@ -1,8 +1,10 @@
 #include "Diffusion.h"
+#include "Activations.h"
 #include "Dense.h"
 #include "Json.h"
 #include "SafeTensors.h"
 
+#include <cmath>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -40,6 +42,14 @@ public:
         if (w.size() != out * patch) fail(prefix + ".weight", w.size(), out * patch);
         c.weights() = Matrix(out, patch, std::move(w.values())).transpose();
         c.bias() = vector(prefix + ".bias", out);
+    }
+    void convNoBias(Conv2D& c, const std::string& prefix) {
+        const ImageShape in = c.inputShape();
+        const std::size_t out = c.outputShape().channels, patch = in.channels * c.kernelSize() * c.kernelSize();
+        Matrix w = st_.load(prefix + ".weight");
+        if (w.size() != out * patch) fail(prefix + ".weight", w.size(), out * patch);
+        c.weights() = Matrix(out, patch, std::move(w.values())).transpose();
+        c.bias() = Matrix(1, out);
     }
     void norm(GroupNorm& g, const std::string& prefix, std::size_t channels) {
         g.gamma() = vector(prefix + ".weight", channels);
@@ -188,6 +198,111 @@ Vae loadVae(const std::string& directory, std::size_t width, std::size_t height,
         }
         b.normOut("decoder.conv_norm_out");
         b.conv(outC, 3, 1, 1, "decoder.conv_out");
+    }
+    return vae;
+}
+
+// ---- Tiny autoencoder (TAESD) -----------------------------------------------------------------
+
+namespace {
+// AutoencoderTinyBlock: relu(conv(relu(conv(relu(conv(x))))) + skip(x)), skip = identity or a 1x1 conv.
+void tinyBlock(Network& net, Weights& w, ImageShape s, std::size_t out, const std::string& p) {
+    auto& r = net.add<Residual>();
+    auto& c0 = r.add<Conv2D>(s, out, 3, 1, 1);
+    w.conv(c0, p + ".conv.0");
+    r.add<ReLU>();
+    auto& c2 = r.add<Conv2D>(ImageShape{out, s.height, s.width}, out, 3, 1, 1);
+    w.conv(c2, p + ".conv.2");
+    r.add<ReLU>();
+    auto& c4 = r.add<Conv2D>(ImageShape{out, s.height, s.width}, out, 3, 1, 1);
+    w.conv(c4, p + ".conv.4");
+    if (s.channels != out) throw std::runtime_error("loadTinyVae: blocks that change the channel count are not supported");
+    net.add<ReLU>();
+}
+
+void squashInPlace(Matrix& m, float scale, float offset) {
+    for (float& v : m.values()) v = v * scale + offset;
+}
+} // namespace
+
+Matrix TinyVae::encode(const Matrix& img) {
+    Matrix x = img;
+    squashInPlace(x, 0.5f, 0.5f);  // [-1, 1] -> [0, 1]
+    return encoder.predict(x);
+}
+
+Matrix TinyVae::decode(const Matrix& z) {
+    Matrix x = z;
+    for (float& v : x.values()) v = std::tanh(v / 3.0f) * 3.0f;  // soft clamp to (-3, 3)
+    Matrix y = decoder.predict(x);
+    squashInPlace(y, 2.0f, -1.0f);  // [0, 1] -> [-1, 1]
+    return y;
+}
+
+TinyVae loadTinyVae(const std::string& dir, std::size_t width, std::size_t height, bool withEncoder, bool withDecoder) {
+    const json::Value c = json::parse(readFile(dir + "/config.json"));
+    const std::string file = dir + "/diffusion_pytorch_model.safetensors";
+    if (!exists(file)) throw std::runtime_error("loadTinyVae: no diffusion_pytorch_model.safetensors in " + dir);
+    if (const json::Value* a = c.find("act_fn"); a && a->string != "relu")
+        throw std::runtime_error("loadTinyVae: activation '" + a->string + "' is not supported (relu only)");
+    if (const json::Value* sf = c.find("shift_factor"); sf && sf->isNumber() && sf->number != 0.0)
+        throw std::runtime_error("loadTinyVae: shift_factor is not supported");
+    auto list = [&](const char* key) {
+        std::vector<std::size_t> v;
+        for (const auto& e : c.at(key).array) v.push_back(static_cast<std::size_t>(e.number));
+        return v;
+    };
+    const std::vector<std::size_t> encCh = list("encoder_block_out_channels"), encN = list("num_encoder_blocks");
+    const std::vector<std::size_t> decCh = list("decoder_block_out_channels"), decN = list("num_decoder_blocks");
+    const std::size_t latentC = static_cast<std::size_t>(c.numberOr("latent_channels", 4));
+    const std::size_t inC = static_cast<std::size_t>(c.numberOr("in_channels", 3)), outC = static_cast<std::size_t>(c.numberOr("out_channels", 3));
+    const std::size_t up = static_cast<std::size_t>(c.numberOr("upsampling_scaling_factor", 2));
+    const std::size_t factor = std::size_t(1) << (decCh.size() - 1);
+    if (width == 0 || height == 0 || width % factor || height % factor)
+        throw std::invalid_argument("loadTinyVae: width and height must be multiples of " + std::to_string(factor));
+
+    TinyVae vae;
+    vae.image = {inC, height, width};
+    vae.latent = {latentC, height / factor, width / factor};
+    Weights w(file);
+    SkipParameterInit skip;
+    if (withEncoder) {
+        Network& net = vae.encoder;
+        ImageShape s = vae.image;
+        std::size_t idx = 0;
+        for (std::size_t i = 0; i < encCh.size(); ++i) {
+            const std::string p = "encoder.layers." + std::to_string(idx++);
+            auto& conv = i == 0 ? net.add<Conv2D>(s, encCh[0], 3, 1, 1) : net.add<Conv2D>(s, encCh[i], 3, 2, 1);
+            if (i == 0) w.conv(conv, p);
+            else w.convNoBias(conv, p);
+            s = conv.outputShape();
+            for (std::size_t b = 0; b < encN[i]; ++b) tinyBlock(net, w, s, encCh[i], "encoder.layers." + std::to_string(idx++));
+        }
+        auto& out = net.add<Conv2D>(s, latentC, 3, 1, 1);
+        w.conv(out, "encoder.layers." + std::to_string(idx));
+    }
+    if (withDecoder) {
+        Network& net = vae.decoder;
+        ImageShape s = vae.latent;
+        std::size_t idx = 0;
+        auto& in = net.add<Conv2D>(s, decCh[0], 3, 1, 1);
+        w.conv(in, "decoder.layers." + std::to_string(idx));
+        idx += 2;  // conv, activation
+        net.add<ReLU>();
+        s = in.outputShape();
+        for (std::size_t i = 0; i < decCh.size(); ++i) {
+            const bool last = i + 1 == decCh.size();
+            for (std::size_t b = 0; b < decN[i]; ++b) tinyBlock(net, w, s, decCh[i], "decoder.layers." + std::to_string(idx++));
+            if (!last) {
+                auto& u = net.add<Upsample2D>(s, up);
+                s = u.outputShape();
+                ++idx;
+            }
+            auto& conv = net.add<Conv2D>(s, last ? outC : decCh[i], 3, 1, 1);
+            if (last) w.conv(conv, "decoder.layers." + std::to_string(idx++));
+            else w.convNoBias(conv, "decoder.layers." + std::to_string(idx++));
+            s = conv.outputShape();
+        }
     }
     return vae;
 }

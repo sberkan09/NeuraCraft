@@ -2395,6 +2395,69 @@ TEST(unet_loader_builds_and_conditions_on_text_and_time) {
     std::filesystem::remove_all(dir);
 }
 
+namespace {
+// A TAESD (AutoencoderTiny) with 4 channels and one block per level.
+void writeTinyTaesd(const std::string& dir, bool zeroButOutputBias) {
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir + "/config.json") << R"({"_class_name":"AutoencoderTiny","act_fn":"relu","decoder_block_out_channels":[4,4,4,4],)"
+                                        << R"("encoder_block_out_channels":[4,4,4,4],"num_decoder_blocks":[1,1,1,1],)"
+                                        << R"("num_encoder_blocks":[1,1,1,1],"latent_channels":4,"upsampling_scaling_factor":2})";
+    std::map<std::string, Matrix> w;
+    auto conv = [&](const std::string& n, std::size_t o, std::size_t i, bool bias) {
+        w[n + ".weight"] = zeroButOutputBias ? Matrix(1, o * i * 9) : Matrix::uniform(1, o * i * 9, -0.3f, 0.3f);
+        if (bias) w[n + ".bias"] = zeroButOutputBias ? Matrix(1, o) : Matrix::uniform(1, o, -0.1f, 0.1f);
+    };
+    auto block = [&](const std::string& p) {
+        for (const char* c : {".conv.0", ".conv.2", ".conv.4"}) conv(p + c, 4, 4, true);
+    };
+    // encoder: conv, block, (conv s2, block) x 3, conv out
+    conv("encoder.layers.0", 4, 3, true);
+    block("encoder.layers.1");
+    for (int i = 0; i < 3; ++i) {
+        conv("encoder.layers." + std::to_string(2 + 2 * i), 4, 4, false);
+        block("encoder.layers." + std::to_string(3 + 2 * i));
+    }
+    conv("encoder.layers.8", 4, 4, true);
+    // decoder: conv, relu, (block, upsample, conv) x 3, block, conv out
+    conv("decoder.layers.0", 4, 4, true);
+    for (int i = 0; i < 3; ++i) {
+        block("decoder.layers." + std::to_string(2 + 3 * i));
+        conv("decoder.layers." + std::to_string(4 + 3 * i), 4, 4, false);
+    }
+    block("decoder.layers.11");
+    conv("decoder.layers.12", 3, 4, true);
+    if (zeroButOutputBias) {
+        w["encoder.layers.8.bias"] = Matrix{{0.5f, -1.0f, 2.0f, 0.25f}};
+        w["decoder.layers.12.bias"] = Matrix{{0.25f, 0.5f, 1.0f}};
+    }
+    saveAll(dir + "/diffusion_pytorch_model.safetensors", w);
+}
+} // namespace
+
+TEST(tiny_vae_loader_layers_and_value_ranges) {
+    const std::string dir = tempPath("taesd_tiny");
+    // With every weight zero, the outputs are the last biases, through the range conversions:
+    // the decoder maps [0, 1] to [-1, 1], the encoder's latent is the bias itself.
+    writeTinyTaesd(dir, true);
+    TinyVae vae = loadTinyVae(dir, 16, 24);
+    CHECK(vae.latent.channels == 4 && vae.latent.height == 3 && vae.latent.width == 2);
+    const Matrix img = vae.decode(Matrix::uniform(1, 4 * 3 * 2, -5, 5));
+    CHECK(img.cols() == 3 * 24 * 16);
+    CHECK_NEAR(img(0, 0), 2 * 0.25 - 1, 1e-6);
+    CHECK_NEAR(img(0, 24 * 16 + 7), 2 * 0.5 - 1, 1e-6);
+    CHECK_NEAR(img(0, 2 * 24 * 16 + 100), 2 * 1.0 - 1, 1e-6);
+    const Matrix z = vae.encode(Matrix::uniform(1, 3 * 24 * 16, -1, 1));
+    CHECK(z.cols() == 4 * 3 * 2 && z(0, 0) == 0.5f && z(0, 6) == -1.0f && z(0, 12) == 2.0f);
+    // Random weights: runs, deterministic, refuses sizes that are not multiples of 8.
+    setSeed(99);
+    writeTinyTaesd(dir, false);
+    TinyVae r = loadTinyVae(dir, 16, 16);
+    const Matrix lat = Matrix::uniform(1, 4 * 2 * 2, -2, 2);
+    CHECK(r.decode(lat).approxEquals(r.decode(lat), 0.0f) && r.decode(lat).cols() == 3 * 256);
+    CHECK_THROWS(loadTinyVae(dir, 12, 16), std::invalid_argument);
+    std::filesystem::remove_all(dir);
+}
+
 TEST(text_to_image_pipeline_runs_end_to_end) {
     // Tokenizer, text encoder, UNet, VAE and scheduler, all tiny, in one diffusers directory.
     setSeed(98);
@@ -2462,6 +2525,16 @@ TEST(text_to_image_pipeline_runs_end_to_end) {
     o.guidance = 3.0f;                                           // classifier-free guidance runs both prompts
     o.negativePrompt = "he";
     CHECK(textToImage(dir, "hello he", o).pixels.size() == a.pixels.size());
+    // The tiny autoencoder decodes the same latent instead of the full VAE.
+    o.guidance = 0.0f;
+    o.seed = 3;
+    o.tinyVae = dir + "/taesd";
+    writeTinyTaesd(o.tinyVae, false);
+    stages.clear();
+    o.progress = [&](const std::string& s, double) { stages.push_back(s); };
+    const Image tiny = textToImage(dir, "hello he", o);
+    CHECK(tiny.width == 64 && tiny.height == 128 && stages.back() == "taesd decode");
+    o.progress = nullptr;
     o.width = 60;
     CHECK_THROWS(textToImage(dir, "hello", o), std::invalid_argument);
     std::filesystem::remove_all(dir);

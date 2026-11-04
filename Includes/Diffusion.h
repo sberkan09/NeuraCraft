@@ -37,6 +37,23 @@ struct Vae {
 Vae loadVae(const std::string& directory, std::size_t width, std::size_t height, bool withEncoder = true,
             bool withDecoder = true);
 
+// Tiny autoencoder TAESD (diffusers AutoencoderTiny, madebyollin/taesd):
+// ~1 M parameters of 3x3 convolutions, ReLU residual blocks and nearest
+// upsampling that approximate the full VAE at a small fraction of the cost.
+// Works in the diffusion model's (already scaled) latent space.
+struct TinyVae {
+    Network encoder;  // image in [0, 1] -> latent
+    Network decoder;  // latent clamped to (-3, 3) -> image in [0, 1]
+    ImageShape image, latent;
+
+    Matrix encode(const Matrix& image);   // image row in [-1, 1] -> latent
+    Matrix decode(const Matrix& latent);  // latent -> image row in [-1, 1]
+};
+
+// Loads `directory` (config.json + diffusion_pytorch_model.safetensors).
+TinyVae loadTinyVae(const std::string& directory, std::size_t width, std::size_t height, bool withEncoder = true,
+                    bool withDecoder = true);
+
 // CLIP's text transformer (Hugging Face CLIPTextModel): token ids (padded to
 // `length`, usually 77) -> one hidden state per position after the final
 // layer norm, the conditioning Stable Diffusion's UNet cross-attends to.
@@ -111,6 +128,7 @@ struct TextToImageOptions {
     unsigned seed = 0;
     float guidance = 0.0f;                  // classifier-free guidance scale; <= 1 = off (SD-Turbo)
     std::string negativePrompt;             // used with guidance > 1
+    std::string tinyVae;                    // TAESD directory: decode with it instead of the full VAE
     std::function<void(const std::string& stage, double seconds)> progress;  // after each stage / step
 };
 
@@ -120,6 +138,10 @@ struct TextToImageOptions {
 // VAE decodes it. Each model is loaded only for its stage, so peak memory is
 // about the UNet's.
 Image textToImage(const std::string& directory, const std::string& prompt, const TextToImageOptions& options = {});
+// The first two stages alone: the denoised latent (1 x 4 * H/8 * W/8), ...
+Matrix textToLatent(const std::string& directory, const std::string& prompt, const TextToImageOptions& options = {});
+// ... and the last: decode it with the full VAE of `directory`, or with the TAESD in options.tinyVae.
+Image decodeLatent(const std::string& directory, const Matrix& latent, const TextToImageOptions& options = {});
 
 } // namespace nc
 

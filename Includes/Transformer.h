@@ -133,13 +133,20 @@ private:
 // Gaussian error linear unit (tanh approximation, as in GPT-2).
 class GELU : public Layer {
 public:
+    // Tanh: GPT-2's tanh approximation. Erf: the exact x * Phi(x) (BERT,
+    // OpenCLIP). Sigmoid: x * sigmoid(1.702 x) ("quick GELU" of OpenAI CLIP).
+    enum class Approximation { Tanh, Erf, Sigmoid };
+    explicit GELU(Approximation approximation = Approximation::Tanh) : approximation_(approximation) {}
+
     Matrix forward(const Matrix& input, bool training) override;
     Matrix backward(const Matrix& gradOutput) override;
     std::string name() const override { return "GELU"; }
+    std::string describe() const override;
 
 private:
+    Approximation approximation_;
     Matrix input_;
-    Matrix tanh_;  // tanh term from forward, reused by backward
+    Matrix tanh_;  // tanh term from forward, reused by backward (Tanh mode)
 };
 
 // Llama 3-style RoPE frequency scaling ("rope_type": "llama3"): pairs with

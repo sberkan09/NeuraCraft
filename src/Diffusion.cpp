@@ -1,4 +1,5 @@
 #include "Diffusion.h"
+#include "Dense.h"
 #include "Json.h"
 #include "SafeTensors.h"
 
@@ -189,6 +190,94 @@ Vae loadVae(const std::string& directory, std::size_t width, std::size_t height,
         b.conv(outC, 3, 1, 1, "decoder.conv_out");
     }
     return vae;
+}
+
+// ---- CLIP text encoder ------------------------------------------------------------------------
+
+Matrix ClipTextEncoder::encode(const std::vector<int>& ids) {
+    if (ids.size() != length)
+        throw std::invalid_argument("ClipTextEncoder::encode: expected " + std::to_string(length) + " ids, got " +
+                                    std::to_string(ids.size()));
+    Matrix x(1, ids.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) x(0, i) = static_cast<float>(ids[i]);
+    return net.predict(x);
+}
+
+ClipTextEncoder loadClipTextEncoder(const std::string& directory) {
+    const std::string dir = exists(directory + "/config.json") ? directory : directory + "/text_encoder";
+    const json::Value c = json::parse(readFile(dir + "/config.json"));
+    std::string file = dir + "/model.safetensors";
+    if (!exists(file)) file = dir + "/model.fp16.safetensors";
+    if (!exists(file)) throw std::runtime_error("loadClipTextEncoder: no model(.fp16).safetensors in " + dir);
+    const std::string act = c.find("hidden_act") ? c.at("hidden_act").string : "quick_gelu";
+    GELU::Approximation gelu;
+    if (act == "gelu") gelu = GELU::Approximation::Erf;
+    else if (act == "quick_gelu") gelu = GELU::Approximation::Sigmoid;
+    else throw std::runtime_error("loadClipTextEncoder: activation '" + act + "' is not supported");
+
+    ClipTextEncoder enc;
+    const std::size_t V = static_cast<std::size_t>(c.at("vocab_size").number);
+    const std::size_t D = static_cast<std::size_t>(c.at("hidden_size").number);
+    const std::size_t H = static_cast<std::size_t>(c.at("num_attention_heads").number);
+    const std::size_t F = static_cast<std::size_t>(c.at("intermediate_size").number);
+    enc.layers = static_cast<std::size_t>(c.at("num_hidden_layers").number);
+    enc.length = static_cast<std::size_t>(c.numberOr("max_position_embeddings", 77));
+    enc.dim = D;
+    const float eps = static_cast<float>(c.numberOr("layer_norm_eps", 1e-5));
+    SafeTensors st(file);
+    auto load = [&](const std::string& name, std::size_t rows, std::size_t cols) {
+        Matrix m = st.load(name);
+        if (m.size() != rows * cols)
+            throw std::runtime_error("loadClipTextEncoder: " + name + " has " + std::to_string(m.size()) + " values, expected " +
+                                     std::to_string(rows * cols));
+        return Matrix(rows, cols, std::move(m.values()));
+    };
+    const std::string p = "text_model.";
+    {
+        SkipParameterInit skip;
+        enc.context = std::make_shared<SequenceContext>();
+        auto& emb = enc.net.add<TokenEmbedding>(V, D, enc.length, enc.context, true);
+        emb.tokenTable() = load(p + "embeddings.token_embedding.weight", V, D);
+        emb.positionTable() = load(p + "embeddings.position_embedding.weight", enc.length, D);
+        for (std::size_t i = 0; i < enc.layers; ++i) {
+            const std::string l = p + "encoder.layers." + std::to_string(i) + ".";
+            auto& a = enc.net.add<Residual>();
+            auto& ln1 = a.add<LayerNorm>(D, eps);
+            ln1.gamma() = load(l + "layer_norm1.weight", 1, D);
+            ln1.beta() = load(l + "layer_norm1.bias", 1, D);
+            auto& att = a.add<CausalSelfAttention>(D, H, enc.context);
+            // [Q | K | V] stacked as (3D x D) out x in, transposed to the layer's in x out.
+            Matrix qkv(3 * D, D);
+            const char* parts[3] = {"q_proj", "k_proj", "v_proj"};
+            Matrix bias(1, 3 * D);
+            for (std::size_t k = 0; k < 3; ++k) {
+                const Matrix w = load(l + "self_attn." + parts[k] + ".weight", D, D);
+                std::copy(w.data(), w.data() + w.size(), qkv.data() + k * D * D);
+                const Matrix b = load(l + "self_attn." + parts[k] + ".bias", 1, D);
+                std::copy(b.data(), b.data() + D, bias.data() + k * D);
+            }
+            att.setWeights(qkv.transpose(), load(l + "self_attn.out_proj.weight", D, D).transpose());
+            att.qkvBias() = std::move(bias);
+            att.outBias() = load(l + "self_attn.out_proj.bias", 1, D);
+
+            auto& m = enc.net.add<Residual>();
+            auto& ln2 = m.add<LayerNorm>(D, eps);
+            ln2.gamma() = load(l + "layer_norm2.weight", 1, D);
+            ln2.beta() = load(l + "layer_norm2.bias", 1, D);
+            auto& fc1 = m.add<Dense>(D, F);
+            fc1.weights() = load(l + "mlp.fc1.weight", F, D).transpose();
+            fc1.bias() = load(l + "mlp.fc1.bias", 1, F);
+            m.add<GELU>(gelu);
+            auto& fc2 = m.add<Dense>(F, D);
+            fc2.weights() = load(l + "mlp.fc2.weight", D, F).transpose();
+            fc2.bias() = load(l + "mlp.fc2.bias", 1, D);
+        }
+        auto& lnf = enc.net.add<LayerNorm>(D, eps);
+        lnf.gamma() = load(p + "final_layer_norm.weight", 1, D);
+        lnf.beta() = load(p + "final_layer_norm.bias", 1, D);
+    }
+    enc.net.releaseGradients();
+    return enc;
 }
 
 } // namespace nc

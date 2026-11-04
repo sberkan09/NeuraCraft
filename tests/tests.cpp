@@ -2050,6 +2050,168 @@ TEST(vae_loader_builds_and_runs_a_diffusers_checkpoint) {
     std::filesystem::remove_all(dir);
 }
 
+TEST(gelu_variants_values_and_gradcheck) {
+    CHECK_NEAR(GELU(GELU::Approximation::Erf).forward(Matrix{{1.0f}}, false)(0, 0), 0.8413447, 1e-6);
+    CHECK_NEAR(GELU(GELU::Approximation::Sigmoid).forward(Matrix{{1.0f}}, false)(0, 0), 1.0 / (1.0 + std::exp(-1.702)), 1e-6);
+    CHECK_NEAR(GELU().forward(Matrix{{1.0f}}, false)(0, 0), 0.841192, 1e-5);  // tanh approximation
+    for (auto a : {GELU::Approximation::Erf, GELU::Approximation::Sigmoid}) {
+        setSeed(94);
+        Network net;
+        net.add<Dense>(3, 5);
+        net.add<GELU>(a);
+        MSE loss;
+        gradientCheck(net, loss, Matrix::uniform(4, 3, -2, 2), Matrix::uniform(4, 5, -1, 1));
+    }
+}
+
+namespace {
+std::string tinyClipTokenizer() {
+    const std::string dir = tempPath("cliptok");
+    std::filesystem::create_directories(dir);
+    std::ofstream vocab(dir + "/vocab.json");
+    vocab << '{';
+    int id = 0;
+    for (int pass = 0; pass < 2; ++pass)
+        for (int b = 0; b < 256; ++b) {
+            std::string sym = gpt2ByteSymbol(b);
+            if (sym == "\"" || sym == "\\") sym = "\\" + sym;
+            vocab << '"' << sym << (pass ? "</w>" : "") << "\":" << id++ << ',';
+        }
+    vocab << R"("he":512,"he</w>":513,"hel":514,"lo</w>":515,"<|startoftext|>":516,"<|endoftext|>":517})";
+    std::ofstream(dir + "/merges.txt") << "#version: 0.2\nh e</w>\nh e\nhe l\nl o</w>\n";
+    std::ofstream(dir + "/tokenizer_config.json")
+        << R"({"added_tokens_decoder":{"0":{"content":"!","special":true},"516":{"content":"<|startoftext|>"},)"
+        << R"("517":{"content":"<|endoftext|>"}}})";
+    return dir;
+}
+} // namespace
+
+TEST(clip_tokenizer_cleanup_split_and_padding) {
+    using V = std::vector<std::string>;
+    CHECK(ClipTokenizer::clean("  Hello\tWORLD\n\n Çağ  ") == "hello world çağ");
+    CHECK(ClipTokenizer::clean("東京tower") == "東 京 tower");       // spaces around CJK ideographs
+    CHECK(ClipTokenizer::clean("\xc4\xb0stanbul") == "i\xcc\x87stanbul");  // İ -> i + combining dot, as Python
+    CHECK(ClipTokenizer::splitWords("it's a 4k photo,by <|endoftext|>x") ==
+          V({"it", "'s", "a", "4", "k", "photo", ",", "by", "<|endoftext|>", "x"}));
+    CHECK(ClipTokenizer::splitWords("12 ...!! don't") == V({"1", "2", "...!!", "don", "'t"}));
+
+    const std::string dir = tinyClipTokenizer();
+    const ClipTokenizer tok = ClipTokenizer::fromDirectory(dir);
+    CHECK(tok.startOfText() == 516 && tok.endOfText() == 517);
+    CHECK(tok.encode("he") == std::vector<int>({513}));                   // "h e</w>" merge
+    CHECK(tok.encode("HELLO") == std::vector<int>({514, 515}));           // lowercased: "hel" + "lo</w>"
+    CHECK(tok.encode("ab") == std::vector<int>({'a', 256 + 'b'}));        // bytes; the last carries </w>
+    CHECK(tok.encode("he!he") == std::vector<int>({513, 0, 513}));        // the added "!" splits the raw text
+    const auto ids = tok.encodeForModel("hello he", 8, 0);
+    CHECK(ids == std::vector<int>({516, 514, 515, 513, 517, 0, 0, 0}));
+    CHECK(tok.encodeForModel("he he he he he he", 5, 0) == std::vector<int>({516, 513, 513, 513, 517}));  // truncated, end kept
+    CHECK(tok.decode({516, 514, 515, 513, 517}) == "hello he");  // end-of-word markers become spaces
+    std::filesystem::remove_all(dir);
+}
+
+TEST(clip_text_encoder_matches_reference_forward) {
+    setSeed(95);
+    const std::size_t V = 20, D = 8, H = 2, F = 16, L = 2, T = 6, hd = D / H;
+    const std::string dir = tempPath("clip_tiny");
+    std::filesystem::create_directories(dir + "/text_encoder");
+    std::ofstream(dir + "/text_encoder/config.json")
+        << R"({"model_type":"clip_text_model","hidden_act":"gelu","vocab_size":20,"hidden_size":8,"num_attention_heads":2,)"
+        << R"("intermediate_size":16,"num_hidden_layers":2,"max_position_embeddings":6,"layer_norm_eps":1e-5})";
+    std::map<std::string, Matrix> w;
+    const std::string p = "text_model.";
+    w[p + "embeddings.token_embedding.weight"] = Matrix::uniform(V, D, -1, 1);
+    w[p + "embeddings.position_embedding.weight"] = Matrix::uniform(T, D, -1, 1);
+    for (std::size_t i = 0; i < L; ++i) {
+        const std::string l = p + "encoder.layers." + std::to_string(i) + ".";
+        for (const char* n : {"layer_norm1", "layer_norm2"}) {
+            w[l + n + ".weight"] = Matrix::uniform(1, D, 0.5f, 1.5f);
+            w[l + n + ".bias"] = Matrix::uniform(1, D, -0.3f, 0.3f);
+        }
+        for (const char* n : {"q_proj", "k_proj", "v_proj", "out_proj"}) {
+            w[l + "self_attn." + n + ".weight"] = Matrix::uniform(D, D, -0.5f, 0.5f);
+            w[l + "self_attn." + n + ".bias"] = Matrix::uniform(1, D, -0.3f, 0.3f);
+        }
+        w[l + "mlp.fc1.weight"] = Matrix::uniform(F, D, -0.5f, 0.5f);
+        w[l + "mlp.fc1.bias"] = Matrix::uniform(1, F, -0.3f, 0.3f);
+        w[l + "mlp.fc2.weight"] = Matrix::uniform(D, F, -0.5f, 0.5f);
+        w[l + "mlp.fc2.bias"] = Matrix::uniform(1, D, -0.3f, 0.3f);
+    }
+    w[p + "final_layer_norm.weight"] = Matrix::uniform(1, D, 0.5f, 1.5f);
+    w[p + "final_layer_norm.bias"] = Matrix::uniform(1, D, -0.3f, 0.3f);
+    std::vector<std::pair<std::string, const Matrix*>> refs;
+    for (const auto& [n, m] : w) refs.emplace_back(n, &m);
+    saveSafeTensors(dir + "/text_encoder/model.safetensors", refs);
+
+    // Reference: Hugging Face's CLIPTextModel written out naively.
+    const std::vector<int> ids{3, 17, 5, 0, 0, 9};
+    using Rows = std::vector<std::vector<double>>;
+    auto ln = [&](const Rows& x, const std::string& n) {
+        Rows y = x;
+        for (auto& r : y) {
+            double m = 0, v = 0;
+            for (double e : r) m += e;
+            m /= D;
+            for (double e : r) v += (e - m) * (e - m);
+            v /= D;
+            for (std::size_t j = 0; j < D; ++j) r[j] = (r[j] - m) / std::sqrt(v + 1e-5) * w[n + ".weight"](0, j) + w[n + ".bias"](0, j);
+        }
+        return y;
+    };
+    auto lin = [&](const Rows& x, const std::string& n) {
+        const Matrix& W = w[n + ".weight"];
+        Rows y(x.size(), std::vector<double>(W.rows()));
+        for (std::size_t t = 0; t < x.size(); ++t)
+            for (std::size_t o = 0; o < W.rows(); ++o) {
+                double acc = w[n + ".bias"](0, o);
+                for (std::size_t k = 0; k < W.cols(); ++k) acc += W(o, k) * x[t][k];
+                y[t][o] = acc;
+            }
+        return y;
+    };
+    Rows x(T, std::vector<double>(D));
+    for (std::size_t t = 0; t < T; ++t)
+        for (std::size_t j = 0; j < D; ++j)
+            x[t][j] = w[p + "embeddings.token_embedding.weight"](static_cast<std::size_t>(ids[t]), j) +
+                      w[p + "embeddings.position_embedding.weight"](t, j);
+    for (std::size_t i = 0; i < L; ++i) {
+        const std::string l = p + "encoder.layers." + std::to_string(i) + ".";
+        const Rows h = ln(x, l + "layer_norm1");
+        const Rows q = lin(h, l + "self_attn.q_proj"), k = lin(h, l + "self_attn.k_proj"), v = lin(h, l + "self_attn.v_proj");
+        Rows merged(T, std::vector<double>(D, 0.0));
+        for (std::size_t hh = 0; hh < H; ++hh)
+            for (std::size_t a = 0; a < T; ++a) {
+                std::vector<double> s(a + 1);
+                double m = -1e300, sum = 0;
+                for (std::size_t b = 0; b <= a; ++b) {
+                    for (std::size_t e = 0; e < hd; ++e) s[b] += q[a][hh * hd + e] * k[b][hh * hd + e];
+                    m = std::max(m, s[b] /= std::sqrt(double(hd)));
+                }
+                for (double& e : s) sum += e = std::exp(e - m);
+                for (std::size_t b = 0; b <= a; ++b)
+                    for (std::size_t e = 0; e < hd; ++e) merged[a][hh * hd + e] += s[b] / sum * v[b][hh * hd + e];
+            }
+        const Rows o = lin(merged, l + "self_attn.out_proj");
+        for (std::size_t t = 0; t < T; ++t)
+            for (std::size_t j = 0; j < D; ++j) x[t][j] += o[t][j];
+        Rows f = lin(ln(x, l + "layer_norm2"), l + "mlp.fc1");
+        for (auto& r : f)
+            for (double& e : r) e = 0.5 * e * (1 + std::erf(e / std::sqrt(2.0)));
+        const Rows f2 = lin(f, l + "mlp.fc2");
+        for (std::size_t t = 0; t < T; ++t)
+            for (std::size_t j = 0; j < D; ++j) x[t][j] += f2[t][j];
+    }
+    const Rows ref = ln(x, p + "final_layer_norm");
+
+    ClipTextEncoder enc = loadClipTextEncoder(dir);
+    CHECK(enc.length == T && enc.dim == D && enc.layers == L);
+    const Matrix got = enc.encode(ids);
+    CHECK(got.rows() == T && got.cols() == D);
+    for (std::size_t t = 0; t < T; ++t)
+        for (std::size_t j = 0; j < D; ++j) CHECK_NEAR(got(t, j), ref[t][j], 1e-4);
+    CHECK_THROWS(enc.encode({1, 2, 3}), std::invalid_argument);
+    std::filesystem::remove_all(dir);
+}
+
 // ---- Training robustness ------------------------------------------------------------------
 
 TEST(cosine_schedule_and_gradient_clipping) {

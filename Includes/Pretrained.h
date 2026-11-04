@@ -101,6 +101,47 @@ private:
     int bos_ = -1, eos_ = -1, unk_ = -1;
 };
 
+// CLIP's BPE tokenizer (Stable Diffusion text encoders), from `vocab.json` and
+// `merges.txt`, matching transformers' CLIPTokenizer without ftfy: text is
+// cleaned (control characters dropped, whitespace collapsed, spaces around
+// CJK ideographs), lowercased, split with CLIP's pattern, mapped to bytes and
+// merged with an end-of-word marker "</w>". Lowercasing covers ASCII, Latin,
+// Greek and Cyrillic. With a tokenizer_config.json, its extra added tokens are
+// split out of the raw text first, as transformers does (Stable Diffusion 2's
+// pad token "!" then always becomes id 0).
+class ClipTokenizer : public Tokenizer {
+public:
+    ClipTokenizer(const std::string& vocabJsonPath, const std::string& mergesPath,
+                  const std::string& tokenizerConfigPath = "");
+    // Loads vocab.json, merges.txt and (if present) tokenizer_config.json from a directory.
+    static ClipTokenizer fromDirectory(const std::string& directory);
+
+    std::vector<int> encode(const std::string& text) const override;  // no bos / eos / padding
+    std::string decode(const std::vector<int>& ids) const override;   // "</w>" becomes a space; specials dropped
+    std::size_t vocabSize() const override { return idToToken_.size(); }
+    // <|startoftext|> text <|endoftext|>, truncated to `length` (keeping the
+    // end token) and padded with `pad` (Stable Diffusion 2 / Turbo pad with "!", id 0).
+    std::vector<int> encodeForModel(const std::string& text, std::size_t length = 77, int pad = -1) const;
+    int startOfText() const { return bos_; }
+    int endOfText() const { return eos_; }
+
+    static std::vector<std::string> splitWords(const std::string& cleanedText);  // CLIP's pattern (for tests)
+    static std::string clean(const std::string& text);                           // cleanup + lowercase (for tests)
+
+private:
+    std::vector<int> encodeWord(const std::string& word) const;
+    std::vector<int> encodeText(const std::string& text) const;  // no added-token splitting
+
+    std::unordered_map<std::string, int> vocab_;
+    std::vector<std::string> idToToken_;
+    std::unordered_map<std::string, int> ranks_;
+    std::vector<std::pair<std::string, int>> added_;  // matched verbatim before cleanup, longest first
+    std::array<std::string, 256> byteToUnicode_;
+    std::unordered_map<std::uint32_t, unsigned char> unicodeToByte_;
+    int bos_ = -1, eos_ = -1;
+    mutable std::unordered_map<std::string, std::vector<int>> cache_;
+};
+
 struct PretrainedModel {
     Network net;
     SequenceContextPtr context;  // pass to generate() for the KV cache

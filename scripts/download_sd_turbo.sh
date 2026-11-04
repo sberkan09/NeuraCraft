@@ -2,18 +2,21 @@
 # Downloads Stable Diffusion Turbo (stabilityai/sd-turbo; Stability AI
 # Non-Commercial Research Community License) in diffusers layout, fp16 weights.
 #   scripts/download_sd_turbo.sh [dir] [components...]
-# Components: vae (default; ~170 MB). More follow as NeuraCraft runs them.
+# Components: vae (~170 MB), text_encoder (CLIP tokenizer + text model, ~680 MB);
+# default: all of them. The UNet follows when NeuraCraft runs it.
 set -euo pipefail
 
 DIR="${1:-data/sd-turbo}"
 shift || true
-COMPONENTS=("${@:-vae}")
+if [ $# -gt 0 ]; then COMPONENTS=("$@"); else COMPONENTS=(vae text_encoder); fi
 BASE="${SD_TURBO_BASE_URL:-https://huggingface.co/stabilityai/sd-turbo/resolve/main}"
 
 files=(model_index.json)
 for c in "${COMPONENTS[@]}"; do
     case "$c" in
     vae) files+=(vae/config.json vae/diffusion_pytorch_model.fp16.safetensors) ;;
+    text_encoder) files+=(tokenizer/vocab.json tokenizer/merges.txt tokenizer/tokenizer_config.json
+                          tokenizer/special_tokens_map.json text_encoder/config.json text_encoder/model.fp16.safetensors) ;;
     *) echo "unknown component: $c" >&2; exit 1 ;;
     esac
 done

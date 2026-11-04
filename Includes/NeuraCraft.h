@@ -7,6 +7,8 @@
 #include "Conv.h"
 #include "Data.h"
 #include "Dense.h"
+#include "Diffusion.h"
+#include "Image.h"
 #include "Json.h"
 #include "Layer.h"
 #include "Loss.h"
@@ -21,6 +23,6 @@
 #include "Text.h"
 #include "Transformer.h"
 
-#define NEURACRAFT_VERSION "1.6.0"
+#define NEURACRAFT_VERSION "1.7.0"
 
 #endif // NEURACRAFT_H

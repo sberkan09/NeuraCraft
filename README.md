@@ -283,6 +283,38 @@ scaling types (linear, dynamic, YaRN), attention biases (Qwen 2; its
 tokenizer pattern is supported), sliding-window attention (Mistral v0.1) and
 tokenizer.json files with other pre-tokenizers (e.g. Metaspace).
 
+### Image generation (in progress): Stable Diffusion's VAE
+
+```
+$ scripts/download_sd_turbo.sh data/sd-turbo                  # the VAE of SD-Turbo (~170 MB fp16)
+$ ./build_and_run.sh vae data/sd-turbo                        # built-in test picture, 512x512
+$ ./build_and_run.sh vae data/sd-turbo photo.ppm out.png      # your own image (sides multiple of 8)
+```
+
+The first stage of text-to-image generation: `loadVae()` builds Stable
+Diffusion's KL autoencoder (diffusers `AutoencoderKL`) from its checkpoint and
+maps images (3 x H x W in [-1, 1]) to latents (4 x H/8 x W/8) and back. It is
+made of the new image layers in `Image.h`: `GroupNorm`, `SiLU`, `Upsample2D`,
+`Pad2D`, `ResnetBlock2D` and `SpatialSelfAttention`, plus `Conv2D`, whose
+inference path now works in row strips written straight into channel-major
+output (memory stays bounded at 512 x 512 and beyond; 1x1 convolutions are one
+GEMM). Images are read as PPM and written as PNG (`savePng`, `loadPpm`).
+
+`scripts/vae_reference.py` is an independent NumPy implementation: for a
+256 x 256 picture, NeuraCraft's latents and reconstruction agree with it within
+5.4e-6 and 3.1e-6. The round trip keeps the picture (PSNR 29-32 dB on the test
+pattern; fine stripes soften a little, as with any SD VAE).
+
+| SD-Turbo VAE, 2-core x86 | 256 x 256 | 512 x 512 |
+|---|---:|---:|
+| encode | 5.2 s | 22 s |
+| decode | 11.7 s | 45 s |
+| peak memory | — | 1.4 GB |
+
+The decoder is ~2.5 TFLOP at 512 x 512, running at ~70 GFLOPS here; on Apple
+silicon the same products go to Accelerate. Next: the CLIP text encoder, the
+UNet and the sampler, then GPU convolutions.
+
 ## Performance and devices
 
 All matrix products in the library go through one `gemm()` dispatcher
@@ -375,6 +407,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
 | Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE with Llama 3 scaling, grouped-query attention, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
 | Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales; integer AVX-VNNI / AVX2 / NEON products), `Network::quantize()` for Dense, attention and embeddings (shared with tied outputs), `setInt8Inputs` |
+| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG / PPM files, `loadVae()` (Stable Diffusion autoencoder: `encode`, `decode`) |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
 | Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k, top-p, repetition penalty, streaming callback, stop tokens), `Generator` (multi-turn, KV cache kept between calls) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |
@@ -424,7 +457,11 @@ independent reference forward pass (float32, int8, tied output, RoPE scaling,
 sharded files, stop tokens), int8 embeddings, the integer int8 kernels
 (error bound, single-row vs. batched paths, ragged sizes), multi-turn
 generation against generating from the whole transcript, top-p and the
-repetition penalty, and that inference passes keep no backward state. CI runs
+repetition penalty, that inference passes keep no backward state, the
+convolution inference path against the training path, the image layers
+(known values and gradient checks), spatial attention against a naive
+implementation, PNG/PPM files (chunks, CRCs and pixels parsed back), and the
+VAE loader on a synthetic diffusers checkpoint. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
 kernels).
 
@@ -434,6 +471,7 @@ kernels).
 Includes/   public headers (NeuraCraft.h includes everything)
 src/        library sources + Main.cpp (demo CLI -> bin/NeuraCraft)
 tests/      unit tests
-scripts/    download_{mnist,shakespeare,gpt2,tinyllama,llama32}.sh, gpt2_reference.py, llama_reference.py,
+scripts/    download_{mnist,shakespeare,gpt2,tinyllama,llama32,sd_turbo}.sh, gpt2_reference.py, llama_reference.py,
+            vae_reference.py,
             gen_unicode_tables.py (src/UnicodeTables.cpp)
 ```

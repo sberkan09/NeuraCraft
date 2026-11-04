@@ -11,6 +11,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1797,6 +1798,256 @@ TEST(inference_forward_keeps_no_backward_state) {
     const Matrix y = att.forward(seq, false);
     CHECK_THROWS(att.backward(Matrix(6, 8, 1.0f)), std::logic_error);
     CHECK(att.forward(seq, true).approxEquals(y, 1e-5f));
+}
+
+// ---- Image models ----------------------------------------------------------------------------
+
+TEST(conv2d_inference_path_matches_training_path) {
+    // Inference works in row strips straight into channel-major output (1x1: one GEMM).
+    setSeed(90);
+    struct Case { ImageShape in; std::size_t out, k, stride, pad; };
+    for (const Case& c : {Case{{3, 9, 7}, 5, 3, 1, 1}, Case{{4, 8, 8}, 6, 3, 2, 0}, Case{{6, 5, 4}, 3, 1, 1, 0},
+                          Case{{2, 11, 13}, 4, 5, 2, 2}, Case{{3, 4, 4}, 2, 1, 2, 0}}) {
+        Conv2D conv(c.in, c.out, c.k, c.stride, c.pad);
+        conv.bias() = Matrix::uniform(1, c.out, -1, 1);
+        const Matrix x = Matrix::uniform(2, c.in.size(), -1, 1);
+        CHECK(conv.forward(x, false).approxEquals(conv.forward(x, true), 1e-4f));
+    }
+}
+
+TEST(image_layers_known_values_and_gradcheck) {
+    setSeed(91);
+    // GroupNorm: every group has mean 0 and variance 1 before gamma / beta.
+    GroupNorm gn({4, 3, 2}, 2, 1e-6f);
+    const Matrix x = Matrix::uniform(2, 24, -2, 3);
+    const Matrix y = gn.forward(x, false);
+    for (std::size_t b = 0; b < 2; ++b)
+        for (std::size_t g = 0; g < 2; ++g) {
+            double s = 0, ss = 0;
+            for (std::size_t i = 0; i < 12; ++i) {
+                s += y(b, g * 12 + i);
+                ss += y(b, g * 12 + i) * y(b, g * 12 + i);
+            }
+            CHECK_NEAR(s / 12, 0.0, 1e-5);
+            CHECK_NEAR(ss / 12, 1.0, 1e-4);
+        }
+    // Upsample (nearest) and Pad2D (asymmetric) values.
+    Upsample2D up({1, 2, 2}, 2);
+    CHECK(up.forward(Matrix{{1, 2, 3, 4}}, false).approxEquals(
+        Matrix{{1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4}}, 0.0f));
+    Pad2D pad({1, 2, 2}, 0, 1, 0, 1);
+    CHECK(pad.forward(Matrix{{1, 2, 3, 4}}, false).approxEquals(Matrix{{1, 2, 0, 3, 4, 0, 0, 0, 0}}, 0.0f));
+    CHECK(std::fabs(SiLU().forward(Matrix{{1.0f}}, false)(0, 0) - 1.0f / (1.0f + std::exp(-1.0f))) < 1e-6f);
+
+    // Gradients through GroupNorm, SiLU, Pad2D, Upsample2D and residual blocks (both shortcut kinds).
+    Network net;
+    auto& g = net.add<GroupNorm>(ImageShape{4, 3, 3}, 2, 1e-5f);
+    g.gamma() = Matrix::uniform(1, 4, 0.5f, 1.5f);
+    g.beta() = Matrix::uniform(1, 4, -0.5f, 0.5f);
+    net.add<SiLU>();
+    net.add<Pad2D>(ImageShape{4, 3, 3}, 1, 0, 0, 1);
+    net.add<Upsample2D>(ImageShape{4, 4, 4}, 2);
+    net.add<ResnetBlock2D>(ImageShape{4, 8, 8}, 4, 2, 1e-5f);
+    net.add<ResnetBlock2D>(ImageShape{4, 8, 8}, 2, 2, 1e-5f);
+    MSE loss;
+    gradientCheck(net, loss, Matrix::uniform(2, 36, -1, 1), Matrix::uniform(2, 2 * 64, -1, 1));
+}
+
+TEST(spatial_attention_matches_naive_and_chunks) {
+    // 64 x 64 pixels = 4096 queries, processed in four chunks; two heads.
+    setSeed(92);
+    const ImageShape s{4, 64, 64};
+    const std::size_t C = 4, HW = 4096, heads = 2, dh = 2;
+    SpatialSelfAttention att(s, heads, 2, 1e-6f);
+    att.queryBias() = Matrix::uniform(1, C, -0.3f, 0.3f);
+    att.outBias() = Matrix::uniform(1, C, -0.3f, 0.3f);
+    const Matrix x = Matrix::uniform(1, s.size(), -1, 1);
+    const Matrix got = att.forward(x, false);
+    const Matrix n = att.norm().forward(x, false);
+    auto proj = [&](Matrix& w, Matrix& b, std::size_t c, std::size_t p, const std::vector<double>& v) {
+        double acc = b(0, c);
+        for (std::size_t k = 0; k < C; ++k) acc += w(c, k) * v[k * HW + p];
+        return acc;
+    };
+    std::vector<double> nv(n.data(), n.data() + n.size()), q(C * HW), k(C * HW), v(C * HW), o(C * HW, 0.0);
+    for (std::size_t c = 0; c < C; ++c)
+        for (std::size_t p = 0; p < HW; ++p) {
+            q[c * HW + p] = proj(att.query(), att.queryBias(), c, p, nv);
+            k[c * HW + p] = proj(att.key(), att.keyBias(), c, p, nv);
+            v[c * HW + p] = proj(att.value(), att.valueBias(), c, p, nv);
+        }
+    std::vector<double> sc(HW);
+    for (std::size_t h = 0; h < heads; ++h)
+        for (std::size_t i = 0; i < HW; i += 97) {  // a spread of query pixels
+            double m = -1e300, sum = 0;
+            for (std::size_t j = 0; j < HW; ++j) {
+                double d = 0;
+                for (std::size_t e = 0; e < dh; ++e) d += q[(h * dh + e) * HW + i] * k[(h * dh + e) * HW + j];
+                m = std::max(m, sc[j] = d / std::sqrt(double(dh)));
+            }
+            for (std::size_t j = 0; j < HW; ++j) sum += sc[j] = std::exp(sc[j] - m);
+            for (std::size_t e = 0; e < dh; ++e) {
+                double acc = 0;
+                for (std::size_t j = 0; j < HW; ++j) acc += sc[j] / sum * v[(h * dh + e) * HW + j];
+                o[(h * dh + e) * HW + i] = acc;
+            }
+        }
+    for (std::size_t i = 0; i < HW; i += 97)
+        for (std::size_t c = 0; c < C; ++c) CHECK_NEAR(got(0, c * HW + i), x(0, c * HW + i) + proj(att.out(), att.outBias(), c, i, o), 1e-4);
+    CHECK_THROWS(att.backward(got), std::logic_error);
+}
+
+TEST(png_and_ppm_files) {
+    Image img;
+    img.width = 300;  // a scanline of 900 bytes; 240 rows span two stored deflate blocks
+    img.height = 240;
+    img.pixels.resize(300 * 240 * 3);
+    for (std::size_t i = 0; i < img.pixels.size(); ++i) img.pixels[i] = static_cast<std::uint8_t>(i * 7 % 251);
+    const std::string png = tempPath("t.png"), ppm = tempPath("t.ppm");
+    savePng(png, img);
+    // Parse it back: chunks with valid CRCs, IHDR fields, and the stored zlib blocks.
+    std::ifstream f(png, std::ios::binary);
+    std::vector<std::uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    CHECK(d.size() > 8 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G');
+    auto be = [&](std::size_t at) { return (std::uint32_t(d[at]) << 24) | (d[at + 1] << 16) | (d[at + 2] << 8) | d[at + 3]; };
+    std::vector<std::uint8_t> zlib;
+    for (std::size_t at = 8; at < d.size();) {
+        const std::uint32_t len = be(at);
+        const std::string type(d.begin() + static_cast<long>(at + 4), d.begin() + static_cast<long>(at + 8));
+        std::uint32_t crc = 0xFFFFFFFFu;
+        for (std::size_t i = at + 4; i < at + 8 + len; ++i) {
+            crc ^= d[i];
+            for (int b = 0; b < 8; ++b) crc = crc & 1 ? 0xEDB88320u ^ (crc >> 1) : crc >> 1;
+        }
+        CHECK((~crc) == be(at + 8 + len));
+        if (type == "IHDR") CHECK(be(at + 8) == 300 && be(at + 12) == 240 && d[at + 16] == 8 && d[at + 17] == 2);
+        if (type == "IDAT") zlib.insert(zlib.end(), d.begin() + static_cast<long>(at + 8), d.begin() + static_cast<long>(at + 8 + len));
+        at += 12 + len;
+    }
+    std::vector<std::uint8_t> raw;
+    for (std::size_t at = 2;;) {
+        const bool last = zlib[at] & 1;
+        const std::size_t len = zlib[at + 1] | (zlib[at + 2] << 8);
+        CHECK(((zlib[at + 3] | (zlib[at + 4] << 8)) ^ 0xFFFF) == len);
+        raw.insert(raw.end(), zlib.begin() + static_cast<long>(at + 5), zlib.begin() + static_cast<long>(at + 5 + len));
+        at += 5 + len;
+        if (last) break;
+    }
+    CHECK(raw.size() == 240 * 901);
+    for (std::size_t y = 0; y < 240; ++y) {
+        CHECK(raw[y * 901] == 0);
+        CHECK(std::equal(img.pixels.begin() + static_cast<long>(y * 900), img.pixels.begin() + static_cast<long>((y + 1) * 900),
+                         raw.begin() + static_cast<long>(y * 901 + 1)));
+    }
+    savePpm(ppm, img);
+    const Image back = loadPpm(ppm);
+    CHECK(back.width == 300 && back.height == 240 && back.pixels == img.pixels);
+    // Tensor conversion round trip in [-1, 1].
+    const Matrix t = imageToTensor(img);
+    CHECK(t.cols() == 3 * 300 * 240 && t(0, 0) == -1.0f + 2.0f * img.pixels[0] / 255.0f);
+    CHECK(tensorToImage(t.data(), {3, 240, 300}).pixels == img.pixels);
+    std::filesystem::remove(png);
+    std::filesystem::remove(ppm);
+}
+
+namespace {
+// Tensor names and shapes of a diffusers AutoencoderKL with the given layout.
+std::map<std::string, std::vector<std::size_t>> vaeTensorShapes(const std::vector<std::size_t>& ch, std::size_t layers,
+                                                                 std::size_t latent) {
+    std::map<std::string, std::vector<std::size_t>> t;
+    auto conv = [&](const std::string& n, std::size_t o, std::size_t i, std::size_t k) {
+        t[n + ".weight"] = {o, i, k, k};
+        t[n + ".bias"] = {o};
+    };
+    auto norm = [&](const std::string& n, std::size_t c) {
+        t[n + ".weight"] = {c};
+        t[n + ".bias"] = {c};
+    };
+    auto resnet = [&](const std::string& p, std::size_t in, std::size_t out) {
+        norm(p + ".norm1", in);
+        conv(p + ".conv1", out, in, 3);
+        norm(p + ".norm2", out);
+        conv(p + ".conv2", out, out, 3);
+        if (in != out) conv(p + ".conv_shortcut", out, in, 1);
+    };
+    auto attention = [&](const std::string& p, std::size_t c) {
+        norm(p + ".group_norm", c);
+        for (const char* n : {".to_q", ".to_k", ".to_v", ".to_out.0"}) {
+            t[p + n + ".weight"] = {c, c};
+            t[p + n + ".bias"] = {c};
+        }
+    };
+    const std::size_t top = ch.back();
+    conv("encoder.conv_in", ch[0], 3, 3);
+    std::size_t c = ch[0];
+    for (std::size_t i = 0; i < ch.size(); ++i) {
+        for (std::size_t j = 0; j < layers; ++j, c = ch[i])
+            resnet("encoder.down_blocks." + std::to_string(i) + ".resnets." + std::to_string(j), c, ch[i]);
+        if (i + 1 < ch.size()) conv("encoder.down_blocks." + std::to_string(i) + ".downsamplers.0.conv", c, c, 3);
+    }
+    resnet("encoder.mid_block.resnets.0", top, top);
+    attention("encoder.mid_block.attentions.0", top);
+    resnet("encoder.mid_block.resnets.1", top, top);
+    norm("encoder.conv_norm_out", top);
+    conv("encoder.conv_out", 2 * latent, top, 3);
+    conv("quant_conv", 2 * latent, 2 * latent, 1);
+    conv("post_quant_conv", latent, latent, 1);
+    conv("decoder.conv_in", top, latent, 3);
+    resnet("decoder.mid_block.resnets.0", top, top);
+    attention("decoder.mid_block.attentions.0", top);
+    resnet("decoder.mid_block.resnets.1", top, top);
+    c = top;
+    for (std::size_t i = 0; i < ch.size(); ++i) {
+        const std::size_t out = ch[ch.size() - 1 - i];
+        for (std::size_t j = 0; j <= layers; ++j, c = out)
+            resnet("decoder.up_blocks." + std::to_string(i) + ".resnets." + std::to_string(j), c, out);
+        if (i + 1 < ch.size()) conv("decoder.up_blocks." + std::to_string(i) + ".upsamplers.0.conv", out, out, 3);
+    }
+    norm("decoder.conv_norm_out", ch[0]);
+    conv("decoder.conv_out", 3, ch[0], 3);
+    return t;
+}
+} // namespace
+
+TEST(vae_loader_builds_and_runs_a_diffusers_checkpoint) {
+    setSeed(93);
+    const std::string dir = tempPath("vae_tiny");
+    std::filesystem::create_directories(dir + "/vae");
+    std::ofstream(dir + "/vae/config.json") << R"({"_class_name":"AutoencoderKL","act_fn":"silu","block_out_channels":[8,16],)"
+                                            << R"("in_channels":3,"out_channels":3,"latent_channels":2,"layers_per_block":1,)"
+                                            << R"("norm_num_groups":4,"scaling_factor":0.5})";
+    std::map<std::string, Matrix> owned;
+    for (const auto& [name, shape] : vaeTensorShapes({8, 16}, 1, 2)) {
+        std::size_t n = 1;
+        for (std::size_t d : shape) n *= d;
+        const bool scale = name.find("norm") != std::string::npos && name.size() > 7 && name.substr(name.size() - 7) == ".weight";
+        owned[name] = scale ? Matrix::uniform(1, n, 0.8f, 1.2f) : Matrix::uniform(1, n, -0.2f, 0.2f);
+    }
+    std::vector<std::pair<std::string, const Matrix*>> refs;
+    for (const auto& [n, m] : owned) refs.emplace_back(n, &m);
+    saveSafeTensors(dir + "/vae/diffusion_pytorch_model.safetensors", refs);
+
+    Vae vae = loadVae(dir, 16, 8);
+    CHECK(vae.latent.channels == 2 && vae.latent.height == 4 && vae.latent.width == 8 && vae.scalingFactor == 0.5f);
+    const Matrix img = Matrix::uniform(1, 3 * 16 * 8, -1, 1);
+    const Matrix z = vae.encode(img);
+    CHECK(z.cols() == 2 * 4 * 8);
+    const Matrix moments = vae.encoder.predict(img);
+    CHECK_NEAR(z(0, 5), moments(0, 5) * 0.5, 1e-6);  // the scaled mean: first half of the moments
+    const Matrix back = vae.decode(z);
+    CHECK(back.cols() == 3 * 16 * 8);
+    CHECK(vae.decode(z).approxEquals(back, 0.0f));  // deterministic
+    // The first decoder layer (post_quant_conv) got the checkpoint's weights, transposed to (in*k*k) x out.
+    auto& pq = dynamic_cast<Conv2D&>(vae.decoder.layer(0));
+    CHECK(pq.weights()(1, 0) == owned["post_quant_conv.weight"](0, 1));
+
+    CHECK_THROWS(loadVae(dir, 15, 8), std::invalid_argument);  // not a multiple of 2^(blocks - 1) = 2
+    owned["decoder.conv_in.weight"] = Matrix(1, 5);
+    refs.clear();
+    for (const auto& [n, m] : owned) refs.emplace_back(n, &m);
+    saveSafeTensors(dir + "/vae/diffusion_pytorch_model.safetensors", refs);
+    CHECK_THROWS(loadVae(dir, 16, 8), std::runtime_error);
+    std::filesystem::remove_all(dir);
 }
 
 // ---- Training robustness ------------------------------------------------------------------

@@ -15,6 +15,8 @@
 //                              run pretrained GPT-2 weights (scripts/download_gpt2.sh)
 //   NeuraCraft llama <dir> [prompt] [tokens] [options]
 //                              run a Llama-family checkpoint (scripts/download_llama32.sh, download_tinyllama.sh)
+//   NeuraCraft vae <dir> [in.ppm] [out.png] [--size N]
+//                              Stable Diffusion VAE round trip (scripts/download_sd_turbo.sh)
 //   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
 //
 // Global options: --gpu (Metal on Apple silicon), --threads N
@@ -628,6 +630,84 @@ struct ChatTemplate {
     }
 };
 
+// A procedural test picture (sky, sun, hills, stripes, checkerboard) for the VAE demo.
+Image testPattern(std::size_t size) {
+    Image img;
+    img.width = img.height = size;
+    img.pixels.resize(size * size * 3);
+    for (std::size_t y = 0; y < size; ++y)
+        for (std::size_t x = 0; x < size; ++x) {
+            const double u = static_cast<double>(x) / size, v = static_cast<double>(y) / size;
+            double r = 0.35 + 0.4 * (1 - v), g = 0.55 + 0.3 * (1 - v), b = 0.95;
+            if ((u - 0.72) * (u - 0.72) + (v - 0.25) * (v - 0.25) < 0.012) {
+                r = 1.0;
+                g = 0.85;
+                b = 0.2;
+            }
+            const double hill = 0.62 + 0.08 * std::sin(u * 9.0);
+            if (v > hill) {
+                r = 0.15 + 0.1 * std::sin(u * 40);
+                g = 0.55 - 0.3 * (v - hill);
+                b = 0.2;
+            }
+            if (v > 0.85) r = g = b = ((x / (size / 16)) + (y / (size / 16))) % 2 ? 0.9 : 0.1;
+            if (u < 0.12 && v < 0.8) {
+                const bool s = (y / 6) % 2;
+                r = s ? 0.9 : 0.6;
+                g = 0.1;
+                b = s ? 0.2 : 0.5;
+            }
+            const double px[3] = {r, g, b};
+            for (std::size_t c = 0; c < 3; ++c)
+                img.pixels[(y * size + x) * 3 + c] = static_cast<std::uint8_t>(std::lround(std::min(1.0, std::max(0.0, px[c])) * 255));
+        }
+    return img;
+}
+
+int runVae(const std::string& dir, const std::string& input, const std::string& output, std::size_t size) {
+    using Clock = std::chrono::steady_clock;
+    auto seconds = [](Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); };
+    Image img;
+    try {
+        img = input.empty() ? testPattern(size) : loadPpm(input);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << '\n';
+        return 2;
+    }
+    if (img.channels != 3 || img.width % 8 || img.height % 8) {
+        std::cerr << "the image must be RGB with width and height multiples of 8 (got " << img.width << "x" << img.height << ")\n";
+        return 2;
+    }
+    auto t = Clock::now();
+    Vae vae;
+    try {
+        vae = loadVae(dir, img.width, img.height);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\ndownload the VAE with: scripts/download_sd_turbo.sh " << dir << '\n';
+        return 2;
+    }
+    std::cout << "loaded the VAE for " << img.width << "x" << img.height << " in " << std::fixed << std::setprecision(1) << seconds(t)
+              << " s; latents are " << vae.latent.channels << "x" << vae.latent.height << "x" << vae.latent.width << '\n';
+    t = Clock::now();
+    const Matrix z = vae.encode(imageToTensor(img));
+    std::cout << "encode " << seconds(t) << " s";
+    t = Clock::now();
+    const Matrix back = vae.decode(z);
+    std::cout << ", decode " << seconds(t) << " s\n";
+    const Image rec = tensorToImage(back.data(), vae.image);
+    double se = 0.0;
+    for (std::size_t i = 0; i < img.pixels.size(); ++i) {
+        const double d = static_cast<double>(img.pixels[i]) - rec.pixels[i];
+        se += d * d;
+    }
+    const std::string original = output.substr(0, output.rfind('.')) + "_input.png";
+    savePng(original, img);
+    savePng(output, rec);
+    std::cout << "reconstruction PSNR " << std::setprecision(2) << 10.0 * std::log10(255.0 * 255.0 / (se / img.pixels.size()))
+              << " dB; wrote " << output << " (input: " << original << ")" << std::defaultfloat << '\n';
+    return 0;
+}
+
 int runLlama(const std::string& dir, const LlamaOptions& o) {
     const auto t0 = std::chrono::steady_clock::now();
     PretrainedModel model;
@@ -861,6 +941,8 @@ void usage() {
               << "  NeuraCraft llama <dir> [prompt] [tokens] [--chat | -i] [--system S] [--fp32] [--check]\n"
               << "                 [--greedy | --temperature T] [--top-k K] [--top-p P] [--repeat-penalty R] [--seed N]\n"
               << "                               Llama 3.x / TinyLlama / Mistral, int8 by default (scripts/download_llama32.sh)\n"
+              << "  NeuraCraft vae <dir> [in.ppm] [out.png] [--size N]\n"
+              << "                               encode and decode an image with Stable Diffusion's VAE\n"
               << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
               << "options:\n"
               << "  --gpu          run large matrix products on the GPU (Metal)\n"
@@ -990,6 +1072,25 @@ int main(int argc, char** argv) {
                 }
             }
             return runGpt2(args[1], prompt, tokens, sampling, check, int8);
+        }
+        if (cmd == "vae") {
+            if (args.size() < 2) {
+                usage();
+                return 2;
+            }
+            std::string input, output = "vae_reconstruction.png";
+            std::size_t size = 512, positional = 0;
+            for (std::size_t i = 2; i < args.size(); ++i) {
+                if (args[i] == "--size" && i + 1 < args.size()) size = std::stoul(args[++i]);
+                else if (positional == 0 && args[i].size() > 4 && args[i].substr(args[i].size() - 4) == ".png") { output = args[i]; positional = 2; }
+                else if (positional == 0) { input = args[i]; ++positional; }
+                else if (positional == 1) { output = args[i]; ++positional; }
+                else {
+                    std::cerr << "unknown vae option: " << args[i] << "\n";
+                    return 2;
+                }
+            }
+            return runVae(args[1], input, output, size);
         }
         if (cmd == "llama") {
             if (args.size() < 2) {

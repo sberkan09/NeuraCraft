@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -584,6 +585,129 @@ TEST(cnn_learns_simple_patterns) {
     opts.verbose = false;
     net.fit(x, y, loss, opt, opts);
     CHECK_NEAR(net.accuracy(x, y), 1.0, 1e-6);
+}
+
+// ---- Transformer / language model -------------------------------------------------------
+
+TEST(layernorm_and_gelu_gradcheck) {
+    setSeed(30);
+    Network net;
+    net.add<Dense>(4, 6);
+    net.add<LayerNorm>(6);
+    net.add<GELU>();
+    net.add<Dense>(6, 2);
+    MSE loss;
+    gradientCheck(net, loss, Matrix::uniform(5, 4, -1.5f, 1.5f), Matrix::uniform(5, 2, -1, 1));
+
+    LayerNorm ln(3);
+    const Matrix y = ln.forward(Matrix{{1, 2, 3}, {10, 10, 13}}, false);
+    for (std::size_t r = 0; r < 2; ++r) CHECK_NEAR(y.row(r).sum(), 0.0, 1e-5);
+    CHECK_NEAR(GELU().forward(Matrix{{0.0f}}, false)(0, 0), 0.0, 1e-7);
+}
+
+TEST(attention_gradcheck_and_residual) {
+    setSeed(31);
+    auto ctx = std::make_shared<SequenceContext>();
+    ctx->length = 3;  // input: 2 sequences of 3 positions
+    Network net;
+    auto& block = net.add<Residual>();
+    block.add<LayerNorm>(4);
+    block.add<CausalSelfAttention>(4, 2, ctx);
+    net.add<Dense>(4, 3);
+    MSE loss;
+    gradientCheck(net, loss, Matrix::uniform(6, 4, -1, 1), Matrix::uniform(6, 3, -1, 1));
+}
+
+TEST(attention_is_causal) {
+    setSeed(32);
+    auto ctx = std::make_shared<SequenceContext>();
+    ctx->length = 5;
+    CausalSelfAttention att(8, 2, ctx);
+    Matrix x = Matrix::uniform(5, 8, -1, 1);
+    const Matrix before = att.forward(x, false);
+    for (std::size_t j = 0; j < 8; ++j) x(4, j) += 3.0f;  // change only the last position
+    const Matrix after = att.forward(x, false);
+    CHECK(before.sliceRows(0, 4).approxEquals(after.sliceRows(0, 4), 1e-6f));
+    CHECK(!before.row(4).approxEquals(after.row(4), 1e-3f));
+    ctx->length = 4;
+    CHECK_THROWS(att.forward(x, false), std::invalid_argument);  // 5 rows, length 4
+}
+
+TEST(sparse_cross_entropy_matches_dense) {
+    const Matrix logits{{2.0f, -1.0f, 0.5f}, {0.1f, 0.2f, 3.0f}, {1, 1, 1}};
+    SparseSoftmaxCrossEntropy sparse;
+    SoftmaxCrossEntropy dense;
+    CHECK_NEAR(sparse.compute(logits, Matrix{{0, 2, 1}}), dense.compute(logits, oneHot({0, 2, 1}, 3)), 1e-5);
+    CHECK(sparse.gradient().approxEquals(dense.gradient(), 1e-6f));
+    CHECK_THROWS(sparse.compute(logits, Matrix{{0, 3, 1}}), std::out_of_range);
+    CHECK_THROWS(sparse.compute(logits, Matrix{{0, 1}}), std::invalid_argument);
+}
+
+TEST(gpt_gradcheck_end_to_end) {
+    setSeed(33);
+    GPTConfig cfg;
+    cfg.vocabSize = 5;
+    cfg.contextLength = 4;
+    cfg.dim = 8;
+    cfg.heads = 2;
+    cfg.layers = 1;
+    cfg.mlpRatio = 2;
+    Network net;
+    buildGPT(net, cfg);
+    // Embeddings start at std 0.02; widen them so the 0.01 finite-difference
+    // probe is small relative to the values LayerNorm normalizes.
+    auto& emb = dynamic_cast<TokenEmbedding&>(net.layer(0));
+    emb.tokenTable() = Matrix::uniform(cfg.vocabSize, cfg.dim, -1, 1);
+    emb.positionTable() = Matrix::uniform(cfg.contextLength, cfg.dim, -1, 1);
+    SparseSoftmaxCrossEntropy loss;
+    // Token-id inputs: the numerical probe never changes the rounded ids, and
+    // TokenEmbedding returns a zero input gradient, so the check still holds.
+    gradientCheck(net, loss, Matrix{{0, 3, 1, 4}, {2, 2, 0, 1}}, Matrix{{3, 1, 4, 0}, {2, 0, 1, 3}});
+}
+
+TEST(tokenizer_and_dataset) {
+    const CharTokenizer tok("hello world");
+    CHECK(tok.vocabSize() == 8);  // ' ' d e h l o r w
+    const auto ids = tok.encode("hold");
+    CHECK(tok.decode(ids) == "hold");
+    CHECK(tok.contains('w') && !tok.contains('z'));
+    CHECK_THROWS(tok.encode("z"), std::invalid_argument);
+
+    const Dataset d = makeNextTokenDataset({0, 1, 2, 3, 4, 5, 6}, 3, 2);
+    CHECK(d.x.rows() == 2 && d.x.cols() == 3);
+    CHECK(d.x.approxEquals(Matrix{{0, 1, 2}, {2, 3, 4}}));
+    CHECK(d.y.approxEquals(Matrix{{1, 2, 3}, {3, 4, 5}}));
+    CHECK_THROWS(makeNextTokenDataset({1, 2}, 3), std::invalid_argument);
+}
+
+TEST(gpt_memorizes_a_sequence_and_generates_it) {
+    setSeed(34);
+    const std::string text = "abcdefgh abcdefgh abcdefgh abcdefgh abcdefgh abcdefgh ";
+    const CharTokenizer tok(text);
+    const Dataset d = makeNextTokenDataset(tok.encode(text), 8, 1);
+    GPTConfig cfg;
+    cfg.vocabSize = tok.vocabSize();
+    cfg.contextLength = 8;
+    cfg.dim = 32;
+    cfg.heads = 4;
+    cfg.layers = 2;
+    Network net;
+    buildGPT(net, cfg);
+    SparseSoftmaxCrossEntropy loss;
+    Adam opt(0.01f);
+    FitOptions opts;
+    opts.epochs = 40;
+    opts.batchSize = 16;
+    opts.verbose = false;
+    const History h = net.fit(d.x, d.y, loss, opt, opts);
+    CHECK(h.back().loss < 0.1f);
+    SamplingOptions greedy;
+    greedy.temperature = 0.0f;
+    CHECK(tok.decode(generate(net, tok.encode("abc"), 13, cfg.contextLength, greedy)) == "defgh abcdefg");
+    SamplingOptions sampled;
+    sampled.temperature = 0.8f;
+    sampled.topK = 3;
+    CHECK(generate(net, tok.encode("a"), 20, cfg.contextLength, sampled).size() == 20);
 }
 
 // ---- Backends & threading -----------------------------------------------------------

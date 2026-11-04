@@ -4,6 +4,7 @@
 #include "Matrix.h"
 
 #include <string>
+#include <vector>
 
 namespace nc {
 
@@ -67,6 +68,20 @@ public:
 private:
     Matrix probabilities_;
     Matrix targets_;
+};
+
+// Softmax cross-entropy against integer class ids instead of one-hot rows.
+// `targets` may have any shape as long as it holds one id per logits row
+// (e.g. batch x seqLen next-token ids for a language model).
+class SparseSoftmaxCrossEntropy : public Loss {
+public:
+    float compute(const Matrix& logits, const Matrix& targets) override;
+    Matrix gradient() const override;
+    std::string name() const override { return "SparseSoftmaxCrossEntropy"; }
+
+private:
+    Matrix probabilities_;
+    std::vector<std::size_t> targets_;
 };
 
 } // namespace nc

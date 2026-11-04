@@ -32,6 +32,8 @@ add_library(neuracraft_lib STATIC
     src/Optimizer.cpp
     src/Parallel.cpp
     src/Random.cpp
+    src/Text.cpp
+    src/Transformer.cpp
 )
 set_target_properties(neuracraft_lib PROPERTIES OUTPUT_NAME neuracraft)
 target_include_directories(neuracraft_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/Includes)

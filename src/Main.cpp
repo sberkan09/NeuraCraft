@@ -7,6 +7,10 @@
 //   NeuraCraft eval <dir> [mlp|cnn]
 //                              evaluate the saved weights on the MNIST test set
 //                              (see scripts/download_mnist.sh)
+//   NeuraCraft gpt <text-file> [epochs]
+//                              train a character-level GPT (scripts/download_shakespeare.sh)
+//   NeuraCraft generate <text-file> [prompt] [length]
+//                              sample from the trained GPT
 //   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
 //
 // Global options: --gpu (Metal on Apple silicon), --threads N
@@ -293,6 +297,107 @@ int runEval(const std::string& dir, const std::string& model) {
     return 0;
 }
 
+GPTConfig textModelConfig(std::size_t vocab) {
+    GPTConfig cfg;
+    cfg.vocabSize = vocab;
+    cfg.contextLength = 64;
+    cfg.dim = 128;
+    cfg.heads = 4;
+    cfg.layers = 4;
+    cfg.dropout = 0.1f;
+    return cfg;
+}
+
+std::string gptWeightsPath(const std::string& textPath) { return textPath + ".gpt.weights"; }
+
+void printSample(Network& net, const CharTokenizer& tok, const std::string& prompt, std::size_t length,
+                 std::size_t context) {
+    SamplingOptions sampling;
+    sampling.temperature = 0.8f;
+    sampling.topK = 20;
+    std::cout << "----- sample -----\n" << prompt << tok.decode(generate(net, tok.encode(prompt), length, context, sampling))
+              << "\n------------------" << std::endl;
+}
+
+int runGpt(const std::string& path, std::size_t epochs) {
+    banner("Character-level GPT");
+    std::string text;
+    try {
+        text = loadText(path);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\ndownload a corpus with: scripts/download_shakespeare.sh\n";
+        return 2;
+    }
+    const CharTokenizer tok(text);
+    const std::vector<int> ids = tok.encode(text);
+    const std::size_t split = ids.size() * 9 / 10;
+    const GPTConfig cfg = textModelConfig(tok.vocabSize());
+    const Dataset train = makeNextTokenDataset(std::vector<int>(ids.begin(), ids.begin() + static_cast<long>(split)),
+                                               cfg.contextLength);
+    const Dataset val = makeNextTokenDataset(std::vector<int>(ids.begin() + static_cast<long>(split), ids.end()),
+                                             cfg.contextLength);
+    std::cout << path << ": " << ids.size() << " characters, vocabulary " << tok.vocabSize() << ", "
+              << train.x.rows() << " training / " << val.x.rows() << " validation sequences of "
+              << cfg.contextLength << "\n";
+
+    Network net;
+    buildGPT(net, cfg);
+    net.summary();
+    SparseSoftmaxCrossEntropy loss;
+    Adam optimizer(0.001f);
+    FitOptions opts;
+    opts.epochs = epochs;
+    opts.batchSize = 32;
+    opts.printEveryBatches = 50;
+    opts.validationX = &val.x;
+    opts.validationY = &val.y;
+    const std::string prompt(1, text[0]);
+    opts.onEpochEnd = [&](const EpochStats&) { printSample(net, tok, prompt, 300, cfg.contextLength); };
+    const auto start = std::chrono::steady_clock::now();
+    net.fit(train.x, train.y, loss, optimizer, opts);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+    const std::string weights = gptWeightsPath(path);
+    net.save(weights);
+    std::cout << "trained in " << std::fixed << std::setprecision(1) << seconds << " s ("
+              << seconds / static_cast<double>(epochs) << " s/epoch, incl. samples)\n" << std::defaultfloat
+              << "weights saved to " << weights << "\ngenerate more with: NeuraCraft generate " << path
+              << " \"PROMPT\" 500\n";
+    return 0;
+}
+
+int runGenerate(const std::string& path, const std::string& prompt, std::size_t length) {
+    std::string text;
+    try {
+        text = loadText(path);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << '\n';
+        return 2;
+    }
+    const CharTokenizer tok(text);  // same text -> same vocabulary as in training
+    const GPTConfig cfg = textModelConfig(tok.vocabSize());
+    Network net;
+    buildGPT(net, cfg);
+    try {
+        net.load(gptWeightsPath(path));
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\ntrain first with: NeuraCraft gpt " << path << '\n';
+        return 2;
+    }
+    std::vector<int> promptIds;
+    try {
+        promptIds = tok.encode(prompt.empty() ? std::string(1, text[0]) : prompt);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << '\n';
+        return 2;
+    }
+    SamplingOptions sampling;
+    sampling.temperature = 0.8f;
+    sampling.topK = 20;
+    std::cout << prompt << tok.decode(generate(net, promptIds, length, cfg.contextLength, sampling)) << '\n';
+    return 0;
+}
+
 // Times one backend on an n x n x n product; returns GFLOPS.
 double timeGemm(void (*fn)(bool, bool, std::size_t, std::size_t, std::size_t, const float*, std::size_t,
                            const float*, std::size_t, float*, std::size_t, bool),
@@ -359,6 +464,10 @@ void usage() {
               << "                               train on MNIST IDX files in <dir>, save weights\n"
               << "  NeuraCraft eval <dir> [mlp|cnn]\n"
               << "                               evaluate saved MNIST weights on the test set\n"
+              << "  NeuraCraft gpt <text-file> [epochs]\n"
+              << "                               train a character-level GPT on a text file\n"
+              << "  NeuraCraft generate <text-file> [prompt] [length]\n"
+              << "                               sample text from the trained GPT\n"
               << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
               << "options:\n"
               << "  --gpu          run large matrix products on the GPU (Metal)\n"
@@ -417,6 +526,22 @@ int main(int argc, char** argv) {
                 return 2;
             }
             return runEval(args[1], args.size() > 2 ? args[2] : "mlp");
+        }
+        if (cmd == "gpt") {
+            if (args.size() < 2) {
+                usage();
+                return 2;
+            }
+            const std::size_t epochs = args.size() > 2 ? static_cast<std::size_t>(std::strtoul(args[2].c_str(), nullptr, 10)) : 1;
+            return runGpt(args[1], epochs == 0 ? 1 : epochs);
+        }
+        if (cmd == "generate") {
+            if (args.size() < 2) {
+                usage();
+                return 2;
+            }
+            const std::size_t length = args.size() > 3 ? static_cast<std::size_t>(std::strtoul(args[3].c_str(), nullptr, 10)) : 500;
+            return runGenerate(args[1], args.size() > 2 ? args[2] : "", length == 0 ? 500 : length);
         }
         if (cmd == "-h" || cmd == "--help" || cmd == "help") {
             usage();

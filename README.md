@@ -1,9 +1,10 @@
 # NeuraCraft
 
-A small, dependency-free neural network library written from scratch in C++17.
-It covers everything needed to define, train, evaluate and save feed-forward
-networks: a matrix type, layers with hand-written backpropagation, losses,
-optimizers and data utilities — plus demos and a gradient-checked test suite.
+A small, dependency-free neural network library written from scratch in C++17:
+dense, convolutional and transformer layers with hand-written backpropagation,
+losses, optimizers, data and text utilities, a multi-threaded SIMD CPU backend,
+Apple Accelerate and Metal GPU support — plus demos (MNIST, a character-level
+GPT) and a gradient-checked test suite.
 
 ## Build and run
 
@@ -63,6 +64,56 @@ $ ./build_and_run.sh eval data/mnist cnn      # reload, per-digit accuracy, show
 |---|---:|---:|---:|---:|
 | MLP 784-128-64-10 | 109 k | 3 | 97.10 % | 2.3 s |
 | CNN 16-32 conv + 128 dense | 207 k | 3 | 98.83 % | 46 s |
+
+### Language model (character-level GPT)
+
+```
+$ scripts/download_shakespeare.sh                 # data/shakespeare.txt (1.1 MB)
+$ ./build_and_run.sh gpt data/shakespeare.txt 2   # train 2 epochs, samples after each
+$ ./build_and_run.sh generate data/shakespeare.txt "ROMEO:" 400
+```
+
+`gpt` trains a 4-layer, 4-head, 128-dim decoder (context 64, ~0.8 M
+parameters) on any text file, prints a sample after every epoch and saves
+`<file>.gpt.weights`; `generate` reloads it and samples with temperature 0.8,
+top-k 20.
+
+Reference run on Tiny Shakespeare (2-core x86 sandbox, ~4 min per epoch):
+validation loss 2.12 after epoch 1 and **1.91 after epoch 2**. The output
+already has the play's structure (speaker names, verse lines), with
+Shakespeare-flavoured but mostly invented words. More epochs, a longer context
+or a wider model improve it; on Apple silicon the Accelerate backend makes
+epochs much faster.
+
+```
+ROMEO:
+And the lay lords were give?
+
+FLORE:
+You my my fall muter, rethis drove your with mer;
+It the him fatery of me chould the might.
+```
+
+Building one yourself:
+
+```cpp
+CharTokenizer tok(text);
+Dataset d = makeNextTokenDataset(tok.encode(text), 64);  // x, y: (sequences x 64) ids
+
+GPTConfig cfg;
+cfg.vocabSize = tok.vocabSize();
+cfg.contextLength = 64;
+cfg.dim = 128; cfg.heads = 4; cfg.layers = 4;
+Network net;
+buildGPT(net, cfg);                  // (batch x seq) ids -> (batch*seq x vocab) logits
+
+SparseSoftmaxCrossEntropy loss;      // targets: next-token ids, any shape
+Adam opt(1e-3f);
+net.fit(d.x, d.y, loss, opt);
+
+SamplingOptions s; s.temperature = 0.8f; s.topK = 20;
+std::string out = tok.decode(generate(net, tok.encode("ROMEO:"), 200, cfg.contextLength, s));
+```
 
 ## Performance and devices
 
@@ -145,7 +196,9 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 |---|---|---|
 | Matrix | `Matrix.h` | Row-major float matrix: products (incl. `AᵀB`, `ABᵀ`), element-wise ops, broadcasting, reductions, row gather/slice |
 | Layers | `Dense.h`, `Activations.h`, `Conv.h` | `Dense` (Xavier / He / zero init), `Conv2D` (stride, padding; im2col + GEMM), `MaxPool2D`, `ReLU`, `LeakyReLU`, `Sigmoid`, `Tanh`, `Softmax`, `Dropout` |
-| Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits) |
+| Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
+| Transformer | `Transformer.h` | `TokenEmbedding` (token + learned positions), `LayerNorm`, `GELU`, multi-head `CausalSelfAttention`, `Residual` blocks, `buildGPT()` |
+| Text | `Text.h` | `CharTokenizer`, `makeNextTokenDataset`, `generate()` (temperature, top-k) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay) |
 | Network | `Network.h` | `add<Layer>(...)`, `fit` (mini-batches, shuffling, validation, accuracy, callbacks), `predict`, `evaluate`, `accuracy`, `summary`, `save` / `load` |
 | Data | `Data.h` | One-hot / argmax, train/test split, standardization, CSV load/save, MNIST IDX loader, XOR / spiral / sine generators |
@@ -154,7 +207,11 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 
 Conventions: a batch is a `(samples × features)` matrix, one sample per row.
 Images are flattened channel-major (C, H, W) into a row; `Conv2D` and
-`MaxPool2D` take the input `ImageShape` in their constructor.
+`MaxPool2D` take the input `ImageShape` in their constructor. Language models
+take `(batch × seqLen)` token ids, one sequence per row; `TokenEmbedding`
+expands them to `(batch·seqLen) × dim` rows, and attention layers read the
+sequence length from a `SequenceContext` shared with the embedding (`buildGPT`
+wires this up).
 Every layer's `backward()` takes `dL/d(output)`, stores parameter gradients and
 returns `dL/d(input)`. To add a layer, subclass `nc::Layer`.
 
@@ -173,7 +230,9 @@ match.
 numerical gradients (central differences), loss values, optimizer convergence,
 dropout statistics, XOR training, save/load, CSV and IDX loading, every GEMM
 backend against a double-precision reference (all transpose combinations,
-ragged sizes), CPU-vs-GPU training equivalence and the thread pool. CI runs
+ragged sizes), CPU-vs-GPU training equivalence, the thread pool, gradient
+checks for convolution, pooling, LayerNorm, GELU, attention and a whole GPT,
+attention causality, and a GPT that memorizes and regenerates a sequence. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
 kernels).
 
@@ -183,5 +242,5 @@ kernels).
 Includes/   public headers (NeuraCraft.h includes everything)
 src/        library sources + Main.cpp (demo CLI -> bin/NeuraCraft)
 tests/      unit tests
-scripts/    download_mnist.sh
+scripts/    download_mnist.sh, download_shakespeare.sh
 ```

@@ -87,6 +87,14 @@ History Network::fit(const Matrix& x, const Matrix& y, Loss& loss, Optimizer& op
             }
             backward(loss.gradient());
             optimizer.step(parameters());
+
+            const std::size_t batchIndex = start / options.batchSize + 1;
+            if (options.verbose && options.printEveryBatches > 0 && batchIndex % options.printEveryBatches == 0) {
+                const std::size_t batches = (order.size() + options.batchSize - 1) / options.batchSize;
+                std::cout << "  epoch " << epoch << " batch " << batchIndex << "/" << batches << "  loss "
+                          << std::fixed << std::setprecision(5) << lossSum / static_cast<double>(end)
+                          << std::defaultfloat << std::endl;
+            }
         }
 
         EpochStats stats;
@@ -106,7 +114,7 @@ History Network::fit(const Matrix& x, const Matrix& y, Loss& loss, Optimizer& op
             if (stats.accuracy >= 0) std::cout << "  acc " << std::setprecision(4) << stats.accuracy;
             if (stats.validationLoss >= 0) std::cout << "  val_loss " << std::setprecision(5) << stats.validationLoss;
             if (stats.validationAccuracy >= 0) std::cout << "  val_acc " << std::setprecision(4) << stats.validationAccuracy;
-            std::cout << std::defaultfloat << '\n';
+            std::cout << std::defaultfloat << std::endl;
         }
         if (options.onEpochEnd) options.onEpochEnd(stats);
     }

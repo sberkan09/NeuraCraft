@@ -586,6 +586,26 @@ edges as ControlNet input (right): the motion and outline follow the
 source, the light and colours follow the prompt (16 frames at 384 x 384,
 3 steps with ControlNet on every frame: 17 minutes on the 2-core machine).
 
+### Upscaling: Real-ESRGAN
+
+```
+$ scripts/download_upscaler.sh data/upscale              # realesr-general-x4v3 (~5 MB), converted to safetensors
+$ ./build_and_run.sh upscale data/upscale/realesr-general-x4v3.safetensors photo.png photo_x4.png
+$ ./build_and_run.sh video ... --upscale data/upscale/realesr-general-x4v3.safetensors    # every frame, x4
+```
+
+<p><img src="docs/images/upscale_compare.jpg" width="512"></p>
+
+`Upscaler` runs Real-ESRGAN's compact network (`SRVGGNetCompact`: 33 3x3
+convolutions with PReLU at the input size, a pixel shuffle, the
+nearest-upscaled input added back) and agrees with a NumPy reference to the
+last 8-bit step. Large pictures go in tiles that overlap by the receptive
+field, so the result is identical to an untiled run. Above: a 128-pixel crop
+of the LCM fisherman, bicubic (left) and Real-ESRGAN (right); the whole 512 x
+512 picture to 2048 x 2048 takes 46 s on the 2-core machine.
+`scripts/convert_pth.py` turns PyTorch `.pth` checkpoints into safetensors
+without PyTorch, unpickling only tensors and dicts.
+
 ### Output formats
 
 All written by the library itself: `.gif` (`saveGif`,
@@ -694,6 +714,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE with Llama 3 scaling, grouped-query attention, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
 | Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales; integer AVX-VNNI / AVX2 / NEON products, expanded-tile GEMM for many rows), `Network::quantize()` for Dense, Conv2D, attention and embeddings (shared with tied outputs), `setInt8Inputs` |
 | Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG (read / write) and PPM files, `resizeImage` / `fitImage`, `loadVae()`, `loadTinyVae()` (TAESD), `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` / `textToLatent()` / `decodeLatent()` / `imageToImage()`, `StableDiffusion` (models kept in memory; `inpaint()`), `morphAnimation()`, `zoomAnimation()`, `outpaintZoom()`, `textToVideo()` (AnimateDiff motion modules: `loadMotionModules()`, `forwardFrames()`, windows, prompt travel, image / video to video), ControlNet (`controlEmbedding()`, `control()`), `cannyEdges()`, `transformImage()`, `EulerScheduler::lcm` |
+| Upscaling | `Upscale.h` | `Upscaler`: Real-ESRGAN compact (x2 / x4), tiled without seams |
 | LoRA | `Lora.h` | `LoraMerger`: kohya / A1111 and PEFT LoRA files merged into the UNet and text encoder while they load |
 | Files | `Image.h` | PNG (own inflate and deflate), animated PNG, JPEG (baseline encoder), animated GIF (median-cut palette, LZW), QuickTime Motion-JPEG `.mov`, PPM |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |

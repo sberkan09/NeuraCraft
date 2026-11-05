@@ -43,6 +43,7 @@ add_library(neuracraft_lib STATIC
     src/Text.cpp
     src/Transformer.cpp
     src/UNet.cpp
+    src/Upscale.cpp
     src/UnicodeTables.cpp
 )
 set_target_properties(neuracraft_lib PROPERTIES OUTPUT_NAME neuracraft)

@@ -964,6 +964,7 @@ void usage() {
               << "        [--prompt-at FRAME:prompt ...]   (prompt travel)\n"
               << "  NeuraCraft video <dir> outpaint \"prompt\" ... [--keyframes 6] [--shrink 0.75] [--frames 12] [--zoom-in] [--start in.png]\n"
               << "  NeuraCraft inpaint <dir> in.png mask.png \"prompt\" [out.png] [--steps 25] [--strength 1] [--feather 4] [--guidance G]\n"
+              << "  NeuraCraft upscale model.safetensors in.png out.png      (Real-ESRGAN compact; video takes --upscale model)\n"
               << "  video output: .gif (256 colours), .png (animated PNG, full colour) or .mov (QuickTime Motion-JPEG)\n"
               << "        [--strength S] [--steps N] [--start in.png] [--seed S] [--size N] [--frames-dir DIR] [--full-vae]\n"
               << "        [--sharpen A] [--noise N] [--no-color-match]\n"
@@ -1190,6 +1191,7 @@ int main(int argc, char** argv) {
             std::string output = morph ? "morph.gif" : t2v ? "t2v.gif" : outpaint ? "outpaint.gif" : "zoom.gif", framesDir, start;
             float fps = morph ? 10.0f : 8.0f;
             bool fullVae = false, framesSet = false, strengthSet = false, cannyVideo = false;
+            std::string upscaleModel;
             std::size_t frames = 0;
             auto split = [](const std::string& s) {
                 std::vector<std::string> parts;
@@ -1245,6 +1247,7 @@ int main(int argc, char** argv) {
                     for (const std::string& f : files) vo.controlImages.push_back(loadImage(f));
                 } else if (a == "--control-scale") vo.controlScale = std::stof(value());
                 else if (a == "--canny") cannyVideo = true;
+                else if (a == "--upscale") upscaleModel = value();
                 else if (a == "--context") vo.context = std::stoul(value());
                 else if (a == "--lora") o.loras.push_back(parseLora(value()));
                 else if (a == "--sampler") o.sampler = vo.sampler = value();
@@ -1334,6 +1337,13 @@ int main(int argc, char** argv) {
                 std::cerr << e.what() << "\ndownload SD-Turbo with: scripts/download_sd_turbo.sh " << args[1] << '\n';
                 return 2;
             }
+            if (!upscaleModel.empty()) {  // super-resolution of every frame before writing
+                const auto tu = std::chrono::steady_clock::now();
+                const Upscaler up(upscaleModel);
+                for (Image& f : video) f = up.upscale(f);
+                std::cerr << "  upscale x" << up.scale() << ": " << std::fixed << std::setprecision(1)
+                          << std::chrono::duration<double>(std::chrono::steady_clock::now() - tu).count() << " s" << std::defaultfloat << '\n';
+            }
             auto endsWith = [&](const char* ext) {
                 const std::size_t n = std::strlen(ext);
                 return output.size() >= n && output.compare(output.size() - n, n, ext) == 0;
@@ -1354,6 +1364,25 @@ int main(int argc, char** argv) {
             std::cout << "wrote " << output << " (" << video.size() << " frames, " << o.width << "x" << o.height << ", " << fps
                       << " fps) in " << std::fixed << std::setprecision(1)
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() << " s" << std::defaultfloat << '\n';
+            return 0;
+        }
+        if (cmd == "upscale") {
+            if (args.size() < 4) {
+                usage();
+                return 2;
+            }
+            try {
+                const Upscaler up(args[1]);
+                const auto start = std::chrono::steady_clock::now();
+                const Image out = up.upscale(loadImage(args[2]));
+                if (args[3].size() > 4 && args[3].compare(args[3].size() - 4, 4, ".jpg") == 0) saveJpeg(args[3], out, 92);
+                else savePng(args[3], out);
+                std::cout << "wrote " << args[3] << " (" << out.width << "x" << out.height << ") in " << std::fixed << std::setprecision(1)
+                          << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() << " s" << std::defaultfloat << '\n';
+            } catch (const std::exception& e) {
+                std::cerr << e.what() << "\ndownload Real-ESRGAN's compact model with: scripts/download_upscaler.sh\n";
+                return 2;
+            }
             return 0;
         }
         if (cmd == "inpaint") {

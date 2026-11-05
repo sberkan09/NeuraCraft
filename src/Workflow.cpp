@@ -230,6 +230,9 @@ void save(const Step& s, const Clip& c) {
         const std::size_t n = std::strlen(e);
         return path.size() >= n && path.compare(path.size() - n, n, e) == 0;
     };
+    // Missing folders are created (outputs/<run>/image.png).
+    const std::filesystem::path parent = std::filesystem::path(path).parent_path();
+    if (!parent.empty()) std::filesystem::create_directories(parent);
     if (path.back() == '/') {
         std::filesystem::create_directories(path);
         for (std::size_t i = 0; i < c.size(); ++i) {

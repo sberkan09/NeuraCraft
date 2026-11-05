@@ -6,3 +6,7 @@ data/
 .DS_Store
 __pycache__/
 *.pyc
+ui/node_modules/
+ui/dist/
+uploads/
+outputs/

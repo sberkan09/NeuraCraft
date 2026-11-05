@@ -736,6 +736,28 @@ Studio UI builds its forms from), and `NeuraCraft models` lists the models it
 recognises under `data/` (Stable Diffusion, ControlNet, motion modules, LoRA,
 TAESD, IP-Adapter, CLIP vision, Depth Anything, Real-ESRGAN, RIFE).
 
+### NeuraCraft Studio
+
+A web UI for the workflows, in `ui/` (React + TypeScript). Build it once and
+start it; it opens in the browser and talks to the engine on 127.0.0.1:
+
+```
+$ cd ui && npm install && npm run build && cd ..
+$ ./bin/NeuraCraft studio
+```
+
+- **Simple mode**: task cards (image, video, 3D photo, hires portrait,
+  inpaint with a mask painter, upscale, smoothing) with short forms; an
+  "Advanced" section shows every field of every step. Results show a live
+  preview and progress while running, then thumbnails and a frame player;
+  outputs are saved under `outputs/<date>-<task>/`.
+- **Graph mode**: any workflow, step by step, with an operation palette and an
+  inspector for each step's fields, both built from the engine's schema; a JSON
+  view; live checking; run and stop. "Grafikte aç" carries a task's workflow
+  over.
+- `npm run dev` serves the UI with hot reload on :5173 and forwards `/api` to a
+  running `NeuraCraft serve`.
+
 `NeuraCraft serve` starts the engine behind NeuraCraft Studio: a small local
 HTTP server (its own, no dependencies) that queues workflows, runs them one at
 a time and streams their progress as server-sent events — job state, step

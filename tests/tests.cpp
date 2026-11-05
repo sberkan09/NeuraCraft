@@ -4018,6 +4018,27 @@ TEST(studio_server_api) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     CHECK(job.at("state").string == "failed" && !job.at("error").string.empty());
+    // Uploads: base64 PNG saved under <base>/uploads, usable by a workflow; anything else is refused.
+    {
+        std::ifstream f(work + "/a.png", std::ios::binary);
+        const std::string png((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const char* abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string b64;
+        for (std::size_t i = 0; i < png.size(); i += 3) {
+            const unsigned n = (static_cast<unsigned char>(png[i]) << 16) | (i + 1 < png.size() ? static_cast<unsigned char>(png[i + 1]) << 8 : 0) |
+                               (i + 2 < png.size() ? static_cast<unsigned char>(png[i + 2]) : 0);
+            b64 += abc[(n >> 18) & 63];
+            b64 += abc[(n >> 12) & 63];
+            b64 += i + 1 < png.size() ? abc[(n >> 6) & 63] : '=';
+            b64 += i + 2 < png.size() ? abc[n & 63] : '=';
+        }
+        const HttpReply up = http(port, "POST", "/api/upload", R"({"name": "my photo.png", "data": ")" + b64 + R"("})");
+        CHECK(up.status == 200);
+        const std::string path = json::parse(up.body).at("path").string;
+        CHECK(path.rfind("uploads/", 0) == 0 && path.find(' ') == std::string::npos);
+        CHECK(loadImage(work + "/" + path).pixels == a.pixels);
+        CHECK(http(port, "POST", "/api/upload", R"({"data": "aGVsbG8="})").status == 400);  // "hello", not a PNG
+    }
     server.stop();
     CHECK(http(port, "GET", "/api/info").status == 0);  // closed
 }

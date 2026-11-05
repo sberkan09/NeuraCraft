@@ -957,6 +957,7 @@ void usage() {
               << "  NeuraCraft img2img <dir> in.png \"prompt\" [out.png] [--strength S] [--steps N] [--seed S] [--size N] ...\n"
               << "        image commands also take [--lora file.safetensors[:scale]] ... [--sampler euler|lcm]\n"
               << "        and [--controlnet DIR --control image.png [--canny] [--control-scale S]] (t2v: --control-dir frames/)\n"
+              << "        and [--ip-adapter ip-adapter_sd15.safetensors --image-prompt pic.png [--ip-scale 0.6]]\n"
               << "  NeuraCraft video <dir> morph \"prompt\" \"prompt\" ... [-o out.gif] [--seeds A,B,..] [--frames N] [--fps F] [--no-loop]\n"
               << "  NeuraCraft video <dir> zoom \"prompt\" ... [-o out.gif] [--frames N] [--zoom Z] [--pan DX,DY] [--rotate DEG]\n"
               << "  NeuraCraft video <dir> t2v \"prompt\" [-o out.gif] [--frames 16] [--steps 4] [--seed S] [--motion file] [--guidance G]\n"
@@ -1155,6 +1156,10 @@ int main(int argc, char** argv) {
                 else if (a == "--control-scale") o.controlScale = std::stof(value());
                 else if (a == "--canny") canny = true;
                 else if (a == "--depth-model") depthModel = value();
+                else if (a == "--ip-adapter") o.ipAdapter = value();
+                else if (a == "--image-prompt") o.imagePrompt = loadImage(value());
+                else if (a == "--ip-scale") o.ipScale = std::stof(value());
+                else if (a == "--image-encoder") o.imageEncoder = value();
                 else if (a.rfind("--", 0) != 0) output = a;
                 else {
                     std::cerr << "unknown txt2img option: " << a << "\n";
@@ -1255,6 +1260,10 @@ int main(int argc, char** argv) {
                 } else if (a == "--control-scale") vo.controlScale = std::stof(value());
                 else if (a == "--canny") cannyVideo = true;
                 else if (a == "--depth-model") depthModelVideo = value();
+                else if (a == "--ip-adapter") vo.ipAdapter = value();
+                else if (a == "--image-prompt") vo.imagePrompt = loadImage(value());
+                else if (a == "--ip-scale") vo.ipScale = std::stof(value());
+                else if (a == "--image-encoder") vo.imageEncoder = value();
                 else if (a == "--upscale") upscaleModel = value();
                 else if (a == "--interpolate") interpolateModel = value();
                 else if (a == "--interp-passes") interpPasses = std::stoul(value());

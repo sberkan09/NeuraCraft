@@ -3619,6 +3619,103 @@ TEST(depth_anything_and_parallax) {
     std::filesystem::remove_all(dir);
 }
 
+TEST(ip_adapter_image_prompts) {
+    std::mt19937 rng(21);
+    auto rnd = [&](const std::string& name, std::size_t) {
+        if (name.find("norm") != std::string::npos && name.find(".weight") != std::string::npos) return 1.0f;
+        if (name.find("layer_norm") != std::string::npos && name.find(".weight") != std::string::npos) return 1.0f;
+        if (name.find("layrnorm") != std::string::npos && name.find(".weight") != std::string::npos) return 1.0f;
+        return (static_cast<float>(rng() % 2001) / 1000.0f - 1.0f) * 0.4f;
+    };
+    // A tiny CLIP vision encoder: 28 x 28 input, 14-pixel patches, hidden 8, 2 layers, projection 5.
+    const std::string enc = tempPath("clip_vision");
+    std::filesystem::create_directories(enc);
+    std::ofstream(enc + "/config.json") << R"({"hidden_size":8,"num_attention_heads":2,"num_hidden_layers":2,"patch_size":14,)"
+                                       << R"("image_size":28,"projection_dim":5,"hidden_act":"gelu","layer_norm_eps":1e-5})";
+    std::vector<std::pair<std::string, std::vector<std::size_t>>> v;
+    const std::string p = "vision_model.";
+    v.push_back({p + "embeddings.class_embedding", {8}});
+    v.push_back({p + "embeddings.patch_embedding.weight", {8, 3, 14, 14}});
+    v.push_back({p + "embeddings.position_embedding.weight", {5, 8}});
+    for (const char* n : {"pre_layrnorm", "post_layernorm"}) {
+        v.push_back({p + n + ".weight", {8}});
+        v.push_back({p + n + ".bias", {8}});
+    }
+    for (int i = 0; i < 2; ++i) {
+        const std::string l = p + "encoder.layers." + std::to_string(i) + ".";
+        for (const char* n : {"layer_norm1", "layer_norm2"}) {
+            v.push_back({l + n + ".weight", {8}});
+            v.push_back({l + n + ".bias", {8}});
+        }
+        for (const char* n : {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"}) {
+            v.push_back({l + n + ".weight", {8, 8}});
+            v.push_back({l + n + ".bias", {8}});
+        }
+        v.push_back({l + "mlp.fc1.weight", {32, 8}});
+        v.push_back({l + "mlp.fc1.bias", {32}});
+        v.push_back({l + "mlp.fc2.weight", {8, 32}});
+        v.push_back({l + "mlp.fc2.bias", {8}});
+    }
+    v.push_back({"visual_projection.weight", {5, 8}});
+    saveShaped(enc + "/model.safetensors", v, rnd);
+    ClipImageEncoder clip(enc);
+    Image pic;
+    pic.width = 40;
+    pic.height = 30;
+    for (std::size_t i = 0; i < 40 * 30 * 3; ++i) pic.pixels.push_back(static_cast<std::uint8_t>(i * 23 % 256));
+    const Matrix e = clip.embed(pic);
+    CHECK(e.rows() == 1 && e.cols() == 5 && clip.imageSize() == 28);
+    CHECK_THROWS(clip.forward(std::vector<float>(10)), std::invalid_argument);
+
+    // The adapter for the tiny UNet (cross-attention channels 8, 8, 8, 16; context 6): 2 tokens.
+    std::string tok;
+    const std::string dir = writeTinyStableDiffusion("sd_ip", tok);
+    const std::string adapter = dir + "/ip.safetensors";
+    std::vector<std::pair<std::string, std::vector<std::size_t>>> a{{"image_proj.proj.weight", {12, 5}},
+                                                                   {"image_proj.proj.bias", {12}},
+                                                                   {"image_proj.norm.weight", {6}},
+                                                                   {"image_proj.norm.bias", {6}}};
+    const std::size_t ch[4] = {8, 8, 8, 16};
+    for (int i = 0; i < 4; ++i)
+        for (const char* n : {".to_k_ip.weight", ".to_v_ip.weight"}) a.push_back({"ip_adapter." + std::to_string(2 * i + 1) + n, {ch[i], 6}});
+    saveShaped(adapter, a, rnd);
+    const IpAdapter ip(adapter);
+    const Matrix tokens = ip.tokens(e);
+    CHECK(tokens.rows() == 2 && tokens.cols() == 6);
+    double mean = 0;
+    for (std::size_t c = 0; c < 6; ++c) mean += tokens(0, c);
+    CHECK(std::abs(mean / 6) < 0.5);  // layer-normed (weight 1, small bias)
+
+    UNet2DCondition unet = loadUNet(dir, 8, 8);
+    const Matrix latent = Matrix::normal(1, 4 * 8 * 8, 0.0f, 1.0f), ctx = Matrix::uniform(8, 6, -1.0f, 1.0f);
+    const Matrix plain = unet.forward(latent, 100.0f, ctx);
+    CHECK_THROWS(unet.setImagePrompt(tokens), std::logic_error);
+    loadIpAdapter(unet, adapter);
+    CHECK(unet.hasImagePrompt());
+    CHECK(unet.forward(latent, 100.0f, ctx).values() == plain.values());  // no tokens set yet
+    unet.setImagePrompt(tokens, 0.0f);
+    CHECK(unet.forward(latent, 100.0f, ctx).values() == plain.values());
+    unet.setImagePrompt(tokens, 1.0f);
+    CHECK(unet.forward(latent, 100.0f, ctx).values() != plain.values());
+    unet.setImagePrompt(Matrix(), 1.0f);
+    CHECK(unet.forward(latent, 100.0f, ctx).values() == plain.values());
+    CHECK_THROWS(unet.setImagePrompt(Matrix(2, 5)), std::invalid_argument);
+
+    // Pipeline: scale 0 equals no image prompt.
+    TextToImageOptions o;
+    o.width = o.height = 64;
+    o.steps = 2;
+    const Image base = textToImage(dir, "hello", o);
+    o.ipAdapter = adapter;
+    o.imageEncoder = enc;
+    o.imagePrompt = pic;
+    o.ipScale = 0.0f;
+    CHECK(textToImage(dir, "hello", o).pixels == base.pixels);
+    o.ipScale = 1.0f;
+    CHECK(textToImage(dir, "hello", o).pixels != base.pixels);
+    for (const std::string& d : {dir, tok, enc}) std::filesystem::remove_all(d);
+}
+
 // ---- Training robustness ------------------------------------------------------------------
 
 TEST(cosine_schedule_and_gradient_clipping) {

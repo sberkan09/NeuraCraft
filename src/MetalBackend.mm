@@ -445,9 +445,9 @@ kernel void attention_simd(device const float* Q [[buffer(0)]],
             const uint qr = row0 + e / 8;
             Ds[e] = qr < p.N ? Q[ulong(qr) * p.C + base + d * 8 + e % 8] : 0.0f;
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_load(q[d], Ds, 8);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         o[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
     float m = -1e30f, l = 0.0f;  // this lane's row; finite: Metal compiles with fast math
@@ -473,7 +473,7 @@ kernel void attention_simd(device const float* Q [[buffer(0)]],
             }
             simdgroup_store(acc, Ss + h * 8, BC);
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Online softmax of this lane's four scores.
         float s[4];
@@ -498,7 +498,7 @@ kernel void attention_simd(device const float* Q [[buffer(0)]],
         m = mNew;
         // diag(corr) in the 8 x 8 scratch: entries 2 lane, 2 lane + 1 lie in this lane's row.
         for (uint t = 0; t < 2; ++t) Ds[2 * lane + t] = (2 * lane + t) % 8 == r ? corr : 0.0f;
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         simdgroup_float8x8 dcorr, p0, p1;
         simdgroup_load(dcorr, Ds, 8);
@@ -512,25 +512,25 @@ kernel void attention_simd(device const float* Q [[buffer(0)]],
             simdgroup_multiply_accumulate(scaled, p0, v0, scaled);
             simdgroup_multiply_accumulate(o[d], p1, v1, scaled);
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // O / l, out through the 8 x 8 scratch for rows < N.
     for (uint t = 0; t < 2; ++t) Ds[2 * lane + t] = (2 * lane + t) % 8 == r ? 1.0f / l : 0.0f;
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     simdgroup_float8x8 dinv;
     simdgroup_load(dinv, Ds, 8);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint d = 0; d < DB; ++d) {
         simdgroup_float8x8 res;
         simdgroup_multiply(res, dinv, o[d]);
         simdgroup_store(res, Ss, 8);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint e = lane; e < 64; e += 32) {
             const uint orow = row0 + e / 8;
             if (orow < p.N) O[ulong(orow) * p.C + base + d * 8 + e % 8] = Ss[e];
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 )METAL";

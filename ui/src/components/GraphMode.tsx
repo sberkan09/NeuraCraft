@@ -1,0 +1,225 @@
+import { useEffect, useMemo, useState } from "react";
+import type { Step, Workflow, WorkflowOp } from "../api";
+import { api } from "../api";
+import type { Engine } from "../engine";
+import { pickModel } from "../templates";
+import { FieldInput, fieldLabel } from "./FieldInput";
+import { overallFraction } from "./Results";
+
+const groupNames: Record<string, string> = { image: "Resim", video: "Video", analysis: "Analiz", enhance: "İyileştirme", edit: "Düzenle", input: "Giriş / çıkış" };
+const groupOrder = ["image", "video", "analysis", "enhance", "edit", "input"];
+
+// Inputs a step reads (clip fields), for the connection summary.
+function inputsOf(step: Step, op?: WorkflowOp): string[] {
+  if (!op) return [];
+  const out: string[] = [];
+  for (const f of op.fields) {
+    const v = step[f.name];
+    if (f.type === "clip" && typeof v === "string") out.push(`${fieldLabel(f.name)}: ${v}`);
+    if (f.type === "clips" && Array.isArray(v)) out.push(`${fieldLabel(f.name)}: ${v.join(", ")}`);
+  }
+  return out;
+}
+
+// The editor for any workflow: every operation and field from the engine's schema. Steps run top to
+// bottom; any step can read any clip made above it (a graph run in order).
+export function GraphMode(props: { engine: Engine; workflow: Workflow; title: string; onChange(wf: Workflow): void }) {
+  const { engine, workflow } = props;
+  const ops = useMemo(() => new Map((engine.schema?.ops ?? []).map((o) => [o.name, o] as [string, WorkflowOp])), [engine.schema]);
+  const [selected, setSelected] = useState(0);
+  const [view, setView] = useState<"steps" | "json">("steps");
+  const [jsonText, setJsonText] = useState(JSON.stringify(workflow, null, 2));
+  const [jsonError, setJsonError] = useState<string>();
+  const [problems, setProblems] = useState<string[]>([]);
+  const [jobId, setJobId] = useState<number>();
+  const [busy, setBusy] = useState(false);
+  const steps = workflow.steps;
+
+  useEffect(() => {
+    if (view !== "json") setJsonText(JSON.stringify(workflow, null, 2));
+  }, [workflow, view]);
+
+  // Live check against the schema.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      if (!steps.length) return setProblems([]);
+      api.check(workflow).then((r) => setProblems(r.problems)).catch(() => undefined);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [workflow, steps.length]);
+
+  const setSteps = (next: Step[]) => props.onChange({ ...workflow, steps: next });
+  const update = (i: number, field: string, value: unknown) =>
+    setSteps(steps.map((s, j) => {
+      if (j !== i) return s;
+      const n: Step = { ...s };
+      if (value === undefined) delete n[field];
+      else n[field] = value;
+      return n;
+    }));
+
+  function add(opName: string) {
+    const op = ops.get(opName);
+    if (!op) return;
+    const s: Step = { op: opName };
+    const used = new Set(steps.map((x) => String(x.out ?? x.op)));
+    if (op.output) {
+      let name = opName, k = 2;
+      while (used.has(name)) name = `${opName}${k++}`;
+      s.out = name;
+    }
+    const lastClip = [...steps].reverse().find((x) => ops.get(x.op)?.output);
+    for (const f of op.fields) {
+      if (f.type === "model" && f.required) s[f.name] = pickModel(engine.models, f.model ?? "", f.model === "sd" ? ["turbo", "animatediff"] : []);
+      if (f.name === "in" && f.type === "clip" && lastClip) s.in = String(lastClip.out ?? lastClip.op);
+      if (f.name === "prompt" && f.required) s.prompt = "";
+    }
+    if (opName === "save") s.path = `outputs/${String(s.in ?? "out")}.png`;
+    const at = Math.min(selected + 1, steps.length);
+    setSteps([...steps.slice(0, at), s, ...steps.slice(at)]);
+    setSelected(at);
+  }
+  const move = (i: number, d: number) => {
+    const j = i + d;
+    if (j < 0 || j >= steps.length) return;
+    const next = [...steps];
+    [next[i], next[j]] = [next[j], next[i]];
+    setSteps(next);
+    setSelected(j);
+  };
+  const remove = (i: number) => {
+    setSteps(steps.filter((_, j) => j !== i));
+    setSelected(Math.max(0, Math.min(i, steps.length - 2)));
+  };
+
+  async function run() {
+    setBusy(true);
+    try {
+      const r = await api.check(workflow);
+      setProblems(r.problems);
+      if (!r.problems.length) setJobId(await engine.run(workflow, props.title));
+    } catch (e) {
+      const err = e as Error & { problems?: string[] };
+      setProblems(err.problems ?? [err.message]);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const job = engine.jobs.find((j) => j.id === jobId);
+  const sel = steps[selected];
+  const selOp = sel ? ops.get(sel.op) : undefined;
+  const clipsBefore = (i: number) => steps.slice(0, i).filter((s) => ops.get(s.op)?.output).map((s) => String(s.out ?? s.op));
+  const groups = groupOrder.map((g) => ({ g, list: [...ops.values()].filter((o) => o.group === g) }));
+  const stepState = (i: number) => {
+    if (!job) return "";
+    if (job.outputs.some((o) => o.step === i + 1)) return "done";
+    if (job.state === "running" && job.step === i + 1) return "running";
+    return "";
+  };
+
+  return (
+    <div className="graph">
+      <nav className="palette" aria-label="İşlemler">
+        <h2 className="section-title">İşlem ekle</h2>
+        {groups.map(({ g, list }) =>
+          list.length ? (
+            <div key={g}>
+              <div className="help" style={{ marginBottom: 6 }}>{groupNames[g] ?? g}</div>
+              <div className="ops">
+                {list.map((o) => <button key={o.name} type="button" title={o.doc} onClick={() => add(o.name)}>{o.name}</button>)}
+              </div>
+            </div>
+          ) : null,
+        )}
+        <p className="help">Liste motorun işlem şemasından gelir; yeni işlemler burada kendiliğinden görünür.</p>
+      </nav>
+
+      <section className="canvas-area" aria-label="Akış">
+        <div className="runstrip" style={{ borderTop: 0, borderBottom: "1px solid var(--line)" }}>
+          <strong>{props.title}</strong>
+          <div className="segmented" role="group" aria-label="Görünüm">
+            <button type="button" aria-pressed={view === "steps"} onClick={() => setView("steps")}>Adımlar</button>
+            <button type="button" aria-pressed={view === "json"} onClick={() => setView("json")}>JSON</button>
+          </div>
+          <span className="spacer" />
+          <span className="note">{steps.length} adım</span>
+        </div>
+        {view === "json" ? (
+          <>
+            <textarea className="json-editor" aria-label="Workflow JSON" spellCheck={false} value={jsonText}
+              onChange={(e) => {
+                setJsonText(e.target.value);
+                try {
+                  const wf = JSON.parse(e.target.value) as Workflow;
+                  if (!Array.isArray(wf.steps)) throw new Error("\"steps\" listesi yok");
+                  setJsonError(undefined);
+                  props.onChange(wf);
+                } catch (err) {
+                  setJsonError((err as Error).message);
+                }
+              }} />
+            {jsonError ? <div className="error-text" style={{ padding: "8px 16px" }}>{jsonError}</div> : null}
+          </>
+        ) : (
+          <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 10, overflowY: "auto" }}>
+            {steps.length === 0 ? <div className="empty">Soldan bir işlem ekleyerek başla.</div> : null}
+            {steps.map((s, i) => {
+              const op = ops.get(s.op);
+              const st = stepState(i);
+              return (
+                <div key={i} role="button" tabIndex={0} className="task" aria-pressed={i === selected}
+                  onClick={() => setSelected(i)} onKeyDown={(e) => e.key === "Enter" && setSelected(i)}
+                  style={{ cursor: "pointer", borderColor: st === "running" ? "var(--run)" : undefined }}>
+                  <div className="row">
+                    <span className="t">{i + 1}. {op?.title ?? s.op} <span className="help">· {s.op}{s.out ? ` → ${s.out}` : ""}</span></span>
+                    <span className="toolbar">
+                      {st === "done" ? <span className="state done">bitti</span> : st === "running" ? <span className="state running">{job?.stage}</span> : null}
+                      <button type="button" className="btn small ghost" aria-label="Yukarı taşı" onClick={(e) => { e.stopPropagation(); move(i, -1); }}>↑</button>
+                      <button type="button" className="btn small ghost" aria-label="Aşağı taşı" onClick={(e) => { e.stopPropagation(); move(i, 1); }}>↓</button>
+                      <button type="button" className="btn small ghost danger" aria-label="Sil" onClick={(e) => { e.stopPropagation(); remove(i); }}>×</button>
+                    </span>
+                  </div>
+                  <span className="s">{inputsOf(s, op).join(" · ") || (op?.doc ?? "")}</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <div className="runstrip" style={{ marginTop: "auto" }}>
+          {problems.length ? (
+            <ul className="problems" style={{ flex: "1 1 100%" }}>{problems.slice(0, 6).map((p) => <li key={p}>{p}</li>)}</ul>
+          ) : null}
+          {job ? (
+            <div style={{ flex: "1 1 260px", display: "flex", flexDirection: "column", gap: 6 }}>
+              <span className="note">İş {job.id} · {job.state} · {job.op} {job.stage}</span>
+              <div className="bar"><div style={{ width: `${Math.round(overallFraction(job) * 100)}%` }} /></div>
+            </div>
+          ) : <span className="spacer" />}
+          {job && (job.state === "running" || job.state === "queued") ? (
+            <button type="button" className="btn danger" onClick={() => void engine.cancel(job.id)}>Durdur</button>
+          ) : null}
+          <button type="button" className="btn primary" disabled={busy || !steps.length || problems.length > 0 || !engine.connected} onClick={() => void run()}>▶ Çalıştır</button>
+        </div>
+      </section>
+
+      <aside className="inspector" aria-label="Seçili adım">
+        {sel && selOp ? (
+          <>
+            <div>
+              <span className="help">Seçili adım {selected + 1} · {sel.op}</span>
+              <h2 style={{ margin: "2px 0 0", fontSize: 20 }}>{selOp.title}</h2>
+              <p className="note" style={{ margin: "4px 0 0" }}>{selOp.doc}</p>
+            </div>
+            {selOp.fields.map((f) => (
+              <FieldInput key={f.name} id={`insp-${f.name}`} field={f} value={sel[f.name]} models={engine.models} clips={clipsBefore(selected)}
+                onChange={(x) => update(selected, f.name, x)} />
+            ))}
+          </>
+        ) : (
+          <p className="note">Bir adım seç; ayarları burada görünür.</p>
+        )}
+      </aside>
+    </div>
+  );
+}

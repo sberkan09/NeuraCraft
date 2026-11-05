@@ -1078,6 +1078,7 @@ void usage() {
               << "  NeuraCraft depth <depth-anything dir> in.png depth.png [--size 518]   (control images: --depth-model dir)\n"
               << "  NeuraCraft parallax <depth-anything dir> in.png out.gif [--frames 48] [--amplitude 0.03] [--zoom 0.06] [--fps 24]\n"
               << "  NeuraCraft workflow steps.json [--check]               (image / video steps in JSON, see Workflow.h)\n"
+              << "  NeuraCraft studio [--port 8188] [--no-open]            (NeuraCraft Studio: engine + web UI in the browser)\n"
               << "  NeuraCraft serve [--port 8188] [--host IP] [--data DIR] [--ui DIR]   (Studio engine: HTTP API, see Server.h)\n"
               << "  NeuraCraft ops                                         (the workflow operations and fields, JSON)\n"
               << "  NeuraCraft models [folder] [--json]                    (models found under data/ or folder)\n"
@@ -1151,7 +1152,7 @@ int main(int argc, char** argv) {
     }
     const std::string cmd = args.empty() ? "all" : args[0];
     // Commands whose output is data (JSON for tools such as the Studio UI) print nothing else.
-    const bool quiet = cmd == "ops" || cmd == "models" || cmd == "serve";
+    const bool quiet = cmd == "ops" || cmd == "models" || cmd == "serve" || cmd == "studio";
     if (!quiet)
         std::cout << "device: " << deviceDescription() << (gpuAttentionEnabled() && currentDevice() != Device::GPU ? " + GPU attention" : "")
                   << '\n';
@@ -1538,8 +1539,16 @@ int main(int argc, char** argv) {
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() << " s" << std::defaultfloat << '\n';
             return 0;
         }
-        if (cmd == "serve") {  // [--port N] [--host IP] [--data DIR] [--ui DIR]: the Studio engine
+        if (cmd == "serve" || cmd == "studio") {  // [--port N] [--host IP] [--data DIR] [--ui DIR] [--no-open]
+            // studio = serve + the built web UI (ui/dist) + open it in the browser.
             ServerOptions so;
+            bool open = cmd == "studio";
+            if (cmd == "studio")
+                for (const char* dir : {"ui/dist", "../ui/dist", "share/neuracraft/ui"})
+                    if (std::filesystem::exists(std::string(dir) + "/index.html")) {
+                        so.uiDir = dir;
+                        break;
+                    }
             for (std::size_t i = 1; i < args.size(); ++i) {
                 const std::string& a = args[i];
                 auto value = [&]() -> std::string {
@@ -1550,12 +1559,25 @@ int main(int argc, char** argv) {
                 else if (a == "--host") so.host = value();
                 else if (a == "--data") so.dataDir = value();
                 else if (a == "--ui") so.uiDir = value();
-                else throw std::invalid_argument("serve: unknown option " + a);
+                else if (a == "--no-open") open = false;
+                else throw std::invalid_argument(cmd + ": unknown option " + a);
             }
+            if (cmd == "studio" && so.uiDir.empty())
+                throw std::runtime_error("studio: no built UI found (ui/dist). Build it once with: cd ui && npm install && npm run build");
             if (so.host != "127.0.0.1" && so.host != "localhost")
                 std::cerr << "warning: listening on " << so.host << ": anyone who can reach this machine can run workflows\n";
             StudioServer server(so, [](const std::string& line) { std::cerr << line << '\n'; });
             server.start();
+            if (open) {
+                const std::string url = "http://127.0.0.1:" + std::to_string(server.port()) + "/";
+                std::cerr << "opening " << url << '\n';
+#if defined(__APPLE__)
+                const std::string command = "open '" + url + "' >/dev/null 2>&1 &";
+#else
+                const std::string command = "xdg-open '" + url + "' >/dev/null 2>&1 &";
+#endif
+                if (std::system(command.c_str()) != 0) std::cerr << "open " << url << " in a browser\n";
+            }
             std::signal(SIGINT, [](int) { gServeStop = 1; });
             std::signal(SIGTERM, [](int) { gServeStop = 1; });
             while (!gServeStop) std::this_thread::sleep_for(std::chrono::milliseconds(200));

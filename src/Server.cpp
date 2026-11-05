@@ -217,6 +217,35 @@ std::string urlDecode(const std::string& s) {
     return out;
 }
 
+std::string base64Decode(const std::string& in) {
+    static int table[256];
+    static bool ready = false;
+    if (!ready) {
+        for (int& t : table) t = -1;
+        const char* a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; ++i) table[static_cast<unsigned char>(a[i])] = i;
+        table[static_cast<unsigned char>('-')] = 62;  // URL-safe alphabet too
+        table[static_cast<unsigned char>('_')] = 63;
+        ready = true;
+    }
+    std::string out;
+    out.reserve(in.size() * 3 / 4);
+    unsigned acc = 0;
+    int bits = 0;
+    for (unsigned char c : in) {
+        if (c == '=') break;
+        const int v = table[c];
+        if (v < 0) continue;  // whitespace, line breaks
+        acc = (acc << 6) | static_cast<unsigned>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += static_cast<char>((acc >> bits) & 0xFF);
+        }
+    }
+    return out;
+}
+
 struct OutputInfo {
     std::size_t step = 0;
     std::string op, clip;
@@ -281,6 +310,7 @@ struct StudioServer::Impl {
     std::map<int, std::shared_ptr<Job>> jobs;
     std::deque<int> queue;
     int nextId = 1;
+    int nextUpload = 1;
     std::list<int> clients;  // event-stream sockets
     std::mutex sendMutex;    // serializes writes to clients
 
@@ -468,6 +498,32 @@ struct StudioServer::Impl {
                 std::vector<json::Value> problems;
                 for (const std::string& s : checkWorkflow(req.body)) problems.push_back(makeString(s));
                 return jsonResponse(makeObject({{"problems", makeArray(problems)}}));
+            }
+            if (p.size() == 2 && p[1] == "upload" && post) {
+                // {"name": "photo.png", "data": "<base64 PNG>"} -> saved under <base>/uploads, path for workflows.
+                const json::Value body = json::parse(req.body);
+                const json::Value* data = body.find("data");
+                if (!data || !data->isString()) return errorResponse(400, "upload needs \"data\" (base64 PNG)");
+                const std::string bytes = base64Decode(data->string);
+                static const unsigned char sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+                if (bytes.size() < 8 || std::memcmp(bytes.data(), sig, 8) != 0) return errorResponse(400, "upload: not a PNG");
+                std::string name = body.find("name") && body.at("name").isString() ? body.at("name").string : "upload";
+                std::string clean;
+                for (char c : std::filesystem::path(name).stem().string())
+                    clean += (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_') ? c : '_';
+                if (clean.empty()) clean = "upload";
+                if (clean.size() > 40) clean.resize(40);
+                const std::filesystem::path dir = std::filesystem::path(opt.baseDir) / "uploads";
+                std::filesystem::create_directories(dir);
+                std::string file;
+                {
+                    std::lock_guard<std::mutex> l(mutex);
+                    file = std::to_string(static_cast<long long>(nowSeconds() * 1000)) + "-" + std::to_string(nextUpload++) + "-" + clean + ".png";
+                }
+                std::ofstream out(dir / file, std::ios::binary);
+                out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                if (!out) return errorResponse(500, "upload: cannot write " + (dir / file).string());
+                return jsonResponse(makeObject({{"path", makeString("uploads/" + file)}}));
             }
             if (p.size() == 2 && p[1] == "run" && post) {
                 const std::vector<std::string> problems = checkWorkflow(req.body);

@@ -9,6 +9,7 @@
 //   GET  /api/models                    models under the data folder (findModels)
 //   POST /api/check                     {problems: [...]} for a workflow
 //   POST /api/run                       queue a workflow -> {job: id}
+//   POST /api/upload                    {name, data: base64 PNG} -> {path} (saved in <base>/uploads)
 //   GET  /api/jobs, /api/jobs/<id>      job state, progress and outputs
 //   POST /api/jobs/<id>/cancel
 //   GET  /api/jobs/<id>/preview.jpg     latest live preview of a running job

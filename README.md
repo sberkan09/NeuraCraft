@@ -781,6 +781,23 @@ All matrix products in the library go through one `gemm()` dispatcher
 float32) and a short animation, pausing between runs so a laptop stays
 cool, and writes `benchmark_results.txt`.
 
+Measured on an Apple M4 (10 cores, 16 GB; v1.11, before the GPU int8 and
+fused-attention kernels):
+
+| Run | CPU (Accelerate) | GPU (Metal) |
+|---|---|---|
+| SD-Turbo 512, 1 step, int8 | **1.1 s** / step, 5.1 s in all, 1.8 GB peak | 3.4 s / step, 7.2 s |
+| SD-Turbo 512, 1 step, float32 | 1.4 s / step, 4.5 GB peak | 4.1 s / step |
+| Prompt morph, per frame | **1.5 s** (int8) | 4.5–5 s (float32) |
+| AnimateDiff-Lightning 384, 8 frames, 4 steps | **6.8 s** / step, 33 s in all | 20 s / step (float32), 89 s |
+
+GPU and CPU pictures were identical, and int8 against float32 was 33.9 dB
+PSNR. On Apple silicon, **stay on the CPU** (the default): Accelerate runs on
+the AMX units at about 1 TFLOPS even for small products, while the Metal path
+does one synchronous GPU round trip per product with the norms, softmax and
+im2col on the CPU in between. The GPU only wins once a whole UNet pass stays
+on the GPU, which is the direction of the Metal work.
+
 ```cpp
 nc::setThreadCount(8);                 // CPU threads (default: all cores)
 if (nc::setDevice(nc::Device::GPU))    // false -> stays on the CPU

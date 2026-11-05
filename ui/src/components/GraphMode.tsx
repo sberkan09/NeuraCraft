@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import type { Step, Workflow, WorkflowOp } from "../api";
 import { api } from "../api";
 import type { Engine } from "../engine";
+import { freeSpot, topoSort, withLayout, type StepUi } from "../graph";
 import { pickModel } from "../templates";
 import { FieldInput, fieldLabel } from "./FieldInput";
+import { GraphCanvas } from "./GraphCanvas";
 import { overallFraction } from "./Results";
 
 const groupNames: Record<string, string> = { image: "Resim", video: "Video", analysis: "Analiz", enhance: "İyileştirme", edit: "Düzenle", input: "Giriş / çıkış" };
@@ -23,11 +25,14 @@ function inputsOf(step: Step, op?: WorkflowOp): string[] {
 
 // The editor for any workflow: every operation and field from the engine's schema. Steps run top to
 // bottom; any step can read any clip made above it (a graph run in order).
+const stateLabel: Record<string, string> = { queued: "sırada", running: "çalışıyor", done: "bitti", failed: "hata", cancelled: "durduruldu" };
+
 export function GraphMode(props: { engine: Engine; workflow: Workflow; title: string; onChange(wf: Workflow): void }) {
   const { engine, workflow } = props;
   const ops = useMemo(() => new Map((engine.schema?.ops ?? []).map((o) => [o.name, o] as [string, WorkflowOp])), [engine.schema]);
   const [selected, setSelected] = useState(0);
-  const [view, setView] = useState<"steps" | "json">("steps");
+  const [view, setView] = useState<"graph" | "steps" | "json">("graph");
+  const [message, setMessage] = useState<string>();
   const [jsonText, setJsonText] = useState(JSON.stringify(workflow, null, 2));
   const [jsonError, setJsonError] = useState<string>();
   const [problems, setProblems] = useState<string[]>([]);
@@ -38,6 +43,27 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
   useEffect(() => {
     if (view !== "json") setJsonText(JSON.stringify(workflow, null, 2));
   }, [workflow, view]);
+
+  // Every step needs a node id and a position on the canvas.
+  useEffect(() => {
+    if (!ops.size) return;
+    const laid = withLayout(workflow, ops);
+    if (laid !== workflow) props.onChange(laid);
+  }, [workflow, ops, props]);
+  useEffect(() => {
+    if (!message) return;
+    const t = setTimeout(() => setMessage(undefined), 4000);
+    return () => clearTimeout(t);
+  }, [message]);
+  const laidSteps = useMemo(() => withLayout(workflow, ops).steps, [workflow, ops]);
+  const invalidSteps = useMemo(() => {
+    const set = new Set<number>();
+    for (const p of problems) {
+      const m = /^step (\d+)/.exec(p);
+      if (m) set.add(Number(m[1]) - 1);
+    }
+    return set;
+  }, [problems]);
 
   // Live check against the schema.
   useEffect(() => {
@@ -76,8 +102,12 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
     }
     if (opName === "save") s.path = `outputs/${String(s.in ?? "out")}.png`;
     const at = Math.min(selected + 1, steps.length);
-    setSteps([...steps.slice(0, at), s, ...steps.slice(at)]);
-    setSelected(at);
+    const anchor = steps[Math.min(selected, steps.length - 1)]?.ui as StepUi | undefined;
+    s.ui = freeSpot(steps, anchor ? anchor.x + 300 : 40, anchor ? anchor.y : 40);
+    const inserted = [...steps.slice(0, at), s, ...steps.slice(at)];
+    const sorted = topoSort(inserted, ops) ?? inserted;  // a new step reading a later clip moves after it
+    setSteps(sorted);
+    setSelected(sorted.indexOf(s));
   }
   const move = (i: number, d: number) => {
     const j = i + d;
@@ -139,13 +169,22 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
         <div className="runstrip" style={{ borderTop: 0, borderBottom: "1px solid var(--line)" }}>
           <strong>{props.title}</strong>
           <div className="segmented" role="group" aria-label="Görünüm">
-            <button type="button" aria-pressed={view === "steps"} onClick={() => setView("steps")}>Adımlar</button>
+            <button type="button" aria-pressed={view === "graph"} onClick={() => setView("graph")}>Grafik</button>
+            <button type="button" aria-pressed={view === "steps"} onClick={() => setView("steps")}>Liste</button>
             <button type="button" aria-pressed={view === "json"} onClick={() => setView("json")}>JSON</button>
           </div>
           <span className="spacer" />
           <span className="note">{steps.length} adım</span>
         </div>
-        {view === "json" ? (
+        {message ? <div className="problems" style={{ margin: "10px 16px 0" }} role="alert">{message}</div> : null}
+        {view === "graph" ? (
+          steps.length === 0 ? (
+            <div className="empty">Soldan bir işlem ekleyerek başla. Düğümleri sürükle; bir düğümün sağındaki çıkışı diğerinin solundaki girişe çekerek bağla.</div>
+          ) : (
+            <GraphCanvas steps={laidSteps} ops={ops} models={engine.models} job={job} invalidSteps={invalidSteps} selected={selected}
+              onSelect={(i) => i >= 0 && setSelected(i)} onChange={setSteps} onMessage={setMessage} />
+          )
+        ) : view === "json" ? (
           <>
             <textarea className="json-editor" aria-label="Workflow JSON" spellCheck={false} value={jsonText}
               onChange={(e) => {
@@ -192,8 +231,13 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
           ) : null}
           {job ? (
             <div style={{ flex: "1 1 260px", display: "flex", flexDirection: "column", gap: 6 }}>
-              <span className="note">İş {job.id} · {job.state} · {job.op} {job.stage}</span>
-              <div className="bar"><div style={{ width: `${Math.round(overallFraction(job) * 100)}%` }} /></div>
+              <span className="note">
+                İş {job.id} · {stateLabel[job.state] ?? job.state}
+                {job.state === "running" ? ` · ${job.op} ${job.stage}` : job.error ? ` · ${job.error}` : ""}
+              </span>
+              <div className={`bar ${job.state === "done" ? "done" : ""}`}>
+                <div style={{ width: `${job.state === "done" ? 100 : Math.round(overallFraction(job) * 100)}%` }} />
+              </div>
             </div>
           ) : <span className="spacer" />}
           {job && (job.state === "running" || job.state === "queued") ? (

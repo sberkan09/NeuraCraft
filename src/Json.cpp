@@ -1,5 +1,7 @@
 #include "Json.h"
 
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -197,6 +199,105 @@ private:
 } // namespace
 
 Value parse(const std::string& text) { return Parser(text).document(); }
+
+std::string quote(const std::string& text) {
+    std::string out = "\"";
+    for (unsigned char c : text) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof buf, "\\u%04x", c);
+                out += buf;
+            } else {
+                out += static_cast<char>(c);
+            }
+        }
+    }
+    return out + "\"";
+}
+
+namespace {
+void dumpTo(const Value& v, std::string& out) {
+    switch (v.type) {
+    case Value::Type::Null: out += "null"; break;
+    case Value::Type::Bool: out += v.boolean ? "true" : "false"; break;
+    case Value::Type::Number: {
+        if (!std::isfinite(v.number)) {
+            out += "null";
+        } else if (v.number == std::floor(v.number) && std::fabs(v.number) < 1e15) {
+            out += std::to_string(static_cast<long long>(v.number));
+        } else {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "%.9g", v.number);
+            out += buf;
+        }
+        break;
+    }
+    case Value::Type::String: out += quote(v.string); break;
+    case Value::Type::Array:
+        out += '[';
+        for (std::size_t i = 0; i < v.array.size(); ++i) {
+            if (i) out += ',';
+            dumpTo(v.array[i], out);
+        }
+        out += ']';
+        break;
+    case Value::Type::Object:
+        out += '{';
+        for (std::size_t i = 0; i < v.object.size(); ++i) {
+            if (i) out += ',';
+            out += quote(v.object[i].first);
+            out += ':';
+            dumpTo(v.object[i].second, out);
+        }
+        out += '}';
+        break;
+    }
+}
+} // namespace
+
+std::string dump(const Value& value) {
+    std::string out;
+    dumpTo(value, out);
+    return out;
+}
+
+Value makeString(const std::string& s) {
+    Value v;
+    v.type = Value::Type::String;
+    v.string = s;
+    return v;
+}
+Value makeNumber(double n) {
+    Value v;
+    v.type = Value::Type::Number;
+    v.number = n;
+    return v;
+}
+Value makeBool(bool b) {
+    Value v;
+    v.type = Value::Type::Bool;
+    v.boolean = b;
+    return v;
+}
+Value makeArray(std::vector<Value> items) {
+    Value v;
+    v.type = Value::Type::Array;
+    v.array = std::move(items);
+    return v;
+}
+Value makeObject(std::vector<std::pair<std::string, Value>> members) {
+    Value v;
+    v.type = Value::Type::Object;
+    v.object = std::move(members);
+    return v;
+}
 
 } // namespace json
 } // namespace nc

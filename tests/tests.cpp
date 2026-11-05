@@ -3429,6 +3429,94 @@ TEST(upscaler_compact_esrgan) {
     std::filesystem::remove(file);
 }
 
+// safetensors with explicit shapes (float32), for models whose loaders check 4-D shapes.
+void saveShaped(const std::string& file, const std::vector<std::pair<std::string, std::vector<std::size_t>>>& tensors,
+                const std::function<float(const std::string&, std::size_t)>& value) {
+    std::string header = "{";
+    std::vector<float> data;
+    for (const auto& [name, shape] : tensors) {
+        std::size_t n = 1;
+        for (std::size_t d : shape) n *= d;
+        if (header.size() > 1) header += ",";
+        header += "\"" + name + "\":{\"dtype\":\"F32\",\"shape\":[";
+        for (std::size_t i = 0; i < shape.size(); ++i) header += (i ? "," : "") + std::to_string(shape[i]);
+        header += "],\"data_offsets\":[" + std::to_string(data.size() * 4) + "," + std::to_string((data.size() + n) * 4) + "]}";
+        for (std::size_t i = 0; i < n; ++i) data.push_back(value(name, i));
+    }
+    header += "}";
+    while (header.size() % 8) header += ' ';
+    std::ofstream f(file, std::ios::binary);
+    const std::uint64_t len = header.size();
+    f.write(reinterpret_cast<const char*>(&len), 8);
+    f << header;
+    f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size() * 4));
+}
+
+TEST(rife_frame_interpolation) {
+    const std::string file = tempPath("rife.safetensors");
+    auto write = [&](bool zeroHeads) {
+        std::vector<std::pair<std::string, std::vector<std::size_t>>> t;
+        const std::size_t c = 8;
+        for (const char* b : {"block0", "block1", "block2"}) {
+            const std::string p = b;
+            auto conv = [&](const std::string& n, std::size_t o, std::size_t i) {
+                t.push_back({n + ".0.weight", {o, i, 3, 3}});
+                t.push_back({n + ".0.bias", {o}});
+                t.push_back({n + ".1.weight", {o}});
+            };
+            conv(p + ".conv0.0", c / 2, 11);
+            conv(p + ".conv0.1", c, c / 2);
+            for (int k = 0; k < 4; ++k)
+                for (int j = 0; j < 2; ++j) conv(p + ".convblock" + std::to_string(k) + "." + std::to_string(j), c, c);
+            for (const char* head : {".conv1", ".conv2"}) {
+                t.push_back({p + head + ".0.weight", {c, c / 2, 4, 4}});
+                t.push_back({p + head + ".0.bias", {c / 2}});
+                t.push_back({p + head + ".1.weight", {c / 2}});
+                const std::size_t out = std::string(head) == ".conv1" ? 4 : 1;
+                t.push_back({p + head + ".2.weight", {c / 2, out, 4, 4}});
+                t.push_back({p + head + ".2.bias", {out}});
+            }
+        }
+        std::mt19937 rng(3);
+        saveShaped(file, t, [&](const std::string& name, std::size_t) {
+            const bool head = name.find(".2.") != std::string::npos && (name.find("conv1") != std::string::npos || name.find("conv2") != std::string::npos);
+            if (zeroHeads && head) return 0.0f;
+            if (name.find(".1.weight") != std::string::npos) return 0.25f;  // PReLU slopes
+            return (static_cast<float>(rng() % 2001) / 1000.0f - 1.0f) * 0.2f;
+        });
+    };
+    Image a, b;
+    a.width = b.width = 40;  // not a multiple of 32
+    a.height = b.height = 24;
+    for (std::size_t i = 0; i < 40 * 24 * 3; ++i) {
+        a.pixels.push_back(static_cast<std::uint8_t>(i * 7 % 256));
+        b.pixels.push_back(static_cast<std::uint8_t>(i * 13 % 256));
+    }
+    // Zero flow and mask heads: no motion, an even blend of the two frames.
+    write(true);
+    const FrameInterpolator blend(file);
+    const Image m = blend.middle(a, b);
+    CHECK(m.width == 40 && m.height == 24);
+    bool even = true;
+    for (std::size_t i = 0; i < m.pixels.size(); ++i)
+        if (std::abs(m.pixels[i] - (a.pixels[i] + b.pixels[i]) / 2.0) > 1.0) even = false;
+    CHECK(even);
+    // With flow: frames in between, originals kept, deterministic.
+    write(false);
+    const FrameInterpolator fi(file);
+    const std::vector<Image> frames{a, b, a};
+    const auto doubled = fi.interpolate(frames, 1);
+    CHECK(doubled.size() == 5 && doubled[0].pixels == a.pixels && doubled[2].pixels == b.pixels && doubled[4].pixels == a.pixels);
+    CHECK(doubled[1].pixels == fi.middle(a, b).pixels && doubled[1].pixels != m.pixels);
+    CHECK(fi.interpolate(frames, 2).size() == 9);
+    CHECK(fi.interpolate(frames, 1, true).size() == 6);
+    Image small = a;
+    small.width = 20;
+    small.pixels.resize(20 * 24 * 3);
+    CHECK_THROWS(fi.middle(a, small), std::invalid_argument);
+    std::filesystem::remove(file);
+}
+
 // ---- Training robustness ------------------------------------------------------------------
 
 TEST(cosine_schedule_and_gradient_clipping) {

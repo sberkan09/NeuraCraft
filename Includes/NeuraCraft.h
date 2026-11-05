@@ -9,6 +9,7 @@
 #include "Dense.h"
 #include "Diffusion.h"
 #include "Image.h"
+#include "Interpolate.h"
 #include "Json.h"
 #include "Layer.h"
 #include "Lora.h"

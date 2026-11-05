@@ -965,6 +965,7 @@ void usage() {
               << "  NeuraCraft video <dir> outpaint \"prompt\" ... [--keyframes 6] [--shrink 0.75] [--frames 12] [--zoom-in] [--start in.png]\n"
               << "  NeuraCraft inpaint <dir> in.png mask.png \"prompt\" [out.png] [--steps 25] [--strength 1] [--feather 4] [--guidance G]\n"
               << "  NeuraCraft upscale model.safetensors in.png out.png      (Real-ESRGAN compact; video takes --upscale model)\n"
+              << "  NeuraCraft interpolate rife.safetensors frames/ out.gif [--passes N] [--fps F] [--loop]   (video: --interpolate rife)\n"
               << "  video output: .gif (256 colours), .png (animated PNG, full colour) or .mov (QuickTime Motion-JPEG)\n"
               << "        [--strength S] [--steps N] [--start in.png] [--seed S] [--size N] [--frames-dir DIR] [--full-vae]\n"
               << "        [--sharpen A] [--noise N] [--no-color-match]\n"
@@ -1191,7 +1192,8 @@ int main(int argc, char** argv) {
             std::string output = morph ? "morph.gif" : t2v ? "t2v.gif" : outpaint ? "outpaint.gif" : "zoom.gif", framesDir, start;
             float fps = morph ? 10.0f : 8.0f;
             bool fullVae = false, framesSet = false, strengthSet = false, cannyVideo = false;
-            std::string upscaleModel;
+            std::string upscaleModel, interpolateModel;
+            std::size_t interpPasses = 1;
             std::size_t frames = 0;
             auto split = [](const std::string& s) {
                 std::vector<std::string> parts;
@@ -1248,6 +1250,8 @@ int main(int argc, char** argv) {
                 } else if (a == "--control-scale") vo.controlScale = std::stof(value());
                 else if (a == "--canny") cannyVideo = true;
                 else if (a == "--upscale") upscaleModel = value();
+                else if (a == "--interpolate") interpolateModel = value();
+                else if (a == "--interp-passes") interpPasses = std::stoul(value());
                 else if (a == "--context") vo.context = std::stoul(value());
                 else if (a == "--lora") o.loras.push_back(parseLora(value()));
                 else if (a == "--sampler") o.sampler = vo.sampler = value();
@@ -1337,6 +1341,15 @@ int main(int argc, char** argv) {
                 std::cerr << e.what() << "\ndownload SD-Turbo with: scripts/download_sd_turbo.sh " << args[1] << '\n';
                 return 2;
             }
+            if (!interpolateModel.empty()) {  // RIFE: 2^passes - 1 frames between each pair, same duration
+                const auto ti = std::chrono::steady_clock::now();
+                const FrameInterpolator fi(interpolateModel);
+                const bool loops = morph && mo.loop;
+                video = fi.interpolate(video, interpPasses, loops);
+                fps *= static_cast<float>(std::size_t(1) << interpPasses);
+                std::cerr << "  interpolate x" << (std::size_t(1) << interpPasses) << ": " << std::fixed << std::setprecision(1)
+                          << std::chrono::duration<double>(std::chrono::steady_clock::now() - ti).count() << " s" << std::defaultfloat << '\n';
+            }
             if (!upscaleModel.empty()) {  // super-resolution of every frame before writing
                 const auto tu = std::chrono::steady_clock::now();
                 const Upscaler up(upscaleModel);
@@ -1364,6 +1377,43 @@ int main(int argc, char** argv) {
             std::cout << "wrote " << output << " (" << video.size() << " frames, " << o.width << "x" << o.height << ", " << fps
                       << " fps) in " << std::fixed << std::setprecision(1)
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() << " s" << std::defaultfloat << '\n';
+            return 0;
+        }
+        if (cmd == "interpolate") {  // model frames-dir out [--passes N] [--fps F] [--loop]
+            if (args.size() < 4) {
+                usage();
+                return 2;
+            }
+            std::size_t passes = 1;
+            float fps = 8.0f;
+            bool loop = false;
+            for (std::size_t i = 4; i < args.size(); ++i) {
+                if (args[i] == "--passes" && i + 1 < args.size()) passes = std::stoul(args[++i]);
+                else if (args[i] == "--fps" && i + 1 < args.size()) fps = std::stof(args[++i]);
+                else if (args[i] == "--loop") loop = true;
+                else {
+                    std::cerr << "unknown interpolate option: " << args[i] << "\n";
+                    return 2;
+                }
+            }
+            std::vector<std::string> files;
+            for (const auto& e : std::filesystem::directory_iterator(args[2])) {
+                const std::string ext = e.path().extension().string();
+                if (ext == ".png" || ext == ".ppm") files.push_back(e.path().string());
+            }
+            std::sort(files.begin(), files.end());
+            std::vector<Image> frames;
+            for (const std::string& f : files) frames.push_back(toRgb(loadImage(f)));
+            const auto start = std::chrono::steady_clock::now();
+            const std::vector<Image> out = FrameInterpolator(args[1]).interpolate(frames, passes, loop);
+            const std::string& o = args[3];
+            const float outFps = fps * static_cast<float>(std::size_t(1) << passes);
+            if (o.size() > 4 && o.compare(o.size() - 4, 4, ".png") == 0) saveApng(o, out, outFps);
+            else if (o.size() > 4 && o.compare(o.size() - 4, 4, ".mov") == 0) saveMjpegMov(o, out, outFps);
+            else saveGif(o, out, outFps);
+            std::cout << "wrote " << o << " (" << frames.size() << " -> " << out.size() << " frames, " << outFps << " fps) in " << std::fixed
+                      << std::setprecision(1) << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() << " s"
+                      << std::defaultfloat << '\n';
             return 0;
         }
         if (cmd == "upscale") {

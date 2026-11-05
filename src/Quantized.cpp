@@ -1,4 +1,5 @@
 #include "Quantized.h"
+#include "Profile.h"
 #include "Backend.h"
 #include "Parallel.h"
 
@@ -36,6 +37,7 @@ std::int8_t quantizeValue(float v, float inv) {
 } // namespace
 
 QuantizedWeights QuantizedWeights::fromOutIn(const Matrix& w, std::size_t group) {
+    NC_PROFILE("load: quantize");
     QuantizedWeights q;
     q.out_ = w.rows();
     q.in_ = w.cols();
@@ -263,6 +265,7 @@ const char* QuantizedWeights::kernelName() {
 }
 
 void QuantizedWeights::expandRows(std::size_t j0, std::size_t j1, float* dst) const {
+    NC_PROFILE("int8 expand");
     parallelFor(j0, j1, 8, [&](std::size_t a, std::size_t b) {
         for (std::size_t j = a; j < b; ++j) expandRow(j, dst + (j - j0) * in_);
     });
@@ -276,6 +279,7 @@ Matrix QuantizedWeights::multiply(const Matrix& x) const {
 #ifdef NEURACRAFT_HAS_METAL
     if (gpuProducts(n)) {
         // out (n x out) = x * W^T on the GPU, dequantizing tiles of W as they are loaded.
+        NC_PROFILE("int8 gemm gpu");
         Matrix out(n, out_);
         metal::gemmQ8(false, n, out_, in_, q_.data(), mapBytes(q_.capacity()), scale_.data(),
                       mapBytes(scale_.capacity() * sizeof(float)), groupsPerRow_, group_, x.data(), in_,
@@ -296,6 +300,7 @@ Matrix QuantizedWeights::multiply(const Matrix& x) const {
         return out;
     }
     if (!int8Inputs()) return multiplyFloat(x);
+    NC_PROFILE("int8 gemm cpu");
     Matrix out(n, out_);
     if (n == 0 || out_ == 0) return out;
 
@@ -360,6 +365,7 @@ void QuantizedWeights::multiplyLeft(std::size_t n, const float* b, std::size_t l
     if (n == 0 || out_ == 0) return;
 #ifdef NEURACRAFT_HAS_METAL
     if (gpuProducts(n)) {
+        NC_PROFILE("int8 gemm gpu");
         metal::gemmQ8(true, out_, n, in_, q_.data(), mapBytes(q_.capacity()), scale_.data(),
                       mapBytes(scale_.capacity() * sizeof(float)), groupsPerRow_, group_, b, ldb, bMapBytes, c, ldc,
                       cMapBytes);

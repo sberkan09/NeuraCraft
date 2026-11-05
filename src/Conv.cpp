@@ -1,4 +1,5 @@
 #include "Conv.h"
+#include "Profile.h"
 #include "Backend.h"
 #include "Parallel.h"
 
@@ -118,6 +119,7 @@ Matrix Conv2D::forwardQuantized(const Matrix& input) const {
 }
 
 Matrix Conv2D::forwardInference(const Matrix& input) const {
+    NC_PROFILE("conv (im2col, bias)");
     if (quantized()) return forwardQuantized(input);
     return stripConvolution(input, weights_.data(), false);
 }

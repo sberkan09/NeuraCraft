@@ -23,153 +23,6 @@ const char* const kShaderSource = R"METAL(
 #include <metal_stdlib>
 using namespace metal;
 
-// Int8 weight GEMM: tiles of the int8 operand are dequantized (one scale per
-// `group` inputs of each weight row) while they are loaded into threadgroup
-// memory; the rest is the float kernel. Weights cross the bus as int8.
-const char* const kQ8Common = R"METAL(
-#include <metal_stdlib>
-using namespace metal;
-
-struct Q8Params {
-    uint M; uint N; uint K;
-    uint ldx; uint ldc;
-    uint gpr; uint group; uint quantLeft;
-};
-
-// Element (r, k) of the left operand and (k, c) of the right one.
-inline float q8Left(device const char* Q, device const float* S, device const float* X,
-                    constant Q8Params& p, uint r, uint k) {
-    return p.quantLeft ? S[r * p.gpr + k / p.group] * float(Q[ulong(r) * p.K + k]) : X[ulong(r) * p.ldx + k];
-}
-inline float q8Right(device const char* Q, device const float* S, device const float* X,
-                     constant Q8Params& p, uint k, uint c) {
-    return p.quantLeft ? X[ulong(k) * p.ldx + c] : S[c * p.gpr + k / p.group] * float(Q[ulong(c) * p.K + k]);
-}
-)METAL";
-
-const char* const kQ8TiledSource = R"METAL(
-#define TS 32
-#define TK 16
-#define TPD 8
-#define WPT 4
-
-kernel void gemm_q8_tiled(device const char* Q [[buffer(0)]],
-                          device const float* S [[buffer(1)]],
-                          device const float* X [[buffer(2)]],
-                          device float* C [[buffer(3)]],
-                          constant Q8Params& p [[buffer(4)]],
-                          uint2 tid [[thread_position_in_threadgroup]],
-                          uint2 tg [[threadgroup_position_in_grid]]) {
-    threadgroup float As[TK][TS + 1];
-    threadgroup float Bs[TK][TS + 1];
-
-    const uint row0 = tg.y * TS;
-    const uint col0 = tg.x * TS;
-    const uint lid = tid.y * TPD + tid.x;
-
-    float acc[WPT][WPT];
-    for (uint i = 0; i < WPT; ++i)
-        for (uint j = 0; j < WPT; ++j) acc[i][j] = 0.0f;
-
-    for (uint k0 = 0; k0 < p.K; k0 += TK) {
-        for (uint e = lid; e < TK * TS; e += TPD * TPD) {
-            // Both left operands are row-major M x K; the right one is K x N
-            // (quantLeft: activations) or N x K (int8 weight rows).
-            const uint ma = e / TK, ka = e % TK;
-            const uint gr = row0 + ma, gka = k0 + ka;
-            As[ka][ma] = (gr < p.M && gka < p.K) ? q8Left(Q, S, X, p, gr, gka) : 0.0f;
-
-            uint kb, nb;
-            if (p.quantLeft) { kb = e / TS; nb = e % TS; } else { nb = e / TK; kb = e % TK; }
-            const uint gc = col0 + nb, gkb = k0 + kb;
-            Bs[kb][nb] = (gc < p.N && gkb < p.K) ? q8Right(Q, S, X, p, gkb, gc) : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint kk = 0; kk < TK; ++kk) {
-            float a[WPT], b[WPT];
-            for (uint i = 0; i < WPT; ++i) a[i] = As[kk][tid.y + i * TPD];
-            for (uint j = 0; j < WPT; ++j) b[j] = Bs[kk][tid.x + j * TPD];
-            for (uint i = 0; i < WPT; ++i)
-                for (uint j = 0; j < WPT; ++j) acc[i][j] = fma(a[i], b[j], acc[i][j]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    for (uint i = 0; i < WPT; ++i) {
-        const uint r = row0 + tid.y + i * TPD;
-        if (r >= p.M) continue;
-        for (uint j = 0; j < WPT; ++j) {
-            const uint c = col0 + tid.x + j * TPD;
-            if (c < p.N) C[ulong(r) * p.ldc + c] = acc[i][j];
-        }
-    }
-}
-)METAL";
-
-const char* const kQ8SimdSource = R"METAL(
-#include <metal_simdgroup_matrix>
-#define BM 64
-#define BN 64
-#define BK 16
-
-kernel void gemm_q8_simd(device const char* Q [[buffer(0)]],
-                         device const float* S [[buffer(1)]],
-                         device const float* X [[buffer(2)]],
-                         device float* C [[buffer(3)]],
-                         constant Q8Params& p [[buffer(4)]],
-                         uint2 tg [[threadgroup_position_in_grid]],
-                         uint tidx [[thread_index_in_threadgroup]],
-                         uint sgid [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float As[BM * BK];
-    threadgroup float Bs[BK * BN];
-    threadgroup float Cs[BM * BN];
-
-    const uint row0 = tg.y * BM;
-    const uint col0 = tg.x * BN;
-    const uint sgRow = (sgid / 2) * 32;
-    const uint sgCol = (sgid % 2) * 32;
-
-    simdgroup_float8x8 acc[4][4];
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 4; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-
-    for (uint k0 = 0; k0 < p.K; k0 += BK) {
-        for (uint e = tidx; e < BM * BK; e += 128) {
-            const uint r = e / BK, k = e % BK;
-            const uint gr = row0 + r, gk = k0 + k;
-            As[r * BK + k] = (gr < p.M && gk < p.K) ? q8Left(Q, S, X, p, gr, gk) : 0.0f;
-        }
-        for (uint e = tidx; e < BK * BN; e += 128) {
-            uint k, c;
-            if (p.quantLeft) { k = e / BN; c = e % BN; } else { c = e / BK; k = e % BK; }
-            const uint gc = col0 + c, gk = k0 + k;
-            Bs[k * BN + c] = (gc < p.N && gk < p.K) ? q8Right(Q, S, X, p, gk, gc) : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint kk = 0; kk < BK; kk += 8) {
-            simdgroup_float8x8 a[4], b[4];
-            for (uint i = 0; i < 4; ++i) simdgroup_load(a[i], As + (sgRow + i * 8) * BK + kk, BK);
-            for (uint j = 0; j < 4; ++j) simdgroup_load(b[j], Bs + kk * BN + sgCol + j * 8, BN);
-            for (uint i = 0; i < 4; ++i)
-                for (uint j = 0; j < 4; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 4; ++j)
-            simdgroup_store(acc[i][j], Cs + (sgRow + i * 8) * BN + sgCol + j * 8, BN);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint e = tidx; e < BM * BN; e += 128) {
-        const uint r = row0 + e / BN, c = col0 + e % BN;
-        if (r < p.M && c < p.N) C[ulong(r) * p.ldc + c] = Cs[e];
-    }
-}
-)METAL";
-
 struct GemmParams {
     uint M; uint N; uint K;
     uint lda; uint ldb; uint ldc;
@@ -317,6 +170,153 @@ kernel void gemm_simd(device const float* A [[buffer(0)]],
             const uint idx = r * p.ldc + c;
             C[idx] = p.accumulate ? C[idx] + Cs[e] : Cs[e];
         }
+    }
+}
+)METAL";
+
+// Int8 weight GEMM: tiles of the int8 operand are dequantized (one scale per
+// `group` inputs of each weight row) while they are loaded into threadgroup
+// memory; the rest is the float kernel. Weights cross the bus as int8.
+const char* const kQ8Common = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct Q8Params {
+    uint M; uint N; uint K;
+    uint ldx; uint ldc;
+    uint gpr; uint group; uint quantLeft;
+};
+
+// Element (r, k) of the left operand and (k, c) of the right one.
+inline float q8Left(device const char* Q, device const float* S, device const float* X,
+                    constant Q8Params& p, uint r, uint k) {
+    return p.quantLeft ? S[r * p.gpr + k / p.group] * float(Q[ulong(r) * p.K + k]) : X[ulong(r) * p.ldx + k];
+}
+inline float q8Right(device const char* Q, device const float* S, device const float* X,
+                     constant Q8Params& p, uint k, uint c) {
+    return p.quantLeft ? X[ulong(k) * p.ldx + c] : S[c * p.gpr + k / p.group] * float(Q[ulong(c) * p.K + k]);
+}
+)METAL";
+
+const char* const kQ8TiledSource = R"METAL(
+#define TS 32
+#define TK 16
+#define TPD 8
+#define WPT 4
+
+kernel void gemm_q8_tiled(device const char* Q [[buffer(0)]],
+                          device const float* S [[buffer(1)]],
+                          device const float* X [[buffer(2)]],
+                          device float* C [[buffer(3)]],
+                          constant Q8Params& p [[buffer(4)]],
+                          uint2 tid [[thread_position_in_threadgroup]],
+                          uint2 tg [[threadgroup_position_in_grid]]) {
+    threadgroup float As[TK][TS + 1];
+    threadgroup float Bs[TK][TS + 1];
+
+    const uint row0 = tg.y * TS;
+    const uint col0 = tg.x * TS;
+    const uint lid = tid.y * TPD + tid.x;
+
+    float acc[WPT][WPT];
+    for (uint i = 0; i < WPT; ++i)
+        for (uint j = 0; j < WPT; ++j) acc[i][j] = 0.0f;
+
+    for (uint k0 = 0; k0 < p.K; k0 += TK) {
+        for (uint e = lid; e < TK * TS; e += TPD * TPD) {
+            // Both left operands are row-major M x K; the right one is K x N
+            // (quantLeft: activations) or N x K (int8 weight rows).
+            const uint ma = e / TK, ka = e % TK;
+            const uint gr = row0 + ma, gka = k0 + ka;
+            As[ka][ma] = (gr < p.M && gka < p.K) ? q8Left(Q, S, X, p, gr, gka) : 0.0f;
+
+            uint kb, nb;
+            if (p.quantLeft) { kb = e / TS; nb = e % TS; } else { nb = e / TK; kb = e % TK; }
+            const uint gc = col0 + nb, gkb = k0 + kb;
+            Bs[kb][nb] = (gc < p.N && gkb < p.K) ? q8Right(Q, S, X, p, gkb, gc) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < TK; ++kk) {
+            float a[WPT], b[WPT];
+            for (uint i = 0; i < WPT; ++i) a[i] = As[kk][tid.y + i * TPD];
+            for (uint j = 0; j < WPT; ++j) b[j] = Bs[kk][tid.x + j * TPD];
+            for (uint i = 0; i < WPT; ++i)
+                for (uint j = 0; j < WPT; ++j) acc[i][j] = fma(a[i], b[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < WPT; ++i) {
+        const uint r = row0 + tid.y + i * TPD;
+        if (r >= p.M) continue;
+        for (uint j = 0; j < WPT; ++j) {
+            const uint c = col0 + tid.x + j * TPD;
+            if (c < p.N) C[ulong(r) * p.ldc + c] = acc[i][j];
+        }
+    }
+}
+)METAL";
+
+const char* const kQ8SimdSource = R"METAL(
+#include <metal_simdgroup_matrix>
+#define BM 64
+#define BN 64
+#define BK 16
+
+kernel void gemm_q8_simd(device const char* Q [[buffer(0)]],
+                         device const float* S [[buffer(1)]],
+                         device const float* X [[buffer(2)]],
+                         device float* C [[buffer(3)]],
+                         constant Q8Params& p [[buffer(4)]],
+                         uint2 tg [[threadgroup_position_in_grid]],
+                         uint tidx [[thread_index_in_threadgroup]],
+                         uint sgid [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float As[BM * BK];
+    threadgroup float Bs[BK * BN];
+    threadgroup float Cs[BM * BN];
+
+    const uint row0 = tg.y * BM;
+    const uint col0 = tg.x * BN;
+    const uint sgRow = (sgid / 2) * 32;
+    const uint sgCol = (sgid % 2) * 32;
+
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 4; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+        for (uint e = tidx; e < BM * BK; e += 128) {
+            const uint r = e / BK, k = e % BK;
+            const uint gr = row0 + r, gk = k0 + k;
+            As[r * BK + k] = (gr < p.M && gk < p.K) ? q8Left(Q, S, X, p, gr, gk) : 0.0f;
+        }
+        for (uint e = tidx; e < BK * BN; e += 128) {
+            uint k, c;
+            if (p.quantLeft) { k = e / BN; c = e % BN; } else { c = e / BK; k = e % BK; }
+            const uint gc = col0 + c, gk = k0 + k;
+            Bs[k * BN + c] = (gc < p.N && gk < p.K) ? q8Right(Q, S, X, p, gk, gc) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < BK; kk += 8) {
+            simdgroup_float8x8 a[4], b[4];
+            for (uint i = 0; i < 4; ++i) simdgroup_load(a[i], As + (sgRow + i * 8) * BK + kk, BK);
+            for (uint j = 0; j < 4; ++j) simdgroup_load(b[j], Bs + kk * BN + sgCol + j * 8, BN);
+            for (uint i = 0; i < 4; ++i)
+                for (uint j = 0; j < 4; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 4; ++j)
+            simdgroup_store(acc[i][j], Cs + (sgRow + i * 8) * BN + sgCol + j * 8, BN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint e = tidx; e < BM * BN; e += 128) {
+        const uint r = row0 + e / BN, c = col0 + e % BN;
+        if (r < p.M && c < p.N) C[ulong(r) * p.ldc + c] = Cs[e];
     }
 }
 )METAL";

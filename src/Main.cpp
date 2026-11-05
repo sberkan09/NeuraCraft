@@ -26,7 +26,7 @@
 //                              Stable Diffusion VAE round trip (scripts/download_sd_turbo.sh)
 //   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
 //
-// Global options: --gpu (Metal on Apple silicon), --threads N
+// Global options: --gpu (Metal on Apple silicon), --threads N, --profile
 
 #include "NeuraCraft.h"
 
@@ -1011,7 +1011,8 @@ void usage() {
               << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
               << "options:\n"
               << "  --gpu          run large matrix products on the GPU (Metal)\n"
-              << "  --threads N    number of CPU threads (default: all cores)\n";
+              << "  --threads N    number of CPU threads (default: all cores)\n"
+              << "  --profile      print where the time went (GEMMs, int8, convolutions, attention, ...)\n";
 }
 
 } // namespace
@@ -1038,6 +1039,8 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--gpu") {
             wantGpu = true;
+        } else if (a == "--profile") {
+            setProfiling(true);
         } else if (a == "--threads") {
             if (i + 1 >= argc) {
                 std::cerr << "--threads needs a number\n";
@@ -1054,6 +1057,12 @@ int main(int argc, char** argv) {
     std::cout << "device: " << deviceDescription() << '\n';
 
     const std::string cmd = args.empty() ? "all" : args[0];
+    // --profile: where the time went, printed however the command ends.
+    struct ProfileReport {
+        ~ProfileReport() {
+            if (profiling()) printProfile(std::cout);
+        }
+    } profileReport;
     try {
         if (cmd == "all") {
             int failed = 0;

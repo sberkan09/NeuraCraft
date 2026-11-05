@@ -1,4 +1,5 @@
 #include "Backend.h"
+#include "Profile.h"
 #include "Parallel.h"
 
 #include <algorithm>
@@ -328,6 +329,7 @@ void gemmReference(bool transA, bool transB, std::size_t M, std::size_t N, std::
 void gemmCpu(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
              const float* A, std::size_t lda, const float* B, std::size_t ldb,
              float* C, std::size_t ldc, bool accumulate) {
+    NC_PROFILE("gemm cpu");
     checkDims(M, N, K, transA, transB, lda, ldb, ldc);
     if (M == 0 || N == 0) return;
     if (K == 0) {
@@ -352,6 +354,7 @@ void gemmGpu(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t
 #ifdef NEURACRAFT_HAS_METAL
     if (!metal::available()) throw std::runtime_error("gemmGpu: no Metal device available");
     if (M == 0 || N == 0) return;
+    NC_PROFILE("gemm gpu");
     metal::gemm(transA, transB, M, N, K, A, lda, B, ldb, C, ldc, accumulate);
 #else
     (void)transA; (void)transB; (void)M; (void)N; (void)K; (void)A; (void)lda; (void)B; (void)ldb;
@@ -369,6 +372,7 @@ void matmul(const Matrix& a, bool transA, const Matrix& b, bool transB, Matrix& 
     if (M == 0 || N == 0) return;
 #ifdef NEURACRAFT_HAS_METAL
     if (currentDevice() == Device::GPU && M * N * K >= gpuMinWork() && K > 0 && metal::available()) {
+        NC_PROFILE("gemm gpu");
         metal::gemm(transA, transB, M, N, K, a.data(), a.cols(), b.data(), b.cols(), c.data(), N, false,
                     a.pageBacked() ? a.storageBytes() : 0, b.pageBacked() ? b.storageBytes() : 0,
                     c.pageBacked() ? c.storageBytes() : 0);

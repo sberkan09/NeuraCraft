@@ -54,6 +54,12 @@ bool gpuAttention(const Matrix& q, const Matrix& k, const Matrix& v, std::size_t
 // Metal GEMM, but the fused attention kernel beats the CPU's GEMM + softmax.
 // No effect without a GPU.
 void setGpuAttention(bool enabled);
+// Which Metal attention kernel a head size uses: "simdgroup" (M1 and later),
+// "scalar", or "" when it is not supported / there is no GPU.
+std::string gpuAttentionKernel(std::size_t headSize);
+// Prefer "scalar" (the default) or "simdgroup" (needs the simdgroup GEMM, head
+// sizes divisible by 8); "" goes back to the default / NEURACRAFT_METAL_ATTENTION.
+void setGpuAttentionKernel(const std::string& name);
 bool gpuAttentionEnabled();
 
 // Vectorized dot product of two float arrays.

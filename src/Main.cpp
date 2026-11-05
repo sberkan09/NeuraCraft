@@ -990,11 +990,16 @@ int runBench(bool quick) {
         const bool ok = y.approxEquals(attnRef, 1e-3f);
         mismatches += !ok;
         std::cout << std::setw(22) << label << std::fixed << std::setprecision(2) << std::setw(9) << 1e3 * elapsed / reps << " ms"
-                  << (device == Device::GPU ? (fused ? "  (fused kernel)" : "  (GEMMs + CPU softmax)") : "")
+                  << (device == Device::GPU ? (fused ? "  (fused " + gpuAttentionKernel(40) + " kernel)" : std::string("  (GEMMs + CPU softmax)")) : std::string())
                   << (ok ? "" : "  (disagrees with the CPU!)") << std::defaultfloat << '\n';
     };
     timeAttention("CPU", Device::CPU);
-    if (gpuAvailable()) timeAttention("GPU", Device::GPU);
+    if (gpuAvailable()) {
+        timeAttention("GPU", Device::GPU);
+        setGpuAttentionKernel("simdgroup");
+        if (gpuAttentionKernel(40) == "simdgroup") timeAttention("GPU", Device::GPU);
+        setGpuAttentionKernel("");
+    }
 
     // 3x3 convolutions as in the UNet: im2col + one GEMM, or 9 shifted GEMMs.
     std::cout << "\n3x3 convolution, CPU (ms):        im2col   shifted\n";

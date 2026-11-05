@@ -4200,6 +4200,9 @@ TEST(gpu_int8_products_match_cpu) {
 
 TEST(gpu_fused_attention_matches_cpu) {
     if (!gpuAvailable()) return;
+    std::cout << "         (attention kernels: head 40 " << gpuAttentionKernel(40) << ", head 64 " << gpuAttentionKernel(64)
+              << ", head 36 " << gpuAttentionKernel(36) << ")\n";
+    CHECK(gpuAttentionKernel(36) == "scalar" && gpuAttentionKernel(512).empty());
     setSeed(91);
     const std::size_t saved = gpuMinWork();
     setGpuMinWork(1);
@@ -4207,7 +4210,8 @@ TEST(gpu_fused_attention_matches_cpu) {
     // Self- and cross-attention shapes of the UNet (head size 40 / 80 / 160), a ragged key count,
     // a 64-wide head, and a 512-wide one (VAE) that stays on the CPU.
     for (const Case& c : {Case{300, 300, 320, 8, true}, Case{257, 77, 640, 8, true}, Case{100, 33, 320, 2, true},
-                          Case{70, 129, 320, 5, true}, Case{64, 64, 512, 1, false}}) {
+                          Case{70, 129, 320, 5, true}, Case{13, 5, 288, 8, true}, Case{1, 1, 80, 2, true},
+                          Case{64, 64, 512, 1, false}}) {
         const Matrix q = Matrix::uniform(c.N, c.C, -2, 2), k = Matrix::uniform(c.M, c.C, -2, 2), v = Matrix::uniform(c.M, c.C, -1, 1);
         setDevice(Device::CPU);
         const Matrix cpu = multiHeadAttention(q, k, v, c.heads);
@@ -4216,7 +4220,13 @@ TEST(gpu_fused_attention_matches_cpu) {
         CHECK(gpuAttention(q, k, v, c.heads, direct) == c.gpu);
         const Matrix gpu = multiHeadAttention(q, k, v, c.heads);
         setDevice(Device::CPU);
-        CHECK(gpu.approxEquals(cpu, 1e-4f));
+        // Without the fused kernel the GPU path is GEMMs on the GPU + CPU softmax: a looser bound
+        // (512-wide dot products accumulate in a different order).
+        const float tol = c.gpu ? 1e-4f : 1e-3f;
+        float worst = 0;
+        for (std::size_t i = 0; i < cpu.size(); ++i) worst = std::max(worst, std::fabs(gpu.data()[i] - cpu.data()[i]));
+        if (worst > tol) std::cout << "         attention " << c.N << "x" << c.M << "x" << c.C << "/" << c.heads << ": max diff " << worst << "\n";
+        CHECK(worst <= tol);
         if (c.gpu) CHECK(direct.approxEquals(cpu, 1e-4f));
         // Hybrid: CPU device, attention alone on the GPU.
         setGpuAttention(true);
@@ -4225,6 +4235,39 @@ TEST(gpu_fused_attention_matches_cpu) {
         CHECK(multiHeadAttention(q, k, v, c.heads).approxEquals(cpu, 1e-4f));
         setGpuAttention(false);
     }
+    setGpuMinWork(saved);
+}
+
+TEST(gpu_attention_kernels_agree_and_repeat) {
+    if (!gpuAvailable()) return;
+    setSeed(91);
+    const std::size_t saved = gpuMinWork();
+    setGpuMinWork(1);
+    setDevice(Device::GPU);
+    // Both kernels (simdgroup only where the simdgroup GEMM runs), several threadgroups per head, ragged
+    // sizes, repeated: a race between lanes shows up as rows that change from run to run.
+    for (const char* kernel : {"scalar", "simdgroup"}) {
+        setGpuAttentionKernel(kernel);
+        if (gpuAttentionKernel(40) != kernel) continue;
+        for (std::size_t N : {32, 300})
+            for (std::size_t M : {16, 77, 300}) {
+                const std::size_t C = 320, heads = 8;
+                const Matrix q = Matrix::uniform(N, C, -2, 2), k = Matrix::uniform(M, C, -2, 2), v = Matrix::uniform(M, C, -1, 1);
+                setDevice(Device::CPU);
+                const Matrix cpu = multiHeadAttention(q, k, v, heads);
+                setDevice(Device::GPU);
+                for (int run = 0; run < 3; ++run) {
+                    Matrix out(N, C);
+                    CHECK(gpuAttention(q, k, v, heads, out));
+                    std::size_t bad = 0;
+                    for (std::size_t i = 0; i < out.size(); ++i) bad += std::fabs(out.data()[i] - cpu.data()[i]) > 1e-4f;
+                    if (bad) std::cout << "         " << kernel << " N=" << N << " M=" << M << " run " << run << ": " << bad << " wrong\n";
+                    CHECK(bad == 0);
+                }
+            }
+    }
+    setGpuAttentionKernel("");
+    setDevice(Device::CPU);
     setGpuMinWork(saved);
 }
 

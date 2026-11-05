@@ -572,7 +572,17 @@ preprocessor; IoU 0.99 with OpenCV's edges). Above: the snowy cabin's edges
 text to image, image to image and text / video to video (`--control-dir`, or
 `--canny` alone with `--init-dir` to take the edges of the input clip).
 
-V2V_SAMPLE
+```
+$ ./build_and_run.sh video data/animatediff t2v "a golden retriever puppy standing on a beach at sunset, photo" \
+      --init-dir corgi_frames/ --strength 0.75 --controlnet data/controlnet-canny --canny --control-scale 0.8 --size 384
+```
+
+<p><img src="docs/images/video_v2v.gif" width="384"></p>
+
+Above: the corgi clip (left) restyled frame by frame with its own canny
+edges as ControlNet input (right): the motion and outline follow the
+source, the light and colours follow the prompt (16 frames at 384 x 384,
+3 steps with ControlNet on every frame: 17 minutes on the 2-core machine).
 
 **Output formats**, all written by the library itself: `.gif` (`saveGif`,
 256 colours, plays everywhere), `.png` (`saveApng`, animated PNG, full

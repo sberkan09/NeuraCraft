@@ -219,32 +219,14 @@ struct TimeResnet {
     }
 };
 
-// diffusers Transformer2DModel with one BasicTransformerBlock: self-attention,
-// cross-attention to the text, GEGLU feed-forward; linear or 1x1 projections.
-struct CrossTransformer {
-    ImageShape shape;
-    std::size_t heads;
-    GroupNorm norm;
-    Dense projIn, projOut;
+// diffusers BasicTransformerBlock: self-attention, cross-attention to the text, GEGLU feed-forward.
+struct TransformerBlock {
     LayerNorm ln1, ln2, ln3;
     Dense q1, k1, v1, o1, q2, k2, v2, o2, ff1, ff2;
-    // IP-Adapter: a second key / value projection of image prompt tokens, attended next to the text.
-    std::unique_ptr<Dense> kIp, vIp;
-    const Matrix* ipTokens = nullptr;
-    float ipScale = 0.0f;
-
-    CrossTransformer(ImageShape s, std::size_t h, std::size_t contextDim, std::size_t groups)
-        : shape(s), heads(h), norm(s, groups, 1e-6f), projIn(s.channels, s.channels), projOut(s.channels, s.channels),
-          ln1(s.channels), ln2(s.channels), ln3(s.channels), q1(s.channels, s.channels), k1(s.channels, s.channels),
-          v1(s.channels, s.channels), o1(s.channels, s.channels), q2(s.channels, s.channels), k2(contextDim, s.channels),
-          v2(contextDim, s.channels), o2(s.channels, s.channels), ff1(s.channels, 8 * s.channels), ff2(4 * s.channels, s.channels) {}
-
-    void load(Weights& w, const std::string& p) {
-        const std::size_t C = shape.channels;
-        w.norm(norm, p + ".norm", C);
-        w.linear(projIn, p + ".proj_in");
-        w.linear(projOut, p + ".proj_out");
-        const std::string b = p + ".transformer_blocks.0";
+    TransformerBlock(std::size_t C, std::size_t contextDim)
+        : ln1(C), ln2(C), ln3(C), q1(C, C), k1(C, C), v1(C, C), o1(C, C), q2(C, C), k2(contextDim, C), v2(contextDim, C), o2(C, C),
+          ff1(C, 8 * C), ff2(4 * C, C) {}
+    void load(Weights& w, const std::string& b, std::size_t C) {
         w.layerNorm(ln1, b + ".norm1", C);
         w.layerNorm(ln2, b + ".norm2", C);
         w.layerNorm(ln3, b + ".norm3", C);
@@ -259,6 +241,33 @@ struct CrossTransformer {
         w.linear(ff1, b + ".ff.net.0.proj");
         w.linear(ff2, b + ".ff.net.2");
     }
+};
+
+// diffusers Transformer2DModel: GroupNorm, a linear or 1x1 projection in, `depth` BasicTransformerBlocks
+// (1 in SD 1.x / 2.x, up to 10 in SDXL), a projection out and the residual.
+struct CrossTransformer {
+    ImageShape shape;
+    std::size_t heads;
+    GroupNorm norm;
+    Dense projIn, projOut;
+    std::vector<std::unique_ptr<TransformerBlock>> blocks;
+    // IP-Adapter: a second key / value projection of image prompt tokens, attended next to the text.
+    std::unique_ptr<Dense> kIp, vIp;
+    const Matrix* ipTokens = nullptr;
+    float ipScale = 0.0f;
+
+    CrossTransformer(ImageShape s, std::size_t h, std::size_t contextDim, std::size_t groups, std::size_t depth = 1)
+        : shape(s), heads(h), norm(s, groups, 1e-6f), projIn(s.channels, s.channels), projOut(s.channels, s.channels) {
+        for (std::size_t d = 0; d < depth; ++d) blocks.push_back(std::make_unique<TransformerBlock>(s.channels, contextDim));
+    }
+
+    void load(Weights& w, const std::string& p) {
+        const std::size_t C = shape.channels;
+        w.norm(norm, p + ".norm", C);
+        w.linear(projIn, p + ".proj_in");
+        w.linear(projOut, p + ".proj_out");
+        for (std::size_t d = 0; d < blocks.size(); ++d) blocks[d]->load(w, p + ".transformer_blocks." + std::to_string(d), C);
+    }
     Matrix forward(const Matrix& x, const Matrix& context) { return forward(x, std::vector<const Matrix*>{&context}); }
     // x: B images (rows), each attending to its own context (contexts.size() == B) or all to one. The
     // linear layers see all B * HW tokens at once; attention stays within each image.
@@ -267,56 +276,59 @@ struct CrossTransformer {
         const std::size_t C = shape.channels, HW = shape.height * shape.width, B = x.rows();
         if (contexts.size() != 1 && contexts.size() != B) throw std::invalid_argument("CrossTransformer: one context per image, or one");
         Matrix h = projIn.forward(toTokens(norm.forward(x, false), C, HW), false);  // B*HW x C
-        Matrix a = ln1.forward(h, false);
+        for (auto& blk : blocks) block(*blk, h, contexts, B, HW, C);
+        Matrix out = fromTokens(projOut.forward(h, false), HW);
+        addInPlace(out, x);
+        return out;
+    }
+    void block(TransformerBlock& t, Matrix& h, const std::vector<const Matrix*>& contexts, std::size_t B, std::size_t HW, std::size_t C) {
+        Matrix a = t.ln1.forward(h, false);
         {
-            const Matrix q = q1.forward(a, false), k = k1.forward(a, false), v = v1.forward(a, false);
+            const Matrix q = t.q1.forward(a, false), k = t.k1.forward(a, false), v = t.v1.forward(a, false);
             if (B == 1) {
-                addInPlace(h, o1.forward(multiHeadAttention(q, k, v, heads), false));
+                addInPlace(h, t.o1.forward(multiHeadAttention(q, k, v, heads), false));
             } else {
                 Matrix att(B * HW, C);
                 for (std::size_t b = 0; b < B; ++b)
                     setRowBlock(att, b * HW, multiHeadAttention(rowBlock(q, b * HW, HW), rowBlock(k, b * HW, HW), rowBlock(v, b * HW, HW), heads));
-                addInPlace(h, o1.forward(att, false));
+                addInPlace(h, t.o1.forward(att, false));
             }
         }
-        a = ln2.forward(h, false);
+        a = t.ln2.forward(h, false);
         {
-            const Matrix q = q2.forward(a, false);
+            const Matrix q = t.q2.forward(a, false);
             Matrix att;
             if (contexts.size() == 1) {  // every query row attends to the same keys: one call for the batch
-                att = multiHeadAttention(q, k2.forward(*contexts[0], false), v2.forward(*contexts[0], false), heads);
+                att = multiHeadAttention(q, t.k2.forward(*contexts[0], false), t.v2.forward(*contexts[0], false), heads);
             } else {
                 att = Matrix(B * HW, C);
                 for (std::size_t b = 0; b < B; ++b)
-                    setRowBlock(att, b * HW, multiHeadAttention(rowBlock(q, b * HW, HW), k2.forward(*contexts[b], false),
-                                                                v2.forward(*contexts[b], false), heads));
+                    setRowBlock(att, b * HW, multiHeadAttention(rowBlock(q, b * HW, HW), t.k2.forward(*contexts[b], false),
+                                                                t.v2.forward(*contexts[b], false), heads));
             }
             if (kIp && ipTokens && ipScale != 0.0f) {
                 const Matrix ip = multiHeadAttention(q, kIp->forward(*ipTokens, false), vIp->forward(*ipTokens, false), heads);
                 for (std::size_t k = 0; k < att.size(); ++k) att.data()[k] += ipScale * ip.data()[k];
             }
-            addInPlace(h, o2.forward(att, false));
+            addInPlace(h, t.o2.forward(att, false));
         }
-        a = ln3.forward(h, false);
-        const Matrix g = ff1.forward(a, false);  // B*HW x 8C: [hidden | gate]
+        a = t.ln3.forward(h, false);
+        const Matrix g = t.ff1.forward(a, false);  // B*HW x 8C: [hidden | gate]
         Matrix geglu(B * HW, 4 * C);
         {
-        NC_PROFILE("geglu");
-        parallelFor(0, B * HW, 16, [&](std::size_t r0, std::size_t r1) {
-            for (std::size_t r = r0; r < r1; ++r) {
-                const float* row = g.data() + r * 8 * C;
-                float* o = geglu.data() + r * 4 * C;
-                const float* gate = row + 4 * C;
-                for (std::size_t j = 0; j < 4 * C; ++j) o[j] = gate[j] * 0.70710678118654752f;
-                erfArray(o, o, 4 * C);  // GELU(gate) = gate * (1 + erf(gate / sqrt 2)) / 2
-                for (std::size_t j = 0; j < 4 * C; ++j) o[j] = row[j] * 0.5f * gate[j] * (1.0f + o[j]);
-            }
-        });
+            NC_PROFILE("geglu");
+            parallelFor(0, B * HW, 16, [&](std::size_t r0, std::size_t r1) {
+                for (std::size_t r = r0; r < r1; ++r) {
+                    const float* row = g.data() + r * 8 * C;
+                    float* o = geglu.data() + r * 4 * C;
+                    const float* gate = row + 4 * C;
+                    for (std::size_t j = 0; j < 4 * C; ++j) o[j] = gate[j] * 0.70710678118654752f;
+                    erfArray(o, o, 4 * C);  // GELU(gate) = gate * (1 + erf(gate / sqrt 2)) / 2
+                    for (std::size_t j = 0; j < 4 * C; ++j) o[j] = row[j] * 0.5f * gate[j] * (1.0f + o[j]);
+                }
+            });
         }
-        addInPlace(h, ff2.forward(geglu, false));
-        Matrix out = fromTokens(projOut.forward(h, false), HW);
-        addInPlace(out, x);
-        return out;
+        addInPlace(h, t.ff2.forward(geglu, false));
     }
 };
 
@@ -515,6 +527,11 @@ struct UNet2DCondition::Impl {
     bool flipSinToCos = true;
     float freqShift = 0.0f;
     std::unique_ptr<Dense> t1, t2;
+    // SDXL's added conditions ("text_time"): pooled text embedding + size / crop numbers, embedded and
+    // added to the time embedding.
+    std::unique_ptr<Dense> add1, add2;
+    std::size_t addTimeDim = 0;
+    Matrix addedConditions;  // 1 x (pooled text + time ids * addTimeDim), set per call
     std::unique_ptr<Conv2D> convIn, convOut;
     std::vector<DownBlock> downs;
     std::unique_ptr<TimeResnet> mid1, mid2;
@@ -547,6 +564,39 @@ std::vector<CrossTransformer*> crossLayers(UNet2DCondition::Impl& m) {
     return out;
 }
 } // namespace
+
+namespace {
+// SiLU(time embedding [+ added conditions]): what every resnet's projection takes.
+Matrix timeEmbedding(UNet2DCondition::Impl& m, float timestep) {
+    Matrix temb = m.t1->forward(timestepEmbedding(timestep, m.timeDim, m.flipSinToCos, m.freqShift), false);
+    siluInPlace(temb);
+    temb = m.t2->forward(temb, false);
+    if (m.add1) {
+        if (m.addedConditions.empty()) throw std::logic_error("UNet2DCondition: this model needs setAddedConditions() (SDXL)");
+        Matrix a = m.add1->forward(m.addedConditions, false);
+        siluInPlace(a);
+        addInPlace(temb, m.add2->forward(a, false));
+    }
+    siluInPlace(temb);
+    return temb;
+}
+} // namespace
+
+bool UNet2DCondition::needsAddedConditions() const { return impl_->add1 != nullptr; }
+
+void UNet2DCondition::setAddedConditions(const Matrix& textEmbeds, const std::vector<float>& timeIds) {
+    Impl& m = *impl_;
+    if (!m.add1) throw std::logic_error("UNet2DCondition::setAddedConditions: the model takes none");
+    std::vector<float> v(textEmbeds.data(), textEmbeds.data() + textEmbeds.size());
+    for (float id : timeIds) {
+        const Matrix e = timestepEmbedding(id, m.addTimeDim, m.flipSinToCos, m.freqShift);
+        v.insert(v.end(), e.data(), e.data() + e.size());
+    }
+    if (v.size() != m.add1->inputSize())
+        throw std::invalid_argument("UNet2DCondition::setAddedConditions: got " + std::to_string(v.size()) + " values, expected " +
+                                    std::to_string(m.add1->inputSize()));
+    m.addedConditions = Matrix(1, v.size(), std::move(v));
+}
 
 UNet2DCondition::UNet2DCondition() = default;
 UNet2DCondition::~UNet2DCondition() = default;
@@ -590,10 +640,7 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
         }
         return out;
     }
-    Matrix temb = m.t1->forward(timestepEmbedding(timestep, m.timeDim, m.flipSinToCos, m.freqShift), false);
-    siluInPlace(temb);
-    temb = m.t2->forward(temb, false);
-    siluInPlace(temb);
+    const Matrix temb = timeEmbedding(m, timestep);  // SiLU applied: every resnet starts with it
 
     // Spatial layers take the frames in batches of about 2M values (several frames at the low
     // resolutions), so their products have enough rows for the GEMM path and weights are read
@@ -755,10 +802,7 @@ ControlResiduals UNet2DCondition::control(const Matrix& latent, float timestep, 
     if (!m.controlNet) throw std::logic_error("UNet2DCondition::control: not a ControlNet");
     if (latent.rows() != 1 || latent.cols() != m.latent.size())
         throw std::invalid_argument("UNet2DCondition::control: expected a 1 x " + std::to_string(m.latent.size()) + " latent");
-    Matrix temb = m.t1->forward(timestepEmbedding(timestep, m.timeDim, m.flipSinToCos, m.freqShift), false);
-    siluInPlace(temb);
-    temb = m.t2->forward(temb, false);
-    siluInPlace(temb);
+    const Matrix temb = timeEmbedding(m, timestep);  // SiLU applied: every resnet starts with it
     Matrix h = m.convIn->forward(latent, false);
     if (!embedding.sameShape(h)) throw std::invalid_argument("UNet2DCondition::control: embedding does not match (use controlEmbedding)");
     addInPlace(h, embedding);
@@ -794,10 +838,7 @@ Matrix UNet2DCondition::forward(const Matrix& latent, float timestep, const Matr
         throw std::invalid_argument("UNet2DCondition::forward: expected a 1 x " + std::to_string(m.latent.size()) + " latent");
     if (context.cols() != m.contextDim)
         throw std::invalid_argument("UNet2DCondition::forward: context must have " + std::to_string(m.contextDim) + " columns");
-    Matrix temb = m.t1->forward(timestepEmbedding(timestep, m.timeDim, m.flipSinToCos, m.freqShift), false);
-    siluInPlace(temb);
-    temb = m.t2->forward(temb, false);
-    siluInPlace(temb);  // every resnet applies SiLU before its projection
+    const Matrix temb = timeEmbedding(m, timestep);  // SiLU applied: every resnet starts with it
 
     Matrix h = m.convIn->forward(latent, false);
     std::vector<Matrix> skips{h};
@@ -860,11 +901,11 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
             throw std::runtime_error(std::string("loadUNet: ") + key + " is not supported");
     };
     unsupported("class_embed_type", [](const json::Value&) { return false; });
-    unsupported("addition_embed_type", [](const json::Value&) { return false; });
+    unsupported("addition_embed_type", [](const json::Value& v) { return v.string == "text_time"; });
     unsupported("time_cond_proj_dim", [](const json::Value&) { return false; });
     unsupported("resnet_time_scale_shift", [](const json::Value& v) { return v.string == "default"; });
     unsupported("time_embedding_type", [](const json::Value& v) { return v.string == "positional"; });
-    unsupported("transformer_layers_per_block", [](const json::Value& v) { return v.isNumber() && v.number == 1; });
+    unsupported("transformer_layers_per_block", [](const json::Value& v) { return v.isNumber() || v.isArray(); });
     unsupported("act_fn", [](const json::Value& v) { return v.string == "silu"; });
     unsupported("mid_block_type", [](const json::Value& v) { return v.string == "UNetMidBlock2DCrossAttn"; });
 
@@ -882,6 +923,16 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
     const bool control = c.find("_class_name") && c.at("_class_name").string == "ControlNetModel";
     const std::vector<std::string> downTypes = strings("down_block_types");
     const std::vector<std::string> upTypes = control ? downTypes : strings("up_block_types");
+    // Transformer blocks per attention: one number, or one per level (SDXL: 1, 2, 10); up blocks mirror it.
+    std::vector<std::size_t> depth(ch.size(), 1);
+    if (const json::Value* t = c.find("transformer_layers_per_block"); t && t->type != json::Value::Type::Null) {
+        if (t->isNumber()) depth.assign(ch.size(), static_cast<std::size_t>(t->number));
+        else {
+            depth.clear();
+            for (const auto& e : t->array) depth.push_back(static_cast<std::size_t>(e.number));
+        }
+        if (depth.size() != ch.size()) throw std::runtime_error("loadUNet: transformer_layers_per_block disagrees with block_out_channels");
+    }
     if (heads.size() != ch.size() || downTypes.size() != ch.size() || upTypes.size() != ch.size())
         throw std::runtime_error("loadUNet: block lists disagree in length");
     const std::size_t factor = std::size_t(1) << (ch.size() - 1);
@@ -908,6 +959,14 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
     w.linear(*m.t1, "time_embedding.linear_1");
     m.t2 = std::make_unique<Dense>(tembDim, tembDim);
     w.linear(*m.t2, "time_embedding.linear_2");
+    if (const json::Value* a = c.find("addition_embed_type"); a && a->isString() && a->string == "text_time") {
+        m.addTimeDim = static_cast<std::size_t>(c.at("addition_time_embed_dim").number);
+        const std::size_t in = static_cast<std::size_t>(c.at("projection_class_embeddings_input_dim").number);
+        m.add1 = std::make_unique<Dense>(in, tembDim);
+        w.linear(*m.add1, "add_embedding.linear_1");
+        m.add2 = std::make_unique<Dense>(tembDim, tembDim);
+        w.linear(*m.add2, "add_embedding.linear_2");
+    }
     m.convIn = std::make_unique<Conv2D>(m.latent, ch[0], 3, 1, 1);
     w.conv(*m.convIn, "conv_in");
 
@@ -925,7 +984,7 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
             s.channels = ch[i];
             m.downShapes.back().push_back(s);
             if (cross) {
-                d.attentions.push_back(std::make_unique<CrossTransformer>(s, heads[i], ctx, groups));
+                d.attentions.push_back(std::make_unique<CrossTransformer>(s, heads[i], ctx, groups, depth[i]));
                 d.attentions.back()->load(w, p + ".attentions." + std::to_string(j));
             }
             skipChannels.push_back(s.channels);
@@ -940,7 +999,7 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
     }
     m.mid1 = std::make_unique<TimeResnet>(s, s.channels, tembDim, groups, eps);
     m.mid1->load(w, "mid_block.resnets.0");
-    m.midAttention = std::make_unique<CrossTransformer>(s, heads.back(), ctx, groups);
+    m.midAttention = std::make_unique<CrossTransformer>(s, heads.back(), ctx, groups, depth.back());
     m.midAttention->load(w, "mid_block.attentions.0");
     m.mid2 = std::make_unique<TimeResnet>(s, s.channels, tembDim, groups, eps);
     m.mid2->load(w, "mid_block.resnets.1");
@@ -1002,7 +1061,7 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
             s.channels = out;
             m.upShapes.back().push_back(s);
             if (cross) {
-                u.attentions.push_back(std::make_unique<CrossTransformer>(s, heads[ch.size() - 1 - i], ctx, groups));
+                u.attentions.push_back(std::make_unique<CrossTransformer>(s, heads[ch.size() - 1 - i], ctx, groups, depth[ch.size() - 1 - i]));
                 u.attentions.back()->load(w, p + ".attentions." + std::to_string(j));
             }
         }
@@ -1200,9 +1259,10 @@ std::string loraKey(const std::vector<Lora>& loras) {
     return k;
 }
 
-std::shared_ptr<ClipTextEncoder> textEncoder(const std::string& dir, bool int8, const std::vector<Lora>& loras) {
-    return cachedModel<ClipTextEncoder>("clip|" + modelTag(dir) + (int8 ? "|int8" : "") + loraKey(loras), modelTag(dir),
-                                        [&] { return std::make_shared<ClipTextEncoder>(loadClipTextEncoder(dir, int8, loras)); });
+std::shared_ptr<ClipTextEncoder> textEncoder(const std::string& dir, bool int8, const std::vector<Lora>& loras,
+                                             const std::string& which = "text_encoder") {
+    return cachedModel<ClipTextEncoder>("clip|" + which + "|" + modelTag(dir) + (int8 ? "|int8" : "") + loraKey(loras), modelTag(dir),
+                                        [&] { return std::make_shared<ClipTextEncoder>(loadClipTextEncoder(dir, int8, loras, which)); });
 }
 
 // The denoising UNet for width x height pictures, with motion modules and / or an IP-Adapter merged in.
@@ -1240,16 +1300,62 @@ std::shared_ptr<TinyVae> tinyVaeModel(const std::string& dir, std::size_t width,
 }
 
 // CLIP hidden states of the prompt (and of the negative prompt when guided).
-std::pair<Matrix, Matrix> encodePrompts(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
+// What the UNet is conditioned on: the text hidden states for the prompt and the negative prompt, and
+// for SDXL the pooled text embeddings and the size numbers too.
+struct Conditioning {
+    Matrix cond, uncond;
+    Matrix pooled, pooledUncond;
+    std::vector<float> timeIds;
+};
+
+// CLIP hidden states of the prompt (and of the negative prompt when guided).
+Conditioning encodePrompts(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
     const auto t = PipelineClock::now();
+    Conditioning out;
+    if (isSdxlModel(dir)) {
+        // SDXL: the penultimate states of CLIP-L (768) and OpenCLIP bigG (1280) side by side, the pooled bigG
+        // embedding, and the size numbers (no crop). An empty negative prompt is all zeros, as the base model expects.
+        const ClipTokenizer tok1 = ClipTokenizer::fromDirectory(tokenizerDirectory(dir)), tok2 = ClipTokenizer::fromDirectory(secondTokenizerDirectory(dir));
+        const int pad1 = padsWithExclamation(dir) ? 0 : tok1.endOfText(), pad2 = secondPadsWithExclamation(dir) ? 0 : tok2.endOfText();
+        auto both = [&](const std::string& text, Matrix& hidden, Matrix& pooled) {
+            Matrix h1;
+            {
+                const auto e1 = textEncoder(dir, o.int8, o.loras, "text_encoder");
+                h1 = e1->encodePenultimate(tok1.encodeForModel(text, e1->length, pad1)).hidden;
+            }
+            const auto e2 = textEncoder(dir, o.int8, o.loras, "text_encoder_2");
+            if (e2->projection.empty()) throw std::runtime_error("SDXL: the second text encoder has no text_projection");
+            ClipTextEncoder::Penultimate p2 = e2->encodePenultimate(tok2.encodeForModel(text, e2->length, pad2));
+            if (h1.rows() != p2.hidden.rows()) throw std::runtime_error("SDXL: the text encoders disagree in length");
+            hidden = Matrix(h1.rows(), h1.cols() + p2.hidden.cols());
+            for (std::size_t r = 0; r < h1.rows(); ++r) {
+                std::copy(h1.data() + r * h1.cols(), h1.data() + (r + 1) * h1.cols(), hidden.data() + r * hidden.cols());
+                std::copy(p2.hidden.data() + r * p2.hidden.cols(), p2.hidden.data() + (r + 1) * p2.hidden.cols(),
+                          hidden.data() + r * hidden.cols() + h1.cols());
+            }
+            pooled = std::move(p2.pooled);
+        };
+        both(prompt, out.cond, out.pooled);
+        if (o.guidance > 1.0f) {
+            if (o.negativePrompt.empty()) {
+                out.uncond = Matrix(out.cond.rows(), out.cond.cols());
+                out.pooledUncond = Matrix(1, out.pooled.cols());
+            } else {
+                both(o.negativePrompt, out.uncond, out.pooledUncond);
+            }
+        }
+        const float h = static_cast<float>(o.height), w = static_cast<float>(o.width);
+        out.timeIds = {h, w, 0.0f, 0.0f, h, w};
+        reportStage(o, "text encoder", t);
+        return out;
+    }
     const ClipTokenizer tok = ClipTokenizer::fromDirectory(tokenizerDirectory(dir));
     const std::shared_ptr<ClipTextEncoder> encHold = textEncoder(dir, o.int8, o.loras);
     ClipTextEncoder& enc = *encHold;
     // SD 2 / Turbo pad with "!" (id 0); SD 1.x pads with <|endoftext|>.
     const int pad = padsWithExclamation(dir) ? 0 : tok.endOfText();
-    std::pair<Matrix, Matrix> out;
-    out.first = enc.encode(tok.encodeForModel(prompt, enc.length, pad));
-    if (o.guidance > 1.0f) out.second = enc.encode(tok.encodeForModel(o.negativePrompt, enc.length, pad));
+    out.cond = enc.encode(tok.encodeForModel(prompt, enc.length, pad));
+    if (o.guidance > 1.0f) out.uncond = enc.encode(tok.encodeForModel(o.negativePrompt, enc.length, pad));
     reportStage(o, "text encoder", t);
     return out;
 }
@@ -1282,7 +1388,7 @@ EulerScheduler schedulerFor(const std::string& dir, std::size_t steps, const std
 }
 
 // Runs the scheduler's steps [first, end) on `latent` with the UNet.
-void denoise(const std::string& dir, const std::pair<Matrix, Matrix>& context, const EulerScheduler& sched, std::size_t first,
+void denoise(const std::string& dir, const Conditioning& context, const EulerScheduler& sched, std::size_t first,
              Matrix& latent, const TextToImageOptions& o) {
     std::pair<Matrix, Matrix> ipTokens;
     if (!o.ipAdapter.empty()) ipTokens = imagePromptTokens(o.ipAdapter, o.imageEncoder, o.imagePrompt, o);
@@ -1315,10 +1421,14 @@ void denoise(const std::string& dir, const std::pair<Matrix, Matrix>& context, c
         const float scale = static_cast<float>(sched.inputScale(i));
         for (float& v : in.values()) v *= scale;
         if (unet.hasImagePrompt()) unet.setImagePrompt(ipTokens.first, o.ipScale);
-        Matrix eps = predict(in, static_cast<float>(sched.timesteps[i]), context.first);
+        if (unet.needsAddedConditions()) unet.setAddedConditions(context.pooled, context.timeIds);
+        if (controlNetPtr && controlNetPtr->needsAddedConditions()) controlNetPtr->setAddedConditions(context.pooled, context.timeIds);
+        Matrix eps = predict(in, static_cast<float>(sched.timesteps[i]), context.cond);
         if (o.guidance > 1.0f) {
             if (unet.hasImagePrompt()) unet.setImagePrompt(ipTokens.second, o.ipScale);
-            const Matrix uncond = predict(in, static_cast<float>(sched.timesteps[i]), context.second);
+            if (unet.needsAddedConditions()) unet.setAddedConditions(context.pooledUncond, context.timeIds);
+            if (controlNetPtr && controlNetPtr->needsAddedConditions()) controlNetPtr->setAddedConditions(context.pooledUncond, context.timeIds);
+            const Matrix uncond = predict(in, static_cast<float>(sched.timesteps[i]), context.uncond);
             for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + o.guidance * (eps.data()[k] - uncond.data()[k]);
         }
         if (o.preview) reportPreview(o, latent.data(), eps.data(), sched.sigmas[i], unet.latentShape().channels);
@@ -1388,6 +1498,7 @@ Image textToImage(const std::string& dir, const std::string& prompt, const TextT
 // ---- Text to video (AnimateDiff) -------------------------------------------------------------------
 
 std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt, const TextToVideoOptions& v) {
+    if (isSdxlModel(dir)) throw std::invalid_argument("textToVideo: AnimateDiff needs an SD 1.x model, not SDXL");
     TextToImageOptions o;
     o.width = v.width;
     o.height = v.height;
@@ -1597,6 +1708,7 @@ struct StableDiffusion::Impl {
 };
 
 StableDiffusion::StableDiffusion(const std::string& dir, const TextToImageOptions& o, bool withEncoder) : impl_(std::make_unique<Impl>()) {
+    if (isSdxlModel(dir)) throw std::invalid_argument("morph / zoom / outpaint: SD 1.x / 2.x models only for now (not SDXL)");
     checkSize(o);
     Impl& m = *impl_;
     m.dir = dir;

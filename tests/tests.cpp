@@ -2395,7 +2395,7 @@ TEST(unet_loader_builds_and_conditions_on_text_and_time) {
     CHECK_THROWS(unet.forward(z, 1.0f, Matrix(5, 7)), std::invalid_argument);
     CHECK_THROWS(loadUNet(dir, 3, 6), std::invalid_argument);  // latent sides must be multiples of 2
     std::string cfg = loadText(dir + "/unet/config.json");
-    cfg.insert(1, R"("addition_embed_type":"text_time",)");
+    cfg.insert(1, R"("addition_embed_type":"text_image",)");
     std::ofstream(dir + "/unet/config.json") << cfg;
     CHECK_THROWS(loadUNet(dir, 4, 6), std::runtime_error);  // SDXL-style conditioning is refused
     std::filesystem::remove_all(dir);
@@ -3402,6 +3402,173 @@ TEST(animatediff_motion_modules_and_text_to_video) {
     CHECK_THROWS(textToVideo(dir, "hello", o), std::exception);
     std::filesystem::remove_all(dir);
     std::filesystem::remove_all(tok);
+}
+
+namespace {
+// A tiny CLIP text encoder (diffusers names); with projection > 0, a CLIPTextModelWithProjection.
+std::map<std::string, Matrix> tinyClipWeights(std::size_t D, std::size_t layers, std::size_t projection) {
+    std::map<std::string, Matrix> w;
+    const std::string p = "text_model.";
+    addTensor(w, p + "embeddings.token_embedding.weight", 518 * D, -1, 1);
+    addTensor(w, p + "embeddings.position_embedding.weight", 8 * D, -1, 1);
+    for (std::size_t i = 0; i < layers; ++i) {
+        const std::string l = p + "encoder.layers." + std::to_string(i) + ".";
+        for (const char* n : {"layer_norm1", "layer_norm2"}) {
+            addTensor(w, l + n + ".weight", D, 0.8f, 1.2f);
+            addTensor(w, l + n + ".bias", D, -0.1f, 0.1f);
+        }
+        for (const char* n : {"q_proj", "k_proj", "v_proj", "out_proj"}) {
+            addTensor(w, l + "self_attn." + n + ".weight", D * D, -0.4f, 0.4f);
+            addTensor(w, l + "self_attn." + n + ".bias", D, -0.1f, 0.1f);
+        }
+        addTensor(w, l + "mlp.fc1.weight", 2 * D * D, -0.4f, 0.4f);
+        addTensor(w, l + "mlp.fc1.bias", 2 * D, -0.1f, 0.1f);
+        addTensor(w, l + "mlp.fc2.weight", 2 * D * D, -0.4f, 0.4f);
+        addTensor(w, l + "mlp.fc2.bias", D, -0.1f, 0.1f);
+    }
+    addTensor(w, p + "final_layer_norm.weight", D, 0.8f, 1.2f);
+    addTensor(w, p + "final_layer_norm.bias", D, -0.1f, 0.1f);
+    if (projection) w["text_projection.weight"] = Matrix::uniform(projection, D, -0.5f, 0.5f);
+    return w;
+}
+
+// A tiny SDXL folder: two text encoders (6 + 8 = 14 context channels, the second pooled to 5), a UNet with
+// two transformer blocks in its attention level and the "text_time" added conditions.
+std::string writeTinySdxl(const std::string& name) {
+    std::string tok;
+    const std::string dir = writeTinyStableDiffusion(name, tok);  // tokenizer, vae, scheduler
+    std::filesystem::remove_all(dir + "/unet");
+    std::filesystem::create_directories(dir + "/tokenizer_2");
+    for (const char* f : {"vocab.json", "merges.txt", "tokenizer_config.json"})
+        std::filesystem::copy_file(dir + "/tokenizer/" + f, dir + "/tokenizer_2/" + f, std::filesystem::copy_options::overwrite_existing);
+    std::ofstream(dir + "/tokenizer/tokenizer_config.json") << R"({"pad_token":"<|endoftext|>"})";
+    auto clip = [&](const std::string& sub, std::size_t D, std::size_t P) {
+        std::filesystem::create_directories(dir + "/" + sub);
+        std::ofstream(dir + "/" + sub + "/config.json") << R"({"hidden_act":"gelu","vocab_size":518,"hidden_size":)" << D
+            << R"(,"num_attention_heads":2,"intermediate_size":)" << 2 * D << R"(,"num_hidden_layers":2,"max_position_embeddings":8)"
+            << (P ? R"(,"projection_dim":)" + std::to_string(P) : std::string()) << "}";
+        saveAll(dir + "/" + sub + "/model.safetensors", tinyClipWeights(D, 2, P));
+    };
+    clip("text_encoder", 6, 0);
+    clip("text_encoder_2", 8, 5);
+    std::filesystem::create_directories(dir + "/unet");
+    std::ofstream(dir + "/unet/config.json")
+        << R"({"_class_name":"UNet2DConditionModel","act_fn":"silu","attention_head_dim":[2,2],"block_out_channels":[8,16],)"
+        << R"("cross_attention_dim":14,"down_block_types":["CrossAttnDownBlock2D","DownBlock2D"],"flip_sin_to_cos":true,)"
+        << R"("freq_shift":0,"in_channels":4,"layers_per_block":1,"mid_block_type":"UNetMidBlock2DCrossAttn","norm_eps":1e-5,)"
+        << R"("norm_num_groups":4,"out_channels":4,"up_block_types":["UpBlock2D","CrossAttnUpBlock2D"],"use_linear_projection":true,)"
+        << R"("transformer_layers_per_block":[2,1],"addition_embed_type":"text_time","addition_time_embed_dim":4,)"
+        << R"("projection_class_embeddings_input_dim":29})";
+    std::map<std::string, Matrix> w = tinyUNetWeights({8, 16}, 1, 14);
+    std::vector<std::pair<std::string, Matrix>> extra;
+    for (const auto& [n, m] : w) {
+        const std::size_t at = n.find(".transformer_blocks.0.");
+        if (at != std::string::npos && n.rfind("mid_block", 0) != 0)  // a second block in the level-0 attentions
+            extra.emplace_back(n.substr(0, at) + ".transformer_blocks.1." + n.substr(at + 22), Matrix::uniform(1, m.size(), -0.3f, 0.3f));
+    }
+    for (auto& [n, m] : extra) w[n] = std::move(m);
+    addTensor(w, "add_embedding.linear_1.weight", 32 * 29, -0.3f, 0.3f);
+    addTensor(w, "add_embedding.linear_1.bias", 32, -0.1f, 0.1f);
+    addTensor(w, "add_embedding.linear_2.weight", 32 * 32, -0.3f, 0.3f);
+    addTensor(w, "add_embedding.linear_2.bias", 32, -0.1f, 0.1f);
+    saveAll(dir + "/unet/diffusion_pytorch_model.safetensors", w);
+    std::filesystem::remove_all(tok);
+    return dir;
+}
+} // namespace
+
+TEST(sdxl_pipeline_with_two_text_encoders_and_added_conditions) {
+    setSeed(31);
+    const std::string dir = writeTinySdxl("sdxl_tiny");
+    CHECK(isSdxlModel(dir));
+    // The UNet needs the added conditions, and they change its prediction.
+    {
+        UNet2DCondition unet = loadUNet(dir, 4, 4);
+        CHECK(unet.needsAddedConditions());
+        const Matrix z = Matrix::uniform(1, 4 * 16, -1, 1), ctx = Matrix::uniform(8, 14, -1, 1);
+        CHECK_THROWS(unet.forward(z, 500.0f, ctx), std::logic_error);
+        unet.setAddedConditions(Matrix::uniform(1, 5, -1, 1), {64, 64, 0, 0, 64, 64});
+        const Matrix a = unet.forward(z, 500.0f, ctx);
+        unet.setAddedConditions(Matrix::uniform(1, 5, -1, 1), {64, 64, 0, 0, 64, 64});
+        CHECK(!unet.forward(z, 500.0f, ctx).approxEquals(a, 1e-5f));
+        CHECK_THROWS(unet.setAddedConditions(Matrix(1, 4), {1, 2, 3, 4, 5, 6}), std::invalid_argument);
+    }
+    // The second encoder pools the end-of-text state through its projection.
+    {
+        ClipTextEncoder e2 = loadClipTextEncoder(dir, false, {}, "text_encoder_2");
+        CHECK(e2.projection.rows() == 8 && e2.projection.cols() == 5);
+        const ClipTextEncoder::Penultimate p = e2.encodePenultimate({5, 9, 7, 0, 0, 0, 0, 0});
+        CHECK(p.hidden.rows() == 8 && p.hidden.cols() == 8 && p.pooled.cols() == 5);
+        CHECK(!p.hidden.approxEquals(e2.encode({5, 9, 7, 0, 0, 0, 0, 0}), 1e-4f));  // not the last, normed states
+    }
+    TextToImageOptions o;
+    o.width = o.height = 64;
+    o.steps = 2;
+    o.seed = 4;
+    o.guidance = 2.0f;  // the empty negative prompt is zeros
+    const Image a = textToImage(dir, "hello he", o);
+    CHECK(a.width == 64 && textToImage(dir, "hello he", o).pixels == a.pixels);
+    CHECK(textToImage(dir, "hello", o).pixels != a.pixels);
+    o.width = 128;  // the size numbers follow the picture
+    CHECK(textToImage(dir, "hello he", o).width == 128);
+    o.width = 64;
+    CHECK(imageToImage(dir, a, "hello", o).pixels.size() == a.pixels.size());
+
+    // The same model as one SDXL file: conditioner.embedders.0 (CLIP-L names) and .1 (OpenCLIP, x @ P projection), label_emb.
+    std::map<std::string, Matrix> all;
+    for (auto& [n, m] : loadAllTensors(dir + "/unet/diffusion_pytorch_model.safetensors")) {
+        if (n.rfind("add_embedding.linear_1.", 0) == 0) all["model.diffusion_model.label_emb.0.0." + n.substr(23)] = m;
+        else if (n.rfind("add_embedding.linear_2.", 0) == 0) all["model.diffusion_model.label_emb.0.2." + n.substr(23)] = m;
+        else all[ldmUnetName(n, 1, {false, true})] = m;
+    }
+    for (auto& [n, m] : loadAllTensors(dir + "/vae/diffusion_pytorch_model.safetensors")) all[ldmVaeName(n, 4)] = m;
+    for (auto& [n, m] : loadAllTensors(dir + "/text_encoder/model.safetensors")) all["conditioner.embedders.0.transformer." + n] = m;
+    {
+        const auto t = loadAllTensors(dir + "/text_encoder_2/model.safetensors");
+        const std::string P = "conditioner.embedders.1.model.", T = "text_model.";
+        all[P + "token_embedding.weight"] = t.at(T + "embeddings.token_embedding.weight");
+        all[P + "positional_embedding"] = t.at(T + "embeddings.position_embedding.weight");
+        all[P + "ln_final.weight"] = t.at(T + "final_layer_norm.weight");
+        all[P + "ln_final.bias"] = t.at(T + "final_layer_norm.bias");
+        { const Matrix& tp = t.at("text_projection.weight"); all[P + "text_projection"] = Matrix(5, 8, std::vector<float>(tp.data(), tp.data() + tp.size())).transpose(); }
+        for (int layer = 0; layer < 2; ++layer) {
+            const std::string R = P + "transformer.resblocks." + std::to_string(layer) + ".", L = T + "encoder.layers." + std::to_string(layer) + ".";
+            std::vector<float> wv, bv;
+            for (const char* k : {"q_proj", "k_proj", "v_proj"}) {
+                const Matrix& a1 = t.at(L + "self_attn." + k + ".weight");
+                const Matrix& b1 = t.at(L + "self_attn." + k + ".bias");
+                wv.insert(wv.end(), a1.values().begin(), a1.values().end());
+                bv.insert(bv.end(), b1.values().begin(), b1.values().end());
+            }
+            all[R + "attn.in_proj_weight"] = Matrix(1, wv.size(), std::move(wv));
+            all[R + "attn.in_proj_bias"] = Matrix(1, bv.size(), std::move(bv));
+            const std::vector<std::pair<std::string, std::string>> map = {{"ln_1.", "layer_norm1."}, {"ln_2.", "layer_norm2."},
+                {"attn.out_proj.", "self_attn.out_proj."}, {"mlp.c_fc.", "mlp.fc1."}, {"mlp.c_proj.", "mlp.fc2."}};
+            for (const auto& [to, from] : map)
+                for (const char* wb : {"weight", "bias"}) all[R + to + wb] = t.at(L + from + wb);
+        }
+    }
+    const std::string ckdir = tempPath("sdxl_single");
+    std::filesystem::create_directories(ckdir + "/tokenizer");
+    for (const char* f : {"vocab.json", "merges.txt"})
+        std::filesystem::copy_file(dir + "/tokenizer/" + f, ckdir + "/tokenizer/" + f, std::filesystem::copy_options::overwrite_existing);
+    const std::string file = ckdir + "/xl.safetensors";
+    saveAll(file, all);
+    std::ofstream(ckdir + "/xl.json") << R"({"unet": {"attention_head_dim": [2, 2], "norm_num_groups": 4, "addition_time_embed_dim": 4},
+        "vae": {"norm_num_groups": 4, "scaling_factor": 0.18215}, "text_encoder": {"num_attention_heads": 2, "hidden_act": "gelu"},
+        "text_encoder_2": {"num_attention_heads": 2}, "scheduler": {"beta_schedule": "scaled_linear", "timestep_spacing": "trailing"}})";
+    const CheckpointInfo info = inspectCheckpoint(file);
+    CHECK(info.family == "sdxl" && info.contextDim == 14 && isSdxlModel(file));
+    const ModelComponent u = modelComponent(file, "unet", "test");
+    CHECK(u.config.at("transformer_layers_per_block").array[0].number == 2 && u.config.at("addition_embed_type").string == "text_time");
+    CHECK(u.config.at("projection_class_embeddings_input_dim").number == 29);
+    CHECK(textToImage(file, "hello he", o).pixels == a.pixels);
+    bool listed = false;
+    for (const ModelInfo& m : findModels(ckdir))
+        if (m.path == file) listed = m.kind == "sdxl";
+    CHECK(listed);
+    std::filesystem::remove_all(ckdir);
+    std::filesystem::remove_all(dir);
 }
 
 TEST(lora_merging_and_lcm_sampler) {

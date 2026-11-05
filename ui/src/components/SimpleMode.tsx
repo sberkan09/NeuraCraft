@@ -82,7 +82,7 @@ function FormInput(props: { f: FormField; value: unknown; onChange(v: unknown): 
         </div>
       );
     case "model": {
-      const list = props.engine.models.filter((m) => m.kind === f.model);
+      const list = props.engine.models.filter((m) => m.kind === f.model || (f.alsoModels ?? []).includes(m.kind));
       return (
         <div className="field">
           {label}

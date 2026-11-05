@@ -76,14 +76,15 @@ export function FieldInput(props: {
         </div>
       );
     case "model": {
-      const options = props.models.filter((m) => m.kind === f.model || (f.model === "sd" && m.kind === "sd-inpaint"));
+      // SD fields also list inpainting and SDXL models (the engine says which steps cannot use them).
+      const options = props.models.filter((m) => m.kind === f.model || (f.model === "sd" && (m.kind === "sd-inpaint" || m.kind === "sdxl")));
       const known = options.some((m) => m.path === value);
       return (
         <div className="field">
           {label}
           <select id={id} className="input" value={unset ? "" : String(value)} onChange={(e) => onChange(e.target.value || undefined)}>
             <option value="">{f.required ? "seç…" : "— yok —"}</option>
-            {options.map((m) => <option key={m.path} value={m.path}>{m.path} · {formatBytes(m.bytes)}</option>)}
+            {options.map((m) => <option key={m.path} value={m.path}>{m.path}{m.kind === "sdxl" ? " (SDXL)" : ""} · {formatBytes(m.bytes)}</option>)}
             {!unset && !known ? <option value={String(value)}>{String(value)}</option> : null}
           </select>
         </div>

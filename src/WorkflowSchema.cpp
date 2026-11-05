@@ -205,6 +205,7 @@ std::string folderKind(const std::filesystem::path& dir) {
     namespace fs = std::filesystem;
     std::error_code ec;
     if (fs::exists(dir / "model_index.json", ec) || fs::exists(dir / "unet" / "config.json", ec)) {
+        if (fs::exists(dir / "text_encoder_2" / "config.json", ec)) return "sdxl";
         try {
             const json::Value c = json::parse(readText(dir / "unet" / "config.json"));
             if (c.numberOr("in_channels", 4) == 9) return "sd-inpaint";
@@ -240,7 +241,8 @@ std::string fileKind(const std::filesystem::path& file) {
         const SafeTensors st(file.string());
         if (st.has("model.diffusion_model.input_blocks.0.0.weight")) {  // a single-file Stable Diffusion checkpoint
             const CheckpointInfo info = inspectCheckpoint(file.string());
-            if (info.family != "sd1" && info.family != "sd2") return "";  // SDXL and others are not supported yet
+            if (info.family == "sdxl") return info.inChannels == 9 ? "" : "sdxl";
+            if (info.family != "sd1" && info.family != "sd2") return "";
             return info.inChannels == 9 ? "sd-inpaint" : "sd";
         }
         if (st.has("control_model.input_blocks.0.0.weight")) {  // a ControlNet in the original layout

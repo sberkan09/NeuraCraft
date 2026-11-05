@@ -19,7 +19,10 @@ bool endsWith(const std::string& s, const std::string& p) {
 } // namespace
 
 LoraMerger::LoraMerger(const std::vector<Lora>& loras, const std::string& component) {
-    const std::string kohya = component == "unet" ? "lora_unet_" : "lora_te_";
+    // kohya names: lora_unet_*, lora_te_* (SD 1.x / 2.x) or lora_te1_* / lora_te2_* (SDXL's two encoders).
+    const std::vector<std::string> kohyas = component == "unet" ? std::vector<std::string>{"lora_unet_"}
+                                            : component == "text_encoder_2" ? std::vector<std::string>{"lora_te2_"}
+                                                                            : std::vector<std::string>{"lora_te_", "lora_te1_"};
     const std::string peft = component + ".";
     for (const Lora& lora : loras) {
         const SafeTensors st(lora.file);
@@ -27,7 +30,10 @@ LoraMerger::LoraMerger(const std::vector<Lora>& loras, const std::string& compon
         for (const std::string& name : st.names()) {
             // The down / A half names the layer; the up / B half and alpha sit next to it.
             std::string module, upName, alphaName;
-            if (startsWith(name, kohya) && endsWith(name, ".lora_down.weight")) {
+            std::string kohya;
+            for (const std::string& k : kohyas)
+                if (startsWith(name, k)) kohya = k;
+            if (!kohya.empty() && endsWith(name, ".lora_down.weight")) {
                 const std::string base = name.substr(0, name.size() - std::string(".lora_down.weight").size());
                 module = base.substr(kohya.size());
                 upName = base + ".lora_up.weight";

@@ -3,6 +3,7 @@
 #include "Parallel.h"
 #include "SafeTensors.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 

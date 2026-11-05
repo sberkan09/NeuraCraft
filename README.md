@@ -304,6 +304,7 @@ tokenizer.json files with other pre-tokenizers (e.g. Metaspace).
 | Depth map / 3D photo | `depth`, `parallax`, `--depth-model` | Depth Anything V2 Small | `download_depth_anything.sh` |
 | Upscale x4 | `upscale`, `video --upscale` | Real-ESRGAN compact | `download_upscaler.sh` |
 | Smoother motion | `interpolate`, `video --interpolate` | RIFE v4 | `download_rife.sh` |
+| Chains of the above | `workflow steps.json` | | `docs/workflows/` |
 | Output | `.png` `.jpg` / `.gif` `.png` (APNG) `.mov` | | |
 
 ### Text to image: Stable Diffusion (SD-Turbo)
@@ -699,6 +700,33 @@ in-between frame (28.4-29.5 dB vs 27.9-28.1 dB). `video` multiplies the
 frame rate so the clip keeps its length; with `--upscale` too, frames are
 interpolated first, then upscaled.
 
+### Workflows in JSON
+
+```
+$ ./build_and_run.sh workflow docs/workflows/lighthouse_3d.json
+```
+
+`runWorkflow()` (`Workflow.h`) chains the pieces above from a JSON file:
+each step reads and writes named clips (a picture is a one-frame clip), so
+a picture can feed a video, a video can be interpolated, upscaled and saved
+in several formats. Operations: `load`, `save`, `resize`, `crop`, `concat`,
+`txt2img`, `img2img`, `inpaint`, `t2v` (AnimateDiff, with `init`,
+`controlnet`, `ip_adapter`, `prompt_at`), `morph`, `zoom`, `outpaint`,
+`canny`, `depth`, `parallax`, `upscale`, `interpolate`; their fields follow
+the command-line options. `docs/workflows/lighthouse_3d.json` draws a
+picture with LCM-LoRA, estimates its depth and renders a 3D photo (80 s in
+all on the 2-core machine):
+
+<p><img src="docs/images/workflow_lighthouse.gif" width="256"></p>
+
+`docs/workflows/fox_video.json` draws a fox, animates it with AnimateDiff
+(the picture as the start and as the IP-Adapter image prompt, so the clip
+keeps the same fox), doubles the frame rate with RIFE and writes a QuickTime
+movie: 31 frames at 384 x 384 in 9 minutes. Starting from the picture at
+strength 0.75 keeps the pose, so the motion stays small (a sitting fox that
+breathes and looks around); raise `strength` or drop `init` for more
+movement.
+
 ### Output formats
 
 All written by the library itself: `.gif` (`saveGif`,
@@ -811,6 +839,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Interpolation | `Interpolate.h` | `FrameInterpolator`: RIFE v4 IFNet (middle frames, 2^n x frame rate) |
 | Depth | `Depth.h` | `DepthEstimator` (Depth Anything V2), `parallaxAnimation()` (3D photo) |
 | Image prompts | `IpAdapter.h` | `ClipImageEncoder` (CLIP vision), `IpAdapter`, `loadIpAdapter()` / `setImagePrompt()` |
+| Workflows | `Workflow.h` | `runWorkflow()`: JSON steps over named clips |
 | LoRA | `Lora.h` | `LoraMerger`: kohya / A1111 and PEFT LoRA files merged into the UNet and text encoder while they load |
 | Files | `Image.h` | PNG (own inflate and deflate), animated PNG, JPEG (baseline encoder), animated GIF (median-cut palette, LZW), QuickTime Motion-JPEG `.mov`, PPM |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
@@ -886,7 +915,8 @@ step, inpainting (pixels outside the mask kept exactly) and the outpaint zoom,
 the Real-ESRGAN upscaler (zero head = nearest upscale, tiling exact), RIFE
 (zero heads = even blend, frame counts), Depth Anything (native and
 interpolated position grids) and the parallax animation (first frame exact),
-IP-Adapter (weight 0 or no tokens = no change),
+IP-Adapter (weight 0 or no tokens = no change), JSON workflows (loading,
+cropping, generation, concatenation, saving, errors),
 ControlNet (zero convolutions change nothing, scale 0 equals no ControlNet)
 and canny edges. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal

@@ -1,0 +1,12 @@
+{
+  "steps": [
+    {"op": "txt2img", "model": "data/animatediff", "prompt": "a red fox sitting in a snowy forest, photo",
+     "steps": 4, "sampler": "lcm", "lora": ["data/loras/lcm-lora-sdv1-5.safetensors"], "width": 384, "height": 384, "out": "fox"},
+    {"op": "t2v", "model": "data/animatediff", "prompt": "a red fox walking through a snowy forest, photo",
+     "init": "fox", "strength": 0.75, "frames": 16, "width": 384, "height": 384, "ip_adapter": "data/ip-adapter/ip-adapter_sd15.safetensors",
+     "image_prompt": "fox", "ip_scale": 0.4, "out": "clip"},
+    {"op": "interpolate", "model": "data/interpolate/rife-v4-flownet.safetensors", "in": "clip", "passes": 1, "out": "smooth"},
+    {"op": "save", "in": "smooth", "path": "fox_walk.mov", "fps": 16},
+    {"op": "save", "in": "smooth", "path": "fox_walk.gif", "fps": 16}
+  ]
+}

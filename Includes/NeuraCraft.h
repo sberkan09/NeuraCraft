@@ -27,6 +27,7 @@
 #include "Text.h"
 #include "Transformer.h"
 #include "Upscale.h"
+#include "Workflow.h"
 
 #define NEURACRAFT_VERSION "1.11.0"
 

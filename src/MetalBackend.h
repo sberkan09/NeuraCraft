@@ -3,6 +3,7 @@
 #define NEURACRAFT_METAL_BACKEND_H
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace nc {
@@ -17,6 +18,17 @@ void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
           const float* A, std::size_t lda, const float* B, std::size_t ldb,
           float* C, std::size_t ldc, bool accumulate,
           std::size_t aMapBytes = 0, std::size_t bMapBytes = 0, std::size_t cMapBytes = 0);
+
+// C (M x N, row stride ldc) = op(A) * op(B) with one operand int8 weights
+// (rows x K, row-major, one float scale per `group` inputs of each row,
+// groupsPerRow scales per row) dequantized in the shader as tiles are loaded:
+//   quantLeft:  C = Q (M x K) * X (K x N, row stride ldx)       (convolutions)
+//   !quantLeft: C = X (M x K, row stride ldx) * Q^T, Q is N x K (dense layers)
+bool int8Available();
+void gemmQ8(bool quantLeft, std::size_t M, std::size_t N, std::size_t K,
+            const std::int8_t* q, std::size_t qMapBytes, const float* scales, std::size_t scaleMapBytes,
+            std::size_t groupsPerRow, std::size_t group, const float* x, std::size_t ldx, std::size_t xMapBytes,
+            float* C, std::size_t ldc, std::size_t cMapBytes);
 
 } // namespace metal
 } // namespace nc

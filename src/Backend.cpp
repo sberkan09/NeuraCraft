@@ -293,6 +293,14 @@ std::string gpuName() {
 #endif
 }
 
+bool gpuInt8Available() {
+#ifdef NEURACRAFT_HAS_METAL
+    return metal::int8Available();
+#else
+    return false;
+#endif
+}
+
 std::string deviceDescription() {
     if (currentDevice() == Device::GPU) return "GPU (" + gpuName() + ", Metal)";
     return "CPU (" + cpuBackendName() + ", " + std::to_string(threadCount()) + " threads)";

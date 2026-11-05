@@ -2454,6 +2454,18 @@ TEST(int8_convolutions_and_large_products) {
     const QuantizedWeights w = QuantizedWeights::fromOutIn(Matrix::uniform(37, 70, -1, 1));
     const Matrix many = Matrix::uniform(QuantizedWeights::kGemmRows + 3, 70, -1, 1);
     CHECK(w.multiply(many).approxEquals(w.multiplyFloat(many), 1e-4f));
+    // multiplyLeft (W * b, the convolution layout) with a row stride wider than the product.
+    const std::size_t n = 300;
+    const Matrix b = Matrix::uniform(70, n + 5, -1, 1);
+    Matrix c(37, n + 2, 9.0f);
+    w.multiplyLeft(n, b.data(), n + 5, c.data(), n + 2);
+    const Matrix ref = w.multiplyFloat(b.transpose()).transpose();
+    float worst = 0;
+    for (std::size_t j = 0; j < 37; ++j) {
+        for (std::size_t i = 0; i < n; ++i) worst = std::max(worst, std::fabs(c(j, i) - ref(j, i)));
+        CHECK(c(j, n) == 9.0f && c(j, n + 1) == 9.0f);
+    }
+    CHECK(worst < 1e-4f);
 }
 
 TEST(tiny_vae_loader_layers_and_value_ranges) {
@@ -4014,6 +4026,54 @@ TEST(gpu_zero_copy_matmul_matches_cpu) {
             setDevice(Device::CPU);
             CHECK(gpu.approxEquals(cpu, 1e-3f));
         }
+    setGpuMinWork(saved);
+}
+
+TEST(gpu_int8_products_match_cpu) {
+    if (!gpuAvailable()) return;
+    std::cout << "         (int8 GPU kernel: " << (gpuInt8Available() ? "yes" : "no") << ")\n";
+    CHECK(gpuInt8Available());
+    setSeed(77);
+    const std::size_t saved = gpuMinWork();
+    setGpuMinWork(1);
+    // Dense layout (x * W^T) and the convolution one (W * b); 200 inputs leave a partial last group,
+    // ragged sizes exercise the tile edges, and the large case is page-backed (mapped in place).
+    for (std::size_t in : {200, 576})
+        for (std::size_t out : {70, 130}) {
+            const QuantizedWeights w = QuantizedWeights::fromOutIn(Matrix::uniform(out, in, -1, 1));
+            const Matrix x = Matrix::uniform(QuantizedWeights::kGemmRows + 37, in, -1, 1);
+            setDevice(Device::CPU);
+            const Matrix cpu = w.multiplyFloat(x);
+            CHECK(!w.gpuProducts(x.rows()));
+            setDevice(Device::GPU);
+            CHECK(w.gpuProducts(x.rows()));
+            const Matrix gpu = w.multiply(x);
+            CHECK(gpu.approxEquals(cpu, 1e-3f));
+
+            const std::size_t n = x.rows();
+            const Matrix b = Matrix::uniform(in, n, -1, 1);
+            Matrix cg(out, n), cc(out, n);
+            w.multiplyLeft(n, b.data(), n, cg.data(), n, b.pageBacked() ? b.storageBytes() : 0,
+                           cg.pageBacked() ? cg.storageBytes() : 0);
+            setDevice(Device::CPU);
+            w.multiplyLeft(n, b.data(), n, cc.data(), n);
+            CHECK(cg.approxEquals(cc, 1e-3f));
+            CHECK(cc.approxEquals(w.multiplyFloat(b.transpose()).transpose(), 1e-3f));
+        }
+    // Int8 convolutions (3x3 strips and 1x1 on the image itself) give the same maps on both devices.
+    struct Case { ImageShape in; std::size_t out, k, stride, pad; };
+    for (const Case& c : {Case{{16, 20, 20}, 8, 3, 1, 1}, Case{{8, 24, 24}, 6, 1, 1, 0}, Case{{4, 34, 34}, 5, 3, 2, 1}}) {
+        Conv2D conv(c.in, c.out, c.k, c.stride, c.pad);
+        conv.bias() = Matrix::uniform(1, c.out, -1, 1);
+        conv.quantize();
+        const Matrix x = Matrix::uniform(2, c.in.size(), -1, 1);
+        setDevice(Device::CPU);
+        const Matrix cpu = conv.forward(x, false);
+        setDevice(Device::GPU);
+        const Matrix gpu = conv.forward(x, false);
+        setDevice(Device::CPU);
+        CHECK(gpu.approxEquals(cpu, 1e-3f));
+    }
     setGpuMinWork(saved);
 }
 

@@ -50,6 +50,7 @@ public:
 private:
     Matrix forwardInference(const Matrix& input) const;
     // Strip convolution with weights either (patch x out) (outByPatch = false) or (out x patch).
+    // weights == nullptr: products come from quantized_ (multiplyLeft, the GPU int8 kernel).
     Matrix stripConvolution(const Matrix& input, const float* weights, bool outByPatch) const;
     Matrix forwardQuantized(const Matrix& input) const;
     QuantizedWeights quantized_;

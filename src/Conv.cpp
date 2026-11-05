@@ -72,6 +72,8 @@ Matrix Conv2D::forwardQuantized(const Matrix& input) const {
     const std::size_t B = input.rows(), P = outH_ * outW_, C = in_.channels, H = in_.height, W = in_.width;
     const std::size_t patch = C * kernel_ * kernel_;
     if (P >= QuantizedWeights::kGemmRows) {
+        // GPU: int8 weights go to the shader as they are.
+        if (quantized_.gpuProducts(P)) return stripConvolution(input, nullptr, true);
         // Large maps: expand the weights to float (out x patch) once per call and take the float strip path.
         std::vector<float> wt(outChannels_ * patch);
         quantized_.expandRows(0, outChannels_, wt.data());
@@ -129,13 +131,21 @@ Matrix Conv2D::stripConvolution(const Matrix& input, const float* weights, bool 
         float* dst = out.data() + b * out.cols();
         if (kernel_ == 1 && stride_ == 1 && padding_ == 0) {
             // The image already is a (C x HW) matrix: out = W^T x image.
-            gemm(outByPatch ? false : true, false, outChannels_, P, C, weights, outByPatch ? C : outChannels_, img, P, dst, P, false);
+            if (weights == nullptr) {
+                const bool start = b == 0;  // mapped in place only from the start of a page-backed buffer
+                quantized_.multiplyLeft(P, img, P, dst, P, start && input.pageBacked() ? input.storageBytes() : 0,
+                                        start && out.pageBacked() ? out.storageBytes() : 0);
+            } else {
+                gemm(outByPatch ? false : true, false, outChannels_, P, C, weights, outByPatch ? C : outChannels_, img, P, dst, P, false);
+            }
         } else {
             // Strips of output rows: columns (patch x strip positions), then
             // out[:, strip] = W^T x columns, written straight into place.
             const std::size_t budget = std::size_t(1) << 23;  // floats per strip of columns (32 MB)
             const std::size_t rows = std::max<std::size_t>(1, std::min(outH_, budget / std::max<std::size_t>(1, patch * outW_)));
-            std::vector<float> cols(patch * rows * outW_);
+            FloatVector cols(patch * rows * outW_);
+            const std::size_t colsMap =
+                cols.capacity() * sizeof(float) >= kPageBackedBytes ? detail::storageBytesFor(cols.capacity() * sizeof(float)) : 0;
             for (std::size_t oy0 = 0; oy0 < outH_; oy0 += rows) {
                 const std::size_t oy1 = std::min(outH_, oy0 + rows), n = (oy1 - oy0) * outW_;
                 parallelFor(0, patch, 8, [&](std::size_t r0, std::size_t r1) {
@@ -157,8 +167,14 @@ Matrix Conv2D::stripConvolution(const Matrix& input, const float* weights, bool 
                         }
                     }
                 });
-                gemm(outByPatch ? false : true, false, outChannels_, n, patch, weights, outByPatch ? patch : outChannels_, cols.data(), n,
-                     dst + oy0 * outW_, P, false);
+                if (weights == nullptr) {
+                    const bool whole = b == 0 && oy0 == 0 && n == P;  // C is then the whole page-backed output
+                    quantized_.multiplyLeft(n, cols.data(), n, dst + oy0 * outW_, P, colsMap,
+                                            whole && out.pageBacked() ? out.storageBytes() : 0);
+                } else {
+                    gemm(outByPatch ? false : true, false, outChannels_, n, patch, weights, outByPatch ? patch : outChannels_,
+                         cols.data(), n, dst + oy0 * outW_, P, false);
+                }
             }
         }
         parallelFor(0, outChannels_, 4, [&](std::size_t c0, std::size_t c1) {

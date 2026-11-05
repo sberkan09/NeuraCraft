@@ -1,4 +1,6 @@
 #include "Image.h"
+#include "Profile.h"
+#include "VectorMath.h"
 #include "Backend.h"
 #include "Parallel.h"
 
@@ -72,6 +74,7 @@ GroupNorm::GroupNorm(ImageShape shape, std::size_t groups, float epsilon)
 }
 
 Matrix GroupNorm::forward(const Matrix& input, bool training) {
+    NC_PROFILE("group norm");
     expectColumns(input, shape_.size(), "GroupNorm");
     const std::size_t B = input.rows(), HW = shape_.height * shape_.width, perGroup = shape_.channels / groups_;
     const std::size_t n = perGroup * HW;  // a group's values are contiguous in (C, H, W) order
@@ -83,12 +86,9 @@ Matrix GroupNorm::forward(const Matrix& input, bool training) {
         for (std::size_t t = t0; t < t1; ++t) {
             const std::size_t b = t / groups_, g = t % groups_;
             const float* x = input.data() + b * input.cols() + g * n;
-            double sum = 0.0;
-            for (std::size_t i = 0; i < n; ++i) sum += x[i];
-            const double mean = sum / static_cast<double>(n);
-            double var = 0.0;
-            for (std::size_t i = 0; i < n; ++i) var += (x[i] - mean) * (x[i] - mean);
-            const float inv = static_cast<float>(1.0 / std::sqrt(var / static_cast<double>(n) + epsilon_));
+            double mean = 0.0, var = 0.0;
+            meanAndVariance(x, n, mean, var);
+            const float inv = static_cast<float>(1.0 / std::sqrt(var + epsilon_));
             invStd_[t] = inv;
             const float m = static_cast<float>(mean);
             float* y = out.data() + b * out.cols() + g * n;
@@ -96,10 +96,14 @@ Matrix GroupNorm::forward(const Matrix& input, bool training) {
             for (std::size_t c = 0; c < perGroup; ++c) {
                 const std::size_t ch = g * perGroup + c;
                 const float gm = gamma_(0, ch), bt = beta_(0, ch);
-                for (std::size_t p = c * HW; p < (c + 1) * HW; ++p) {
-                    const float v = (x[p] - m) * inv;
-                    if (xn) xn[p] = v;
-                    y[p] = v * gm + bt;
+                const float a = inv * gm, bb = bt - m * a;
+                if (xn) {
+                    for (std::size_t p = c * HW; p < (c + 1) * HW; ++p) {
+                        xn[p] = (x[p] - m) * inv;
+                        y[p] = xn[p] * gm + bt;
+                    }
+                } else {
+                    for (std::size_t p = c * HW; p < (c + 1) * HW; ++p) y[p] = x[p] * a + bb;
                 }
             }
         }

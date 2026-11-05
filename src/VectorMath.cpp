@@ -75,6 +75,36 @@ void erfArray(const float* x, float* y, std::size_t n) {
     }
 }
 
+namespace {
+// Sum of f(x[i]) over a block, in eight independent float lanes (vectorizable without reassociation).
+template <typename F>
+double laneSum(const float* x, std::size_t n, F f) {
+    double total = 0.0;
+    for (std::size_t b = 0; b < n; b += 4096) {
+        const std::size_t e = std::min(n, b + 4096);
+        float lane[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        std::size_t i = b;
+        for (; i + 8 <= e; i += 8)
+            for (int k = 0; k < 8; ++k) lane[k] += f(x[i + static_cast<std::size_t>(k)]);
+        float tail = 0.0f;
+        for (; i < e; ++i) tail += f(x[i]);
+        total += static_cast<double>((lane[0] + lane[1]) + (lane[2] + lane[3])) +
+                 static_cast<double>((lane[4] + lane[5]) + (lane[6] + lane[7])) + tail;
+    }
+    return total;
+}
+} // namespace
+
+void meanAndVariance(const float* x, std::size_t n, double& mean, double& variance) {
+    if (n == 0) {
+        mean = variance = 0.0;
+        return;
+    }
+    mean = laneSum(x, n, [](float v) { return v; }) / static_cast<double>(n);
+    const float m = static_cast<float>(mean);
+    variance = laneSum(x, n, [m](float v) { return (v - m) * (v - m); }) / static_cast<double>(n);
+}
+
 void softmaxRow(float* row, std::size_t n, float scale) {
     if (n == 0) return;
     float m = -std::numeric_limits<float>::infinity();

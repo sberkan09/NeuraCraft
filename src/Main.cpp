@@ -992,6 +992,41 @@ int runBench(bool quick) {
     };
     timeAttention("CPU", Device::CPU);
     if (gpuAvailable()) timeAttention("GPU", Device::GPU);
+
+    // 3x3 convolutions as in the UNet: im2col + one GEMM, or 9 shifted GEMMs.
+    std::cout << "\n3x3 convolution, CPU (ms):        im2col   shifted\n";
+    struct ConvCase { std::size_t channels, size; };
+    const std::vector<ConvCase> convs = quick ? std::vector<ConvCase>{{64, 32}}
+                                              : std::vector<ConvCase>{{320, 64}, {640, 32}, {1280, 16}, {128, 256}};
+    const Device benchDevice = currentDevice();
+    setDevice(Device::CPU);
+    const bool savedShifted = shiftedConvolutions();
+    for (const ConvCase& cc : convs) {
+        Conv2D conv({cc.channels, cc.size, cc.size}, cc.channels, 3, 1, 1);
+        const Matrix x = Matrix::uniform(1, cc.channels * cc.size * cc.size, -1, 1);
+        double ms[2];
+        Matrix y[2];
+        for (int sh = 0; sh < 2; ++sh) {
+            setShiftedConvolutions(sh == 1);
+            y[sh] = conv.forward(x, false);
+            int reps = 0;
+            const auto start = std::chrono::steady_clock::now();
+            double elapsed = 0.0;
+            do {
+                conv.forward(x, false);
+                ++reps;
+                elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            } while (elapsed < (quick ? 0.2 : 1.0));
+            ms[sh] = 1e3 * elapsed / reps;
+        }
+        const bool ok = y[1].approxEquals(y[0], 1e-3f);
+        mismatches += !ok;
+        std::cout << std::setw(6) << cc.channels << " ch " << std::setw(3) << cc.size << "x" << std::left << std::setw(13) << cc.size
+                  << std::right << std::fixed << std::setprecision(1) << std::setw(10) << ms[0] << std::setw(10) << ms[1]
+                  << (ok ? "" : "  (disagree!)") << std::defaultfloat << '\n';
+    }
+    setShiftedConvolutions(savedShifted);
+    setDevice(benchDevice);
     return mismatches == 0 ? 0 : 1;
 }
 

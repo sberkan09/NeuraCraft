@@ -4,6 +4,8 @@
 #include "Parallel.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -125,7 +127,72 @@ Matrix Conv2D::forwardInference(const Matrix& input) const {
     return stripConvolution(input, weights_.data(), false);
 }
 
+namespace {
+// Off by default until measured on Accelerate: on the 2-core x86 machine the k*k GEMMs with
+// K = channels ran from 10 % faster (large maps) to 20 % slower (32 x 32) than one im2col GEMM.
+// NEURACRAFT_SHIFTED_CONV=1 turns it on.
+std::atomic<bool> gShifted{[] {
+    const char* e = std::getenv("NEURACRAFT_SHIFTED_CONV");
+    return e != nullptr && e[0] == '1';
+}()};
+}
+void setShiftedConvolutions(bool enabled) { gShifted = enabled; }
+bool shiftedConvolutions() { return gShifted.load(); }
+
+Matrix Conv2D::shiftedConvolution(const Matrix& input, const float* weights, bool outByPatch) const {
+    // Output computed on a grid as wide as the padded image (Wp columns, the last k - 1 of each row
+    // discarded): tap (ky, kx) of every output then reads the padded plane at a constant offset
+    // ky * Wp + kx, so out += W_tap * shifted image is a plain GEMM with the channels as K.
+    const std::size_t B = input.rows(), C = in_.channels, H = in_.height, W = in_.width, k = kernel_, kk = k * k;
+    const std::size_t Hp = H + 2 * padding_, Wp = W + 2 * padding_, plane = Hp * Wp, P = outH_ * outW_;
+    std::vector<float> taps;  // outByPatch: weights regrouped per tap, kk x (outC x C)
+    if (outByPatch) {
+        taps.resize(kk * outChannels_ * C);
+        parallelFor(0, outChannels_, 8, [&](std::size_t o0, std::size_t o1) {
+            for (std::size_t o = o0; o < o1; ++o)
+                for (std::size_t c = 0; c < C; ++c)
+                    for (std::size_t t = 0; t < kk; ++t)
+                        taps[(t * outChannels_ + o) * C + c] = weights[o * C * kk + c * kk + t];
+        });
+    }
+    Matrix out(B, outChannels_ * P);
+    FloatVector padded(C * plane + k, 0.0f);  // + k: the last channel's shifted views run a little past it
+    const std::size_t rows = std::max<std::size_t>(1, std::min(outH_, (std::size_t(1) << 22) / std::max<std::size_t>(1, outChannels_ * Wp)));
+    std::vector<float> wide(outChannels_ * rows * Wp);
+    for (std::size_t b = 0; b < B; ++b) {
+        const float* img = input.data() + b * input.cols();
+        parallelFor(0, C, 4, [&](std::size_t c0, std::size_t c1) {
+            for (std::size_t c = c0; c < c1; ++c)
+                for (std::size_t y = 0; y < H; ++y)
+                    std::copy(img + (c * H + y) * W, img + (c * H + y + 1) * W, padded.data() + c * plane + (y + padding_) * Wp + padding_);
+        });
+        float* dst = out.data() + b * out.cols();
+        for (std::size_t oy0 = 0; oy0 < outH_; oy0 += rows) {
+            const std::size_t r = std::min(rows, outH_ - oy0), N = r * Wp;
+            for (std::size_t t = 0; t < kk; ++t) {
+                const float* shifted = padded.data() + (oy0 + t / k) * Wp + t % k;
+                if (outByPatch)
+                    gemm(false, false, outChannels_, N, C, taps.data() + t * outChannels_ * C, C, shifted, plane, wide.data(), N, t > 0);
+                else
+                    gemm(true, false, outChannels_, N, C, weights + t * outChannels_, kk * outChannels_, shifted, plane, wide.data(), N, t > 0);
+            }
+            parallelFor(0, outChannels_, 4, [&](std::size_t o0, std::size_t o1) {
+                for (std::size_t o = o0; o < o1; ++o) {
+                    const float bias = bias_(0, o);
+                    for (std::size_t y = 0; y < r; ++y) {
+                        const float* src = wide.data() + (o * r + y) * Wp;
+                        float* d = dst + o * P + (oy0 + y) * outW_;
+                        for (std::size_t x = 0; x < outW_; ++x) d[x] = src[x] + bias;
+                    }
+                }
+            });
+        }
+    }
+    return out;
+}
+
 Matrix Conv2D::stripConvolution(const Matrix& input, const float* weights, bool outByPatch) const {
+    if (weights != nullptr && stride_ == 1 && kernel_ > 1 && shiftedConvolutions()) return shiftedConvolution(input, weights, outByPatch);
     const std::size_t B = input.rows(), P = outH_ * outW_, C = in_.channels, H = in_.height, W = in_.width;
     const std::size_t patch = C * kernel_ * kernel_;
     Matrix out(B, outChannels_ * P);

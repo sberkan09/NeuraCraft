@@ -15,6 +15,11 @@ namespace nc {
 void expArray(const float* x, float* y, std::size_t n);
 void erfArray(const float* x, float* y, std::size_t n);
 
+// Mean and (population) variance of x[0..n), two passes, with eight float
+// lanes per block of 4096 values summed in double: vectorized, and about as
+// accurate as a double loop for the sizes norms see.
+void meanAndVariance(const float* x, std::size_t n, double& mean, double& variance);
+
 // Row-wise softmax(scale * row) in place, using expArray.
 void softmaxRow(float* row, std::size_t n, float scale = 1.0f);
 

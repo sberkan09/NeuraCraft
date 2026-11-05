@@ -1,4 +1,6 @@
 #include "Transformer.h"
+#include "Profile.h"
+#include "VectorMath.h"
 #include "Activations.h"
 #include "Backend.h"
 #include "Dense.h"
@@ -240,33 +242,37 @@ LayerNorm::LayerNorm(std::size_t dim, float epsilon)
 }
 
 Matrix LayerNorm::forward(const Matrix& input, bool training) {
+    NC_PROFILE("layer norm");
     if (input.cols() != dim_)
         throw std::invalid_argument("LayerNorm: expected " + std::to_string(dim_) + " features, got " +
                                     std::to_string(input.cols()));
     const std::size_t n = input.rows();
-    normalized_ = Matrix(n, dim_);
+    // Inference keeps nothing for backward.
+    normalized_ = training ? Matrix(n, dim_) : Matrix();
     invStd_.assign(n, 0.0f);
     Matrix out(n, dim_);
     parallelFor(0, n, 64, [&](std::size_t r0, std::size_t r1) {
         for (std::size_t r = r0; r < r1; ++r) {
             const float* x = input.data() + r * dim_;
-            double mean = 0.0;
-            for (std::size_t j = 0; j < dim_; ++j) mean += x[j];
-            mean /= static_cast<double>(dim_);
-            double var = 0.0;
-            for (std::size_t j = 0; j < dim_; ++j) var += (x[j] - mean) * (x[j] - mean);
-            var /= static_cast<double>(dim_);
+            double mean = 0.0, var = 0.0;
+            meanAndVariance(x, dim_, mean, var);
             const float inv = static_cast<float>(1.0 / std::sqrt(var + epsilon_));
             invStd_[r] = inv;
-            float* xh = normalized_.data() + r * dim_;
+            const float m = static_cast<float>(mean);
+            const float* g = gamma_.data();
+            const float* b = beta_.data();
             float* o = out.data() + r * dim_;
-            for (std::size_t j = 0; j < dim_; ++j) {
-                xh[j] = static_cast<float>(x[j] - mean) * inv;
-                o[j] = xh[j] * gamma_.data()[j] + beta_.data()[j];
+            if (training) {
+                float* xh = normalized_.data() + r * dim_;
+                for (std::size_t j = 0; j < dim_; ++j) {
+                    xh[j] = (x[j] - m) * inv;
+                    o[j] = xh[j] * g[j] + b[j];
+                }
+            } else {
+                for (std::size_t j = 0; j < dim_; ++j) o[j] = (x[j] - m) * inv * g[j] + b[j];
             }
         }
     });
-    if (!training) normalized_ = Matrix();  // only backward needs it
     return out;
 }
 

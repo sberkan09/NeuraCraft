@@ -727,6 +727,14 @@ strength 0.75 keeps the pose, so the motion stays small (a sitting fox that
 breathes and looks around); raise `strength` or drop `init` for more
 movement.
 
+`docs/workflows/hires_portrait.json` is a "hires fix": the 512 x 512 LCM
+portrait, Real-ESRGAN x4, resized to 1024 x 1024 and redrawn at strength 0.5
+(2 LCM steps at 1024) so the model adds detail the small picture could not
+hold. Below, the same crop of the 512 picture (left, enlarged) and of the
+1024 one (right); 6.3 minutes in all on the 2-core machine.
+
+<p><img src="docs/images/workflow_hires.jpg" width="640"></p>
+
 ### Output formats
 
 All written by the library itself: `.gif` (`saveGif`,

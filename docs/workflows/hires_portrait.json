@@ -1,0 +1,13 @@
+{
+  "steps": [
+    {"op": "txt2img", "model": "data/animatediff", "prompt": "portrait photo of an old fisherman, detailed face, golden hour, 85mm",
+     "steps": 4, "sampler": "lcm", "lora": ["data/loras/lcm-lora-sdv1-5.safetensors"], "seed": 3, "out": "base"},
+    {"op": "upscale", "model": "data/upscale/realesr-general-x4v3.safetensors", "in": "base", "out": "x4"},
+    {"op": "resize", "in": "x4", "width": 1024, "height": 1024, "out": "big"},
+    {"op": "img2img", "model": "data/animatediff", "prompt": "portrait photo of an old fisherman, detailed face, golden hour, 85mm",
+     "in": "big", "width": 1024, "height": 1024, "steps": 4, "strength": 0.5, "sampler": "lcm",
+     "lora": ["data/loras/lcm-lora-sdv1-5.safetensors"], "seed": 4, "out": "detailed"},
+    {"op": "save", "in": "base", "path": "portrait_512.png"},
+    {"op": "save", "in": "detailed", "path": "portrait_1024.png"}
+  ]
+}

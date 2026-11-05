@@ -265,6 +265,14 @@ std::atomic<bool> gGpuAttention{false};
 void setGpuAttention(bool enabled) { gGpuAttention = enabled && gpuAvailable(); }
 bool gpuAttentionEnabled() { return gGpuAttention.load(); }
 
+void setGpuAttentionKernel(const std::string& name) {
+#ifdef NEURACRAFT_HAS_METAL
+    if (metal::available()) metal::setAttentionKernel(name);
+#else
+    (void)name;
+#endif
+}
+
 std::string gpuAttentionKernel(std::size_t headSize) {
 #ifdef NEURACRAFT_HAS_METAL
     return metal::available() ? metal::attentionKernelName(headSize) : std::string();

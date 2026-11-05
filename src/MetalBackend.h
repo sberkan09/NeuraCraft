@@ -33,7 +33,8 @@ void gemmQ8(bool quantLeft, std::size_t M, std::size_t N, std::size_t K,
 // out (N x C) = softmax(Q K^T / sqrt(C / heads)) V for each head (columns
 // h*dh .. h*dh+dh-1); Q is N x C, K and V are M x C, all dense row-major.
 bool attentionSupported(std::size_t headSize);
-std::string attentionKernelName(std::size_t headSize);  // "simdgroup", "scalar" or "" (unsupported)
+std::string attentionKernelName(std::size_t headSize);
+void setAttentionKernel(const std::string& name);  // "scalar", "simdgroup" or "" (default / environment)  // "simdgroup", "scalar" or "" (unsupported)
 void attention(std::size_t N, std::size_t M, std::size_t C, std::size_t heads, const float* q, std::size_t qMapBytes,
                const float* k, std::size_t kMapBytes, const float* v, std::size_t vMapBytes, float* out,
                std::size_t outMapBytes);

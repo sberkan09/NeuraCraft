@@ -405,7 +405,10 @@ kernel void attention_flash(device const float* Q [[buffer(0)]],
 // simdgroups per threadgroup each own 8 query rows; keys and values stream
 // through threadgroup memory 16 at a time. Per tile: S = Q K^T (8 x 16) with
 // 8x8 hardware products, an online softmax in a small per-simdgroup scratch
-// (four lanes per row), O = diag(correction) O + P V. DB = head size / 8 is a
+// (four lanes per row), O = diag(correction) O + P V. Its scratch is handed
+// between lanes with threadgroup barriers: with simdgroup barriers the macOS CI
+// GPU returned wrong rows now and then once several threadgroups shared a
+// core. DB = head size / 8 is a
 // function constant so the loops over head dimensions unroll.
 const char* const kAttentionSimdSource = R"METAL(
 #include <metal_stdlib>
@@ -552,6 +555,7 @@ struct Context {
     id<MTLLibrary> attentionLib = nil;      // attention_flash, specialized per head size
     id<MTLLibrary> attentionSimdLib = nil;  // attention_simd (Apple7+)
     std::map<unsigned, bool> attentionSimd;  // head size -> the pipeline is the simdgroup one
+    std::string attentionChoice;             // "", "scalar" or "simdgroup" (setAttentionKernel)
     std::map<unsigned, id<MTLComputePipelineState>> attention;
     std::mutex attentionMutex;
     bool ok = false;
@@ -660,7 +664,8 @@ struct AttnParams {
 
 // The attention pipeline for one head size (built on first use), or nil: the simdgroup-matrix
 // kernel with the simdgroup GEMM (head sizes divisible by 8), else the portable one.
-// NEURACRAFT_METAL_ATTENTION=scalar forces the portable kernel.
+// Which one is preferred: setAttentionKernel(), else NEURACRAFT_METAL_ATTENTION=scalar|simdgroup,
+// else the scalar one (the simdgroup kernel waits for a measurement on real hardware).
 id<MTLComputePipelineState> attentionPipeline(Context& ctx, unsigned dh) {
     std::lock_guard<std::mutex> lock(ctx.attentionMutex);
     auto it = ctx.attention.find(dh);
@@ -669,9 +674,12 @@ id<MTLComputePipelineState> attentionPipeline(Context& ctx, unsigned dh) {
     bool simd = false;
     @autoreleasepool {
         NSError* err = nil;
-        const char* forced = std::getenv("NEURACRAFT_METAL_ATTENTION");
-        const bool allowSimd = !(forced && std::string(forced) == "scalar");
-        if (ctx.useSimd && allowSimd && dh % 8 == 0 && dh <= 160) {
+        std::string choice = ctx.attentionChoice;
+        if (choice.empty()) {
+            const char* env = std::getenv("NEURACRAFT_METAL_ATTENTION");
+            choice = env ? env : "scalar";
+        }
+        if (ctx.useSimd && choice == "simdgroup" && dh % 8 == 0 && dh <= 160) {
             if (ctx.attentionSimdLib == nil)
                 ctx.attentionSimdLib = [ctx.device newLibraryWithSource:[NSString stringWithUTF8String:kAttentionSimdSource]
                                                                 options:nil
@@ -862,6 +870,16 @@ void gemmQ8(bool quantLeft, std::size_t M, std::size_t N, std::size_t K,
         }
     }
     if (!failure.empty()) throw std::runtime_error("Metal gemmQ8: " + failure);
+}
+
+void setAttentionKernel(const std::string& name) {
+    if (!name.empty() && name != "scalar" && name != "simdgroup")
+        throw std::invalid_argument("Metal attention kernel must be scalar or simdgroup, not " + name);
+    Context& ctx = context();
+    std::lock_guard<std::mutex> lock(ctx.attentionMutex);
+    ctx.attentionChoice = name;
+    ctx.attention.clear();  // rebuilt for the new choice on next use
+    ctx.attentionSimd.clear();
 }
 
 std::string attentionKernelName(std::size_t headSize) {

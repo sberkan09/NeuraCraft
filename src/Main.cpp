@@ -994,7 +994,12 @@ int runBench(bool quick) {
                   << (ok ? "" : "  (disagrees with the CPU!)") << std::defaultfloat << '\n';
     };
     timeAttention("CPU", Device::CPU);
-    if (gpuAvailable()) timeAttention("GPU", Device::GPU);
+    if (gpuAvailable()) {
+        timeAttention("GPU", Device::GPU);
+        setGpuAttentionKernel("simdgroup");
+        if (gpuAttentionKernel(40) == "simdgroup") timeAttention("GPU", Device::GPU);
+        setGpuAttentionKernel("");
+    }
 
     // 3x3 convolutions as in the UNet: im2col + one GEMM, or 9 shifted GEMMs.
     std::cout << "\n3x3 convolution, CPU (ms):        im2col   shifted\n";

@@ -4238,33 +4238,36 @@ TEST(gpu_fused_attention_matches_cpu) {
     setGpuMinWork(saved);
 }
 
-TEST(gpu_attention_repeatability_diagnostic) {
+TEST(gpu_attention_kernels_agree_and_repeat) {
     if (!gpuAvailable()) return;
     setSeed(91);
     const std::size_t saved = gpuMinWork();
     setGpuMinWork(1);
-    for (std::size_t N : {32, 300})
-        for (std::size_t M : {16, 300}) {
-            const std::size_t C = 320, heads = 8;
-            const Matrix q = Matrix::uniform(N, C, -2, 2), k = Matrix::uniform(M, C, -2, 2), v = Matrix::uniform(M, C, -1, 1);
-            setDevice(Device::CPU);
-            const Matrix cpu = multiHeadAttention(q, k, v, heads);
-            setDevice(Device::GPU);
-            for (int run = 0; run < 4; ++run) {
-                Matrix out(N, C);
-                gpuAttention(q, k, v, heads, out);
-                float worst = 0;
-                std::size_t at = 0, bad = 0;
-                for (std::size_t i = 0; i < out.size(); ++i) {
-                    const float d = std::fabs(out.data()[i] - cpu.data()[i]);
-                    if (d > 1e-4f) ++bad;
-                    if (d > worst) { worst = d; at = i; }
+    setDevice(Device::GPU);
+    // Both kernels (simdgroup only where the simdgroup GEMM runs), several threadgroups per head, ragged
+    // sizes, repeated: a race between lanes shows up as rows that change from run to run.
+    for (const char* kernel : {"scalar", "simdgroup"}) {
+        setGpuAttentionKernel(kernel);
+        if (gpuAttentionKernel(40) != kernel) continue;
+        for (std::size_t N : {32, 300})
+            for (std::size_t M : {16, 77, 300}) {
+                const std::size_t C = 320, heads = 8;
+                const Matrix q = Matrix::uniform(N, C, -2, 2), k = Matrix::uniform(M, C, -2, 2), v = Matrix::uniform(M, C, -1, 1);
+                setDevice(Device::CPU);
+                const Matrix cpu = multiHeadAttention(q, k, v, heads);
+                setDevice(Device::GPU);
+                for (int run = 0; run < 3; ++run) {
+                    Matrix out(N, C);
+                    CHECK(gpuAttention(q, k, v, heads, out));
+                    std::size_t bad = 0;
+                    for (std::size_t i = 0; i < out.size(); ++i) bad += std::fabs(out.data()[i] - cpu.data()[i]) > 1e-4f;
+                    if (bad) std::cout << "         " << kernel << " N=" << N << " M=" << M << " run " << run << ": " << bad << " wrong\n";
+                    CHECK(bad == 0);
                 }
-                std::cout << "         diag N=" << N << " M=" << M << " run " << run << ": max " << worst << " at row " << at / C
-                          << " col " << at % C << ", " << bad << " bad of " << out.size() << "\n";
             }
-            setDevice(Device::CPU);
-        }
+    }
+    setGpuAttentionKernel("");
+    setDevice(Device::CPU);
     setGpuMinWork(saved);
 }
 

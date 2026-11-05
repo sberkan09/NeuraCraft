@@ -1,0 +1,12 @@
+{
+  "steps": [
+    {"op": "txt2img", "model": "data/animatediff", "prompt": "a lighthouse on a rocky coast at sunset, waves, photo",
+     "steps": 4, "sampler": "lcm", "lora": ["data/loras/lcm-lora-sdv1-5.safetensors"], "seed": 5, "out": "picture"},
+    {"op": "save", "in": "picture", "path": "lighthouse.jpg"},
+    {"op": "depth", "model": "data/depth-anything-v2-small", "in": "picture", "out": "depth"},
+    {"op": "save", "in": "depth", "path": "lighthouse_depth.png"},
+    {"op": "parallax", "model": "data/depth-anything-v2-small", "in": "picture", "frames": 48, "out": "clip"},
+    {"op": "save", "in": "clip", "path": "lighthouse_3d.gif", "fps": 24},
+    {"op": "save", "in": "clip", "path": "lighthouse_3d.mov", "fps": 24}
+  ]
+}

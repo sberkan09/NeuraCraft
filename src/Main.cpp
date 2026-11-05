@@ -969,6 +969,7 @@ void usage() {
               << "  NeuraCraft interpolate rife.safetensors frames/ out.gif [--passes N] [--fps F] [--loop]   (video: --interpolate rife)\n"
               << "  NeuraCraft depth <depth-anything dir> in.png depth.png [--size 518]   (control images: --depth-model dir)\n"
               << "  NeuraCraft parallax <depth-anything dir> in.png out.gif [--frames 48] [--amplitude 0.03] [--zoom 0.06] [--fps 24]\n"
+              << "  NeuraCraft workflow steps.json                         (image / video steps in JSON, see Workflow.h)\n"
               << "  video output: .gif (256 colours), .png (animated PNG, full colour) or .mov (QuickTime Motion-JPEG)\n"
               << "        [--strength S] [--steps N] [--start in.png] [--seed S] [--size N] [--frames-dir DIR] [--full-vae]\n"
               << "        [--sharpen A] [--noise N] [--no-color-match]\n"
@@ -1396,6 +1397,21 @@ int main(int argc, char** argv) {
             std::cout << "wrote " << output << " (" << video.size() << " frames, " << o.width << "x" << o.height << ", " << fps
                       << " fps) in " << std::fixed << std::setprecision(1)
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() << " s" << std::defaultfloat << '\n';
+            return 0;
+        }
+        if (cmd == "workflow") {  // file.json
+            if (args.size() < 2) {
+                usage();
+                return 2;
+            }
+            std::ifstream f(args[1]);
+            if (!f) throw std::runtime_error("cannot open " + args[1]);
+            std::stringstream text;
+            text << f.rdbuf();
+            const auto start = std::chrono::steady_clock::now();
+            const auto clips = runWorkflow(text.str(), ".", [](const std::string& line) { std::cerr << "  " << line << '\n'; });
+            std::cout << "workflow done (" << clips.size() << " clips) in " << std::fixed << std::setprecision(1)
+                      << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() << " s" << std::defaultfloat << '\n';
             return 0;
         }
         if (cmd == "depth" || cmd == "parallax") {  // depth-model in.png out [options]

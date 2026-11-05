@@ -3716,6 +3716,42 @@ TEST(ip_adapter_image_prompts) {
     for (const std::string& d : {dir, tok, enc}) std::filesystem::remove_all(d);
 }
 
+TEST(json_workflows) {
+    std::string tok;
+    const std::string dir = writeTinyStableDiffusion("sd_workflow", tok);
+    const std::string work = tempPath("workflow");
+    std::filesystem::create_directories(work + "/in");
+    Image a;
+    a.width = 40;
+    a.height = 30;
+    for (std::size_t i = 0; i < 40 * 30 * 3; ++i) a.pixels.push_back(static_cast<std::uint8_t>(i * 19 % 256));
+    savePng(work + "/in/a.png", a);
+    savePng(work + "/in/b.png", resizeImage(a, 40, 30));
+    const std::string json = R"({"steps": [
+        {"op": "load", "path": "in/a.png", "out": "pic"},
+        {"op": "load", "dir": "in", "out": "frames"},
+        {"op": "crop", "in": "pic", "width": 64, "height": 64, "out": "square"},
+        {"op": "canny", "in": "square", "out": "edges"},
+        {"op": "txt2img", "model": ")" + dir + R"(", "prompt": "hello", "width": 64, "height": 64, "steps": 2, "out": "gen"},
+        {"op": "img2img", "model": ")" + dir + R"(", "prompt": "he", "in": "square", "width": 64, "height": 64, "steps": 2, "out": "gen2"},
+        {"op": "concat", "in": ["gen", "gen2", "square"], "out": "clip"},
+        {"op": "save", "in": "clip", "path": "clip.gif", "fps": 4},
+        {"op": "save", "in": "gen", "path": "gen.jpg"},
+        {"op": "save", "in": "frames", "path": "frames/"}
+    ]})";
+    std::vector<std::string> log;
+    const auto clips = runWorkflow(json, work, [&](const std::string& l) { log.push_back(l); });
+    CHECK(log.size() == 10 && log[4].rfind("step 5 txt2img", 0) == 0);
+    CHECK(clips.at("frames").size() == 2 && clips.at("square").front().width == 64 && clips.at("edges").front().height == 64);
+    CHECK(clips.at("clip").size() == 3 && clips.at("gen").front().width == 64);
+    CHECK(std::filesystem::exists(work + "/clip.gif") && std::filesystem::exists(work + "/gen.jpg"));
+    CHECK(std::filesystem::exists(work + "/frames/frame_0001.png"));
+    CHECK_THROWS(runWorkflow(R"({"steps": [{"op": "fly"}]})", work), std::invalid_argument);
+    CHECK_THROWS(runWorkflow(R"({"steps": [{"op": "save", "in": "missing", "path": "x.png"}]})", work), std::invalid_argument);
+    CHECK_THROWS(runWorkflow(R"({"nothing": 1})", work), std::invalid_argument);
+    for (const std::string& d : {dir, tok, work}) std::filesystem::remove_all(d);
+}
+
 // ---- Training robustness ------------------------------------------------------------------
 
 TEST(cosine_schedule_and_gradient_clipping) {

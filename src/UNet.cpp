@@ -444,6 +444,12 @@ struct UNet2DCondition::Impl {
     std::vector<UpBlock> ups;
     std::unique_ptr<GroupNorm> normOut;
     std::size_t groups = 32;
+    // ControlNet parts (a ControlNetModel loads as a UNet without up blocks).
+    bool controlNet = false;
+    std::vector<std::unique_ptr<Conv2D>> condConvs;  // conditioning embedding, SiLU after each
+    std::unique_ptr<Conv2D> condOut;
+    std::vector<std::unique_ptr<Conv2D>> zeroConvs;  // one per skip
+    std::unique_ptr<Conv2D> midZero;
     // Down / up block shapes after each resnet, for building motion modules.
     std::vector<std::vector<ImageShape>> downShapes, upShapes;
 };
@@ -464,6 +470,11 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
 }
 
 Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, const std::vector<Matrix>& contexts) {
+    return forwardFrames(latents, timestep, contexts, nullptr);
+}
+
+Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, const std::vector<Matrix>& contexts,
+                                      const std::vector<ControlResiduals>* residuals) {
     Impl& m = *impl_;
     const std::size_t F = latents.rows();
     if (F == 0 || latents.cols() != m.latent.size())
@@ -474,12 +485,13 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
         if (c.cols() != m.contextDim)
             throw std::invalid_argument("UNet2DCondition::forwardFrames: context must have " + std::to_string(m.contextDim) + " columns");
     auto ctx = [&](std::size_t f) -> const Matrix& { return contexts[contexts.size() == 1 ? 0 : f]; };
+    if (residuals && residuals->size() != F) throw std::invalid_argument("UNet2DCondition::forwardFrames: one set of residuals per frame");
     Matrix out(F, m.latent.size());
     if (!hasMotionModules()) {
         for (std::size_t f = 0; f < F; ++f) {
             Matrix one(1, m.latent.size());
             std::copy(latents.data() + f * one.size(), latents.data() + (f + 1) * one.size(), one.data());
-            const Matrix eps = forward(one, timestep, ctx(f));
+            const Matrix eps = forward(one, timestep, ctx(f), residuals ? &(*residuals)[f] : nullptr);
             std::copy(eps.data(), eps.data() + eps.size(), out.data() + f * eps.size());
         }
         return out;
@@ -518,6 +530,13 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
     attend(*m.midAttention);
     m.midMotion->forward(h);
     each([&](const Matrix& x) { return m.mid2->forward(x, temb); });
+    if (residuals)
+        for (std::size_t f = 0; f < F; ++f) {
+            const ControlResiduals& r = (*residuals)[f];
+            if (r.down.size() != skips.size()) throw std::invalid_argument("UNet2DCondition::forwardFrames: residuals do not match the skips");
+            for (std::size_t k = 0; k < skips.size(); ++k) addInPlace(skips[k][f], r.down[k]);
+            addInPlace(h[f], r.mid);
+        }
     for (auto& u : m.ups) {
         for (std::size_t j = 0; j < u.resnets.size(); ++j) {
             std::vector<Matrix>& s = skips.back();
@@ -563,7 +582,65 @@ void loadMotionModules(UNet2DCondition& unet, const std::string& file, bool int8
 }
 
 Matrix UNet2DCondition::forward(const Matrix& latent, float timestep, const Matrix& context) {
+    return forward(latent, timestep, context, nullptr);
+}
+
+bool UNet2DCondition::isControlNet() const { return impl_->controlNet; }
+
+Matrix UNet2DCondition::controlEmbedding(const Matrix& image) {
     Impl& m = *impl_;
+    if (!m.controlNet) throw std::logic_error("UNet2DCondition::controlEmbedding: not a ControlNet");
+    if (image.rows() != 1 || image.cols() != m.condConvs.front()->inputShape().size())
+        throw std::invalid_argument("UNet2DCondition::controlEmbedding: expected a 1 x " +
+                                    std::to_string(m.condConvs.front()->inputShape().size()) + " image (C H W, values 0..1)");
+    Matrix x = image;
+    for (auto& c : m.condConvs) {
+        x = c->forward(x, false);
+        siluInPlace(x);
+    }
+    return m.condOut->forward(x, false);
+}
+
+ControlResiduals UNet2DCondition::control(const Matrix& latent, float timestep, const Matrix& context, const Matrix& embedding, float scale) {
+    Impl& m = *impl_;
+    if (!m.controlNet) throw std::logic_error("UNet2DCondition::control: not a ControlNet");
+    if (latent.rows() != 1 || latent.cols() != m.latent.size())
+        throw std::invalid_argument("UNet2DCondition::control: expected a 1 x " + std::to_string(m.latent.size()) + " latent");
+    Matrix temb = m.t1->forward(timestepEmbedding(timestep, m.timeDim, m.flipSinToCos, m.freqShift), false);
+    siluInPlace(temb);
+    temb = m.t2->forward(temb, false);
+    siluInPlace(temb);
+    Matrix h = m.convIn->forward(latent, false);
+    if (!embedding.sameShape(h)) throw std::invalid_argument("UNet2DCondition::control: embedding does not match (use controlEmbedding)");
+    addInPlace(h, embedding);
+    std::vector<Matrix> skips{h};
+    for (auto& d : m.downs) {
+        for (std::size_t j = 0; j < d.resnets.size(); ++j) {
+            h = d.resnets[j]->forward(h, temb);
+            if (!d.attentions.empty()) h = d.attentions[j]->forward(h, context);
+            skips.push_back(h);
+        }
+        if (d.downsample) {
+            h = d.downsample->forward(h, false);
+            skips.push_back(h);
+        }
+    }
+    h = m.mid1->forward(h, temb);
+    h = m.midAttention->forward(h, context);
+    h = m.mid2->forward(h, temb);
+    ControlResiduals r;
+    for (std::size_t k = 0; k < skips.size(); ++k) {
+        r.down.push_back(m.zeroConvs[k]->forward(skips[k], false));
+        for (float& v : r.down.back().values()) v *= scale;
+    }
+    r.mid = m.midZero->forward(h, false);
+    for (float& v : r.mid.values()) v *= scale;
+    return r;
+}
+
+Matrix UNet2DCondition::forward(const Matrix& latent, float timestep, const Matrix& context, const ControlResiduals* residuals) {
+    Impl& m = *impl_;
+    if (m.controlNet) throw std::logic_error("UNet2DCondition::forward: a ControlNet has no output; use control()");
     if (latent.rows() != 1 || latent.cols() != m.latent.size())
         throw std::invalid_argument("UNet2DCondition::forward: expected a 1 x " + std::to_string(m.latent.size()) + " latent");
     if (context.cols() != m.contextDim)
@@ -589,6 +666,14 @@ Matrix UNet2DCondition::forward(const Matrix& latent, float timestep, const Matr
     h = m.mid1->forward(h, temb);
     h = m.midAttention->forward(h, context);
     h = m.mid2->forward(h, temb);
+    if (residuals) {  // ControlNet: added to the skips and to the mid block output
+        if (residuals->down.size() != skips.size()) throw std::invalid_argument("UNet2DCondition::forward: residuals do not match the skips");
+        for (std::size_t k = 0; k < skips.size(); ++k) {
+            if (!residuals->down[k].sameShape(skips[k])) throw std::invalid_argument("UNet2DCondition::forward: residual shape mismatch");
+            addInPlace(skips[k], residuals->down[k]);
+        }
+        addInPlace(h, residuals->mid);
+    }
     for (auto& u : m.ups) {
         for (std::size_t j = 0; j < u.resnets.size(); ++j) {
             h = u.resnets[j]->forward(concatChannels(h, skips.back()), temb);
@@ -646,7 +731,9 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
     std::vector<std::size_t> heads;
     if (headsKey->isNumber()) heads.assign(ch.size(), static_cast<std::size_t>(headsKey->number));
     else for (const auto& e : headsKey->array) heads.push_back(static_cast<std::size_t>(e.number));
-    const std::vector<std::string> downTypes = strings("down_block_types"), upTypes = strings("up_block_types");
+    const bool control = c.find("_class_name") && c.at("_class_name").string == "ControlNetModel";
+    const std::vector<std::string> downTypes = strings("down_block_types");
+    const std::vector<std::string> upTypes = control ? downTypes : strings("up_block_types");
     if (heads.size() != ch.size() || downTypes.size() != ch.size() || upTypes.size() != ch.size())
         throw std::runtime_error("loadUNet: block lists disagree in length");
     const std::size_t factor = std::size_t(1) << (ch.size() - 1);
@@ -709,6 +796,48 @@ UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, 
     m.midAttention->load(w, "mid_block.attentions.0");
     m.mid2 = std::make_unique<TimeResnet>(s, s.channels, tembDim, groups, eps);
     m.mid2->load(w, "mid_block.resnets.1");
+
+    if (control) {
+        m.controlNet = true;
+        // Conditioning embedding: full-size RGB image -> latent-size features (stride-2 convs).
+        std::vector<std::size_t> cc;
+        if (const json::Value* v = c.find("conditioning_embedding_out_channels"))
+            for (const auto& e : v->array) cc.push_back(static_cast<std::size_t>(e.number));
+        else cc = {16, 32, 96, 256};
+        const std::size_t condIn = static_cast<std::size_t>(c.numberOr("conditioning_channels", 3));
+        const std::size_t up = std::size_t(1) << (cc.size() - 1);
+        ImageShape cs{condIn, latentHeight * up, latentWidth * up};
+        auto addConv = [&](std::size_t out, std::size_t stride, const std::string& name) {
+            m.condConvs.push_back(std::make_unique<Conv2D>(cs, out, 3, stride, 1));
+            w.conv(*m.condConvs.back(), name);
+            cs = m.condConvs.back()->outputShape();
+        };
+        addConv(cc[0], 1, "controlnet_cond_embedding.conv_in");
+        for (std::size_t i = 0; i + 1 < cc.size(); ++i) {
+            addConv(cc[i], 1, "controlnet_cond_embedding.blocks." + std::to_string(2 * i));
+            addConv(cc[i + 1], 2, "controlnet_cond_embedding.blocks." + std::to_string(2 * i + 1));
+        }
+        m.condOut = std::make_unique<Conv2D>(cs, ch[0], 3, 1, 1);
+        w.conv(*m.condOut, "controlnet_cond_embedding.conv_out");
+        if (m.condOut->outputShape().height != latentHeight || m.condOut->outputShape().width != latentWidth)
+            throw std::runtime_error("loadControlNet: conditioning embedding does not reach the latent size");
+        // Zero convolutions on every skip and on the mid block output.
+        std::vector<ImageShape> skipShapes{m.convIn->outputShape()};
+        for (std::size_t i = 0; i < ch.size(); ++i) {
+            for (const ImageShape& rs : m.downShapes[i]) skipShapes.push_back(rs);
+            if (m.downs[i].downsample) skipShapes.push_back(m.downs[i].downsample->outputShape());
+        }
+        for (std::size_t k = 0; k < skipShapes.size(); ++k) {
+            m.zeroConvs.push_back(std::make_unique<Conv2D>(skipShapes[k], skipShapes[k].channels, 1));
+            w.conv(*m.zeroConvs.back(), "controlnet_down_blocks." + std::to_string(k));
+        }
+        m.midZero = std::make_unique<Conv2D>(s, s.channels, 1);
+        w.conv(*m.midZero, "controlnet_mid_block");
+        if (merger.layers() && !merger.merged())
+            throw std::runtime_error("loadUNet: the LoRA matches no layer of this ControlNet");
+        for (const auto& name : w.st.names()) m.params += w.st.info(name).elements();
+        return unet;
+    }
 
     for (std::size_t i = 0; i < ch.size(); ++i) {
         UpBlock u;
@@ -922,6 +1051,21 @@ void denoise(const std::string& dir, const std::pair<Matrix, Matrix>& context, c
     auto t = PipelineClock::now();
     UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8, o.loras);
     reportStage(o, "load unet", t);
+    UNet2DCondition controlNet;
+    Matrix embedding;
+    if (!o.controlNet.empty()) {
+        t = PipelineClock::now();
+        controlNet = loadUNet(o.controlNet, o.width / 8, o.height / 8, o.int8);
+        if (!controlNet.isControlNet()) throw std::runtime_error(o.controlNet + " is not a ControlNetModel");
+        if (o.controlImage.pixels.empty()) throw std::invalid_argument("ControlNet: no control image");
+        embedding = controlNet.controlEmbedding(imageToTensor(fitImage(toRgb(o.controlImage), o.width, o.height), 0.0f, 1.0f));
+        reportStage(o, "load controlnet", t);
+    }
+    auto predict = [&](const Matrix& in, float timestep, const Matrix& ctx) {
+        if (embedding.empty()) return unet.forward(in, timestep, ctx);
+        const ControlResiduals r = controlNet.control(in, timestep, ctx, embedding, o.controlScale);
+        return unet.forward(in, timestep, ctx, &r);
+    };
     if (latent.empty()) {  // text to image: a Gaussian latent at the first sigma
         setSeed(o.seed);
         latent = Matrix::normal(1, unet.latentShape().size(), 0.0f, 1.0f);
@@ -932,9 +1076,9 @@ void denoise(const std::string& dir, const std::pair<Matrix, Matrix>& context, c
         Matrix in = latent;
         const float scale = static_cast<float>(sched.inputScale(i));
         for (float& v : in.values()) v *= scale;
-        Matrix eps = unet.forward(in, static_cast<float>(sched.timesteps[i]), context.first);
+        Matrix eps = predict(in, static_cast<float>(sched.timesteps[i]), context.first);
         if (o.guidance > 1.0f) {
-            const Matrix uncond = unet.forward(in, static_cast<float>(sched.timesteps[i]), context.second);
+            const Matrix uncond = predict(in, static_cast<float>(sched.timesteps[i]), context.second);
             for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + o.guidance * (eps.data()[k] - uncond.data()[k]);
         }
         sched.step(i, eps, latent);
@@ -1074,6 +1218,18 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
     UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8, o.loras);
     loadMotionModules(unet, motion, o.int8);
     reportStage(o, "load unet + motion", t);
+    UNet2DCondition controlNet;
+    std::vector<Matrix> embeddings;  // one, or one per frame
+    if (!v.controlNet.empty()) {
+        t = PipelineClock::now();
+        if (v.controlImages.size() != 1 && v.controlImages.size() != v.frames)
+            throw std::invalid_argument("textToVideo: give one control image or one per frame");
+        controlNet = loadUNet(v.controlNet, o.width / 8, o.height / 8, o.int8);
+        if (!controlNet.isControlNet()) throw std::runtime_error(v.controlNet + " is not a ControlNetModel");
+        for (const Image& c : v.controlImages)
+            embeddings.push_back(controlNet.controlEmbedding(imageToTensor(fitImage(toRgb(c), o.width, o.height), 0.0f, 1.0f)));
+        reportStage(o, "load controlnet", t);
+    }
     const EulerScheduler sched =
         v.betaSchedule == "config" ? schedulerFor(dir, v.steps, v.sampler)
         : v.sampler == "lcm"       ? EulerScheduler::lcm(v.steps, v.betaSchedule)  // AnimateLCM: LCM steps, linear betas
@@ -1115,15 +1271,27 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
         }
         starts.push_back(s);
     }
+    // One window: the ControlNet's residuals for each of its frames, then the UNet.
+    auto window = [&](const Matrix& in, std::size_t s, float timestep, const std::vector<Matrix>& ctx) {
+        if (embeddings.empty()) return unet.forwardFrames(in, timestep, ctx);
+        std::vector<ControlResiduals> res;
+        for (std::size_t f = 0; f < in.rows(); ++f) {
+            Matrix one(1, n);
+            std::copy(in.data() + f * n, in.data() + (f + 1) * n, one.data());
+            res.push_back(controlNet.control(one, timestep, ctx[ctx.size() == 1 ? 0 : f], embeddings[embeddings.size() == 1 ? 0 : s + f],
+                                             v.controlScale));
+        }
+        return unet.forwardFrames(in, timestep, ctx, &res);
+    };
     auto predict = [&](const Matrix& in, float timestep, const std::vector<Matrix>& ctx) {
-        if (starts.size() == 1) return unet.forwardFrames(in, timestep, ctx);
+        if (starts.size() == 1) return window(in, 0, timestep, ctx);
         Matrix sum(F, n);
         std::vector<float> weight(F, 0.0f);
         for (std::size_t s : starts) {
             Matrix win(ctxLen, n);
             std::copy(in.data() + s * n, in.data() + (s + ctxLen) * n, win.data());
-            const Matrix e = unet.forwardFrames(
-                win, timestep, ctx.size() == 1 ? ctx : std::vector<Matrix>(ctx.begin() + static_cast<long>(s), ctx.begin() + static_cast<long>(s + ctxLen)));
+            const Matrix e = window(
+                win, s, timestep, ctx.size() == 1 ? ctx : std::vector<Matrix>(ctx.begin() + static_cast<long>(s), ctx.begin() + static_cast<long>(s + ctxLen)));
             for (std::size_t f = 0; f < ctxLen; ++f) {
                 // Pyramid weights: frames near a window's middle count most.
                 const float wgt = static_cast<float>(std::min(f + 1, ctxLen - f));
@@ -1152,7 +1320,8 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
         sched.step(i, eps, latents);
         reportStage(o, "step " + std::to_string(i + 1) + "/" + std::to_string(sched.timesteps.size()), t);
     }
-    unet = UNet2DCondition();  // free the UNet before decoding
+    unet = UNet2DCondition();  // free the UNet (and ControlNet) before decoding
+    controlNet = UNet2DCondition();
     t = PipelineClock::now();
     std::unique_ptr<TinyVae> tiny;
     std::unique_ptr<Vae> vae;

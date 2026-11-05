@@ -3290,6 +3290,101 @@ TEST(inpainting_and_outpaint_zoom) {
     for (const std::string& d : {dir, tok, plainDir, tok2}) std::filesystem::remove_all(d);
 }
 
+// A tiny ControlNetModel for the tiny UNet (blocks 8, 16; layers_per_block 1).
+void writeTinyControlNet(const std::string& dir, bool zeroOutputs) {
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir + "/config.json")
+        << R"({"_class_name":"ControlNetModel","act_fn":"silu","attention_head_dim":[2,2],"block_out_channels":[8,16],)"
+        << R"("conditioning_embedding_out_channels":[4,4,4,4],"cross_attention_dim":6,)"
+        << R"("down_block_types":["CrossAttnDownBlock2D","DownBlock2D"],"flip_sin_to_cos":true,"freq_shift":0,"in_channels":4,)"
+        << R"("layers_per_block":1,"norm_eps":1e-5,"norm_num_groups":4,"use_linear_projection":true})";
+    std::map<std::string, Matrix> w;
+    for (auto& [name, m] : tinyUNetWeights({8, 16}, 1, 6))
+        if (name.rfind("up_blocks", 0) != 0 && name.rfind("conv_norm_out", 0) != 0 && name.rfind("conv_out", 0) != 0) w[name] = m;
+    auto conv = [&](const std::string& n, std::size_t o, std::size_t i, std::size_t k, bool zero) {
+        w[n + ".weight"] = zero ? Matrix(1, o * i * k * k) : Matrix::uniform(1, o * i * k * k, -0.3f, 0.3f);
+        w[n + ".bias"] = zero ? Matrix(1, o) : Matrix::uniform(1, o, -0.1f, 0.1f);
+    };
+    conv("controlnet_cond_embedding.conv_in", 4, 3, 3, false);
+    for (int b = 0; b < 6; ++b) conv("controlnet_cond_embedding.blocks." + std::to_string(b), 4, 4, 3, false);
+    conv("controlnet_cond_embedding.conv_out", 8, 4, 3, zeroOutputs);
+    const std::size_t skips[4] = {8, 8, 8, 16};
+    for (int k = 0; k < 4; ++k) conv("controlnet_down_blocks." + std::to_string(k), skips[k], skips[k], 1, zeroOutputs);
+    conv("controlnet_mid_block", 16, 16, 1, zeroOutputs);
+    saveAll(dir + "/diffusion_pytorch_model.safetensors", w);
+}
+
+TEST(controlnet_and_canny_edges) {
+    // Canny: a bright square on black has edges on its border only; a flat picture has none.
+    Image sq;
+    sq.width = sq.height = 32;
+    sq.pixels.assign(32 * 32 * 3, 0);
+    for (std::size_t y = 8; y < 24; ++y)
+        for (std::size_t x = 8; x < 24; ++x) std::fill_n(sq.pixels.data() + (y * 32 + x) * 3, 3, 200);
+    const Image e = cannyEdges(sq);
+    CHECK(e.channels == 3 && e.width == 32);
+    std::size_t edges = 0, inside = 0, far = 0;
+    for (std::size_t y = 0; y < 32; ++y)
+        for (std::size_t x = 0; x < 32; ++x) {
+            if (e.pixels[(y * 32 + x) * 3] == 0) continue;
+            ++edges;
+            if (y >= 11 && y < 21 && x >= 11 && x < 21) ++inside;
+            if (y < 5 || y >= 27 || x < 5 || x >= 27) ++far;
+        }
+    CHECK(edges >= 40 && inside == 0 && far == 0);
+    Image flat = sq;
+    std::fill(flat.pixels.begin(), flat.pixels.end(), static_cast<std::uint8_t>(90));
+    for (std::uint8_t v : cannyEdges(flat).pixels) CHECK(v == 0);
+
+    // ControlNet: loads as a UNet without up blocks; zero convolutions give zero residuals.
+    std::string tok;
+    const std::string dir = writeTinyStableDiffusion("sd_control", tok);
+    writeTinyControlNet(dir + "/cn_zero", true);
+    writeTinyControlNet(dir + "/cn", false);
+    UNet2DCondition unet = loadUNet(dir, 8, 8), zero = loadUNet(dir + "/cn_zero", 8, 8), cn = loadUNet(dir + "/cn", 8, 8);
+    CHECK(cn.isControlNet() && !unet.isControlNet());
+    const Matrix latent = Matrix::normal(1, 4 * 8 * 8, 0.0f, 1.0f), ctx = Matrix::uniform(8, 6, -1.0f, 1.0f);
+    const Matrix image = Matrix::uniform(1, 3 * 64 * 64, 0.0f, 1.0f);
+    CHECK_THROWS(cn.forward(latent, 10.0f, ctx), std::logic_error);
+    CHECK_THROWS(unet.controlEmbedding(image), std::logic_error);
+    const ControlResiduals rz = zero.control(latent, 10.0f, ctx, zero.controlEmbedding(image));
+    CHECK(rz.down.size() == 4);
+    const Matrix plain = unet.forward(latent, 10.0f, ctx);
+    CHECK(unet.forward(latent, 10.0f, ctx, &rz).values() == plain.values());
+    const ControlResiduals r = cn.control(latent, 10.0f, ctx, cn.controlEmbedding(image), 0.7f);
+    const ControlResiduals r1 = cn.control(latent, 10.0f, ctx, cn.controlEmbedding(image), 1.0f);
+    for (std::size_t k = 0; k < r.mid.size(); ++k) CHECK_NEAR(r.mid.data()[k], 0.7f * r1.mid.data()[k], 1e-5);
+    CHECK(unet.forward(latent, 10.0f, ctx, &r).values() != plain.values());
+
+    // Pipelines: scale 0 equals no ControlNet; a control image steers the picture.
+    TextToImageOptions o;
+    o.width = o.height = 64;
+    o.steps = 2;
+    const Image base = textToImage(dir, "hello", o);
+    o.controlNet = dir + "/cn";
+    o.controlImage = cannyEdges(sq);
+    o.controlScale = 0.0f;
+    CHECK(textToImage(dir, "hello", o).pixels == base.pixels);
+    o.controlScale = 1.0f;
+    CHECK(textToImage(dir, "hello", o).pixels != base.pixels);
+    o.controlImage = Image{};
+    CHECK_THROWS(textToImage(dir, "hello", o), std::invalid_argument);
+    // Text to video with one control image per frame.
+    std::filesystem::create_directories(dir + "/motion");
+    saveAll(dir + "/motion/tiny.safetensors", tinyMotionWeights({8, 16}, 1));
+    TextToVideoOptions v;
+    v.width = v.height = 64;
+    v.frames = 3;
+    v.steps = 1;
+    v.controlNet = dir + "/cn";
+    v.controlImages = {sq, flat, sq};
+    CHECK(textToVideo(dir, "hello", v).size() == 3);
+    v.controlImages = {sq, flat};
+    CHECK_THROWS(textToVideo(dir, "hello", v), std::invalid_argument);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(tok);
+}
+
 // ---- Training robustness ------------------------------------------------------------------
 
 TEST(cosine_schedule_and_gradient_clipping) {

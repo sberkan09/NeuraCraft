@@ -475,7 +475,9 @@ scene, so a 16-frame clip shows a blend of both prompts; over a longer clip
 (32 frames above: three overlapping windows, 384 x 384, 29 minutes on the
 2-core machine) the change from spring to winter comes through.
 
-**LoRA and LCM.** `--lora file.safetensors[:scale]` merges LoRA adapters
+### LoRA and the LCM sampler
+
+`--lora file.safetensors[:scale]` merges LoRA adapters
 (kohya / A1111 `lora_unet_*` / `lora_te_*` and diffusers / PEFT `lora_A` /
 `lora_B` files, linear and convolution layers) into the UNet and text encoder
 while they load, before int8 quantization, for every image and video command
@@ -549,7 +551,44 @@ machine. `--zoom-in` plays it the other way.) Starting the border from pure
 noise (`--strength 1`) tends to make the model paint a frame around the old
 picture; the mirrored start avoids that.
 
-**Output formats**, all written by the library itself: `.gif` (`saveGif`,
+### ControlNet
+
+```
+$ scripts/download_controlnet.sh data/controlnet-canny canny     # ControlNet 1.1 canny for SD 1.5 (~720 MB)
+$ ./build_and_run.sh txt2img data/animatediff "a wooden cabin in a sunny green summer meadow, photo" out.png \
+      --controlnet data/controlnet-canny --control cabin.png --canny \
+      --steps 4 --sampler lcm --lora data/loras/lcm-lora-sdv1-5.safetensors
+```
+
+<p><img src="docs/images/video_i2v_input.jpg" width="200"> <img src="docs/images/controlnet_edges.jpg" width="200"> <img src="docs/images/controlnet_result.jpg" width="200"></p>
+
+A diffusers `ControlNetModel` directory loads with `loadUNet()` as a UNet
+without up blocks: the conditioning embedding turns the control picture into
+latent-size features, the copied down / mid blocks run on the noisy latent,
+and zero convolutions produce residuals that `forward(..., residuals)` adds
+to the UNet's skips and mid block (`controlScale` weights them).
+`scripts/controlnet_reference.py` agrees with it within 2.5e-6.
+`cannyEdges()` follows OpenCV's `cv2.Canny` (the ControlNet canny
+preprocessor; IoU 0.99 with OpenCV's edges). Above: the snowy cabin's edges
+(middle) redrawn as a summer scene, 4 LCM steps, 92 s. ControlNet works for
+text to image, image to image and text / video to video (`--control-dir`, or
+`--canny` alone with `--init-dir` to take the edges of the input clip).
+
+```
+$ ./build_and_run.sh video data/animatediff t2v "a golden retriever puppy standing on a beach at sunset, photo" \
+      --init-dir corgi_frames/ --strength 0.75 --controlnet data/controlnet-canny --canny --control-scale 0.8 --size 384
+```
+
+<p><img src="docs/images/video_v2v.gif" width="384"></p>
+
+Above: the corgi clip (left) restyled frame by frame with its own canny
+edges as ControlNet input (right): the motion and outline follow the
+source, the light and colours follow the prompt (16 frames at 384 x 384,
+3 steps with ControlNet on every frame: 17 minutes on the 2-core machine).
+
+### Output formats
+
+All written by the library itself: `.gif` (`saveGif`,
 256 colours, plays everywhere), `.png` (`saveApng`, animated PNG, full
 colour and lossless, plays in browsers), `.mov` (`saveMjpegMov`, a QuickTime
 movie of JPEG frames that QuickTime, Finder previews, VLC and ffmpeg play),
@@ -654,7 +693,9 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
 | Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE with Llama 3 scaling, grouped-query attention, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
 | Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales; integer AVX-VNNI / AVX2 / NEON products, expanded-tile GEMM for many rows), `Network::quantize()` for Dense, Conv2D, attention and embeddings (shared with tied outputs), `setInt8Inputs` |
-| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG (read / write) and PPM files, `resizeImage` / `fitImage`, `loadVae()`, `loadTinyVae()` (TAESD), `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` / `textToLatent()` / `decodeLatent()` / `imageToImage()`, `StableDiffusion` (models kept in memory), `morphAnimation()`, `zoomAnimation()`, `transformImage()`, `saveGif()` (animated GIF) |
+| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG (read / write) and PPM files, `resizeImage` / `fitImage`, `loadVae()`, `loadTinyVae()` (TAESD), `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` / `textToLatent()` / `decodeLatent()` / `imageToImage()`, `StableDiffusion` (models kept in memory; `inpaint()`), `morphAnimation()`, `zoomAnimation()`, `outpaintZoom()`, `textToVideo()` (AnimateDiff motion modules: `loadMotionModules()`, `forwardFrames()`, windows, prompt travel, image / video to video), ControlNet (`controlEmbedding()`, `control()`), `cannyEdges()`, `transformImage()`, `EulerScheduler::lcm` |
+| LoRA | `Lora.h` | `LoraMerger`: kohya / A1111 and PEFT LoRA files merged into the UNet and text encoder while they load |
+| Files | `Image.h` | PNG (own inflate and deflate), animated PNG, JPEG (baseline encoder), animated GIF (median-cut palette, LZW), QuickTime Motion-JPEG `.mov`, PPM |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
 | Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k, top-p, repetition penalty, streaming callback, stop tokens), `Generator` (multi-turn, KV cache kept between calls) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |
@@ -718,7 +759,15 @@ paths, strided and 1x1) and int8 UNet / CLIP loading against float, and the
 whole text-to-image pipeline on tiny synthetic models, with either decoder,
 the PNG reader on embedded Pillow / zlib files (all three deflate block kinds,
 palette with transparency, 16-bit), resizing and cropping, and image to image
-(strength picks the number of steps). CI runs
+(strength picks the number of steps), the persistent session against the
+one-shot pipeline, prompt morphs (keyframes exact) and zoom animations, the GIF
+writer (decoded by a test-side LZW reader), compressed PNG round trips and
+APNG / JPEG / QuickTime structure, AnimateDiff motion modules (frames mix only
+with them; per-frame prompts; windows; image and video to video), LoRA merging
+against the formula (kohya and PEFT names), the LCM scheduler's timesteps and
+step, inpainting (pixels outside the mask kept exactly) and the outpaint zoom,
+ControlNet (zero convolutions change nothing, scale 0 equals no ControlNet)
+and canny edges. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
 kernels).
 

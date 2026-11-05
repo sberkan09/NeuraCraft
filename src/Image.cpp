@@ -1153,6 +1153,85 @@ Image fitImage(const Image& image, std::size_t width, std::size_t height) {
     return crop.width == width && crop.height == height ? crop : resizeImage(crop, width, height);
 }
 
+Image cannyEdges(const Image& input, float low, float high) {
+    checkImage(input, "cannyEdges");
+    const Image im = input.channels == 1 ? input : toRgb(input);
+    const long W = static_cast<long>(im.width), H = static_cast<long>(im.height), C = static_cast<long>(im.channels);
+    auto at = [&](long x, long y, long c) {  // replicated border, as OpenCV's Canny
+        x = std::max(0L, std::min(W - 1, x));
+        y = std::max(0L, std::min(H - 1, y));
+        return static_cast<float>(im.pixels[static_cast<std::size_t>((y * W + x) * C + c)]);
+    };
+    // Per pixel, the channel with the largest L1 gradient (OpenCV's rule for colour images).
+    std::vector<float> mag(static_cast<std::size_t>(W * H)), gx(mag.size()), gy(mag.size());
+    for (long y = 0; y < H; ++y)
+        for (long x = 0; x < W; ++x) {
+            const std::size_t i = static_cast<std::size_t>(y * W + x);
+            mag[i] = -1.0f;
+            for (long c = 0; c < C; ++c) {
+                const float dx = (at(x + 1, y - 1, c) + 2 * at(x + 1, y, c) + at(x + 1, y + 1, c)) -
+                                 (at(x - 1, y - 1, c) + 2 * at(x - 1, y, c) + at(x - 1, y + 1, c));
+                const float dy = (at(x - 1, y + 1, c) + 2 * at(x, y + 1, c) + at(x + 1, y + 1, c)) -
+                                 (at(x - 1, y - 1, c) + 2 * at(x, y - 1, c) + at(x + 1, y - 1, c));
+                const float m = std::abs(dx) + std::abs(dy);
+                if (m > mag[i]) {
+                    mag[i] = m;
+                    gx[i] = dx;
+                    gy[i] = dy;
+                }
+            }
+        }
+    // Non-maximum suppression along the gradient direction (4 sectors, as OpenCV with tan(22.5°)).
+    std::vector<std::uint8_t> state(mag.size(), 0);  // 0 none, 1 weak, 2 strong
+    const float tan22 = 0.4142135623730951f;
+    for (long y = 1; y + 1 < H; ++y)
+        for (long x = 1; x + 1 < W; ++x) {
+            const std::size_t i = static_cast<std::size_t>(y * W + x);
+            const float m = mag[i];
+            if (m <= low) continue;
+            const float ax = std::abs(gx[i]), ay = std::abs(gy[i]);
+            float a, b;
+            if (ay <= ax * tan22) {  // horizontal gradient: compare left / right
+                a = mag[i - 1];
+                b = mag[i + 1];
+            } else if (ay >= ax / tan22) {  // vertical
+                a = mag[i - static_cast<std::size_t>(W)];
+                b = mag[i + static_cast<std::size_t>(W)];
+            } else {  // diagonal: both neighbours strictly smaller
+                const bool same = (gx[i] < 0) == (gy[i] < 0);
+                a = same ? mag[i - static_cast<std::size_t>(W) - 1] : mag[i - static_cast<std::size_t>(W) + 1];
+                b = same ? mag[i + static_cast<std::size_t>(W) + 1] : mag[i + static_cast<std::size_t>(W) - 1];
+                if (!(m > b)) continue;
+            }
+            if (m > a && m >= b) state[i] = m > high ? 2 : 1;
+        }
+    // Hysteresis: weak pixels connected (8-neighbourhood) to strong ones become edges.
+    std::vector<std::size_t> stack;
+    for (std::size_t i = 0; i < state.size(); ++i)
+        if (state[i] == 2) stack.push_back(i);
+    while (!stack.empty()) {
+        const std::size_t i = stack.back();
+        stack.pop_back();
+        const long x = static_cast<long>(i) % W, y = static_cast<long>(i) / W;
+        for (long dy = -1; dy <= 1; ++dy)
+            for (long dx = -1; dx <= 1; ++dx) {
+                const long xx = x + dx, yy = y + dy;
+                if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+                const std::size_t j = static_cast<std::size_t>(yy * W + xx);
+                if (state[j] == 1) {
+                    state[j] = 2;
+                    stack.push_back(j);
+                }
+            }
+    }
+    Image out;
+    out.width = im.width;
+    out.height = im.height;
+    out.pixels.resize(im.width * im.height * 3);
+    for (std::size_t i = 0; i < state.size(); ++i) std::fill_n(out.pixels.data() + i * 3, 3, state[i] == 2 ? 255 : 0);
+    return out;
+}
+
 Image transformImage(const Image& image, float scale, float dx, float dy, float angleDegrees) {
     checkImage(image, "transformImage");
     if (scale <= 0.0f) throw std::invalid_argument("transformImage: scale must be > 0");

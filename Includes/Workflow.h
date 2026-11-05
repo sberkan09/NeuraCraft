@@ -18,7 +18,10 @@
 #include <cstddef>
 #include <functional>
 #include <limits>
+#include <list>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -68,6 +71,36 @@ struct WorkflowCancelled : std::runtime_error {
 };
 
 std::map<std::string, Clip> runWorkflow(const std::string& json, const std::string& baseDirectory, const WorkflowEvents& events);
+
+// Results of earlier runs, so a step whose settings and inputs have not changed is not computed again
+// (the Studio server keeps one across jobs: change a late step and only it and what follows re-run).
+// A step's key covers its fields (not "out" or editor data), the keys of the clips it reads, and the
+// size and time of the files it names; save steps always run. Least recently used results are dropped
+// beyond maxBytes. Thread-safe.
+class WorkflowResultCache {
+public:
+    explicit WorkflowResultCache(std::size_t maxBytes = std::size_t(1) << 30) : maxBytes_(maxBytes) {}
+    std::shared_ptr<const Clip> find(const std::string& key);
+    void put(const std::string& key, const Clip& clip);
+    void clear();
+    std::size_t bytes() const;
+    std::size_t size() const;
+    std::size_t hits() const;
+
+private:
+    struct Entry {
+        std::string key;
+        std::shared_ptr<const Clip> clip;
+        std::size_t bytes;
+    };
+    mutable std::mutex mutex_;
+    std::list<Entry> entries_;  // most recently used first
+    std::size_t maxBytes_, bytes_ = 0, hits_ = 0;
+};
+
+// As above, reusing (and filling) `results` when it is not null; reused steps report the stage "cached".
+std::map<std::string, Clip> runWorkflow(const std::string& json, const std::string& baseDirectory, const WorkflowEvents& events,
+                                        WorkflowResultCache* results);
 
 // ---- Schema: what each operation takes (drives validation, docs and the Studio UI) ----
 

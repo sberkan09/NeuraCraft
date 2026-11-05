@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import type { Step, Workflow, WorkflowOp } from "../api";
+import type { CacheInfo, Step, Workflow, WorkflowOp } from "../api";
 import { api } from "../api";
 import type { Engine } from "../engine";
-import { freeSpot, topoSort, withLayout, type StepUi } from "../graph";
+import { freeSpot, latestRuns, stepId, topoSort, upstream, withLayout, type StepUi } from "../graph";
 import { pickModel } from "../templates";
 import { FieldInput, fieldLabel } from "./FieldInput";
 import { GraphCanvas } from "./GraphCanvas";
@@ -123,12 +123,20 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
     setSelected(Math.max(0, Math.min(i, steps.length - 2)));
   };
 
-  async function run() {
+  // Runs the whole workflow, or only what step `upTo` needs (it and the steps it reads, without saves).
+  // The engine reuses unchanged results, so this is quick for a step late in a long workflow.
+  async function run(upTo?: number) {
     setBusy(true);
     try {
       const r = await api.check(workflow);
       setProblems(r.problems);
-      if (!r.problems.length) setJobId(await engine.run(workflow, props.title));
+      if (r.problems.length) return;
+      if (upTo === undefined) {
+        setJobId(await engine.run(workflow, props.title));
+      } else {
+        const keep = upstream(steps, ops, upTo).filter((k) => k === upTo || steps[k].op !== "save");
+        setJobId(await engine.run({ ...workflow, steps: keep.map((k) => steps[k]) }, `${props.title} · adım ${upTo + 1}`));
+      }
     } catch (e) {
       const err = e as Error & { problems?: string[] };
       setProblems(err.problems ?? [err.message]);
@@ -138,6 +146,13 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
   }
 
   const job = engine.jobs.find((j) => j.id === jobId);
+  const runs = useMemo(() => latestRuns(engine.jobs), [engine.jobs]);
+  const [cache, setCache] = useState<CacheInfo>();
+  const jobState = job?.state;
+  useEffect(() => {
+    if (jobState === "running" || jobState === "queued") return;
+    api.cache().then(setCache).catch(() => setCache(undefined));
+  }, [jobState, engine.connected]);
   const sel = steps[selected];
   const selOp = sel ? ops.get(sel.op) : undefined;
   const hasTimeline = !!selOp?.fields.some((f) => f.type === "keyframes");
@@ -147,9 +162,10 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
   const clipsBefore = (i: number) => steps.slice(0, i).filter((s) => ops.get(s.op)?.output).map((s) => String(s.out ?? s.op));
   const groups = groupOrder.map((g) => ({ g, list: [...ops.values()].filter((o) => o.group === g) }));
   const stepState = (i: number) => {
-    if (!job) return "";
-    if (job.outputs.some((o) => o.step === i + 1)) return "done";
-    if (job.state === "running" && job.step === i + 1) return "running";
+    const r = runs.get(stepId(steps[i]));
+    if (!r) return "";
+    if (r.job.outputs.some((o) => o.step === r.index + 1)) return "done";
+    if (r.job.state === "running" && r.job.step === r.index + 1) return "running";
     return "";
   };
 
@@ -184,12 +200,12 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
         </div>
         {message ? <div className="problems" style={{ margin: "10px 16px 0" }} role="alert">{message}</div> : null}
         {view === "timeline" && sel && selOp && hasTimeline ? (
-          <PromptTimeline step={sel} op={selOp} job={job} onChange={(field, x) => update(selected, field, x)} onBack={() => setView("graph")} />
+          <PromptTimeline step={sel} op={selOp} run={runs.get(stepId(sel))} onChange={(field, x) => update(selected, field, x)} onBack={() => setView("graph")} />
         ) : view === "graph" ? (
           steps.length === 0 ? (
             <div className="empty">Soldan bir işlem ekleyerek başla. Düğümleri sürükle; bir düğümün sağındaki çıkışı diğerinin solundaki girişe çekerek bağla.</div>
           ) : (
-            <GraphCanvas steps={laidSteps} ops={ops} models={engine.models} job={job} invalidSteps={invalidSteps} selected={selected}
+            <GraphCanvas steps={laidSteps} ops={ops} models={engine.models} runs={runs} invalidSteps={invalidSteps} selected={selected}
               onSelect={(i) => i >= 0 && setSelected(i)} onChange={setSteps} onMessage={setMessage} />
           )
         ) : view === "json" ? (
@@ -221,7 +237,7 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
                   <div className="row">
                     <span className="t">{i + 1}. {op?.title ?? s.op} <span className="help">· {s.op}{s.out ? ` → ${s.out}` : ""}</span></span>
                     <span className="toolbar">
-                      {st === "done" ? <span className="state done">bitti</span> : st === "running" ? <span className="state running">{job?.stage}</span> : null}
+                      {st === "done" ? <span className="state done">bitti</span> : st === "running" ? <span className="state running">{runs.get(stepId(s))?.job.stage}</span> : null}
                       <button type="button" className="btn small ghost" aria-label="Yukarı taşı" onClick={(e) => { e.stopPropagation(); move(i, -1); }}>↑</button>
                       <button type="button" className="btn small ghost" aria-label="Aşağı taşı" onClick={(e) => { e.stopPropagation(); move(i, 1); }}>↓</button>
                       <button type="button" className="btn small ghost danger" aria-label="Sil" onClick={(e) => { e.stopPropagation(); remove(i); }}>×</button>
@@ -251,6 +267,12 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
           {job && (job.state === "running" || job.state === "queued") ? (
             <button type="button" className="btn danger" onClick={() => void engine.cancel(job.id)}>Durdur</button>
           ) : null}
+          {cache?.enabled && cache.entries > 0 ? (
+            <button type="button" className="btn small ghost" title="Değişmeyen adımlar yeniden hesaplanmaz; temizlersen her şey baştan çalışır"
+              onClick={() => void api.clearCache().then(setCache)}>
+              Önbellek: {cache.entries} sonuç · {Math.max(1, Math.round(cache.bytes / 1048576))} MB · temizle
+            </button>
+          ) : null}
           <button type="button" className="btn primary" disabled={busy || !steps.length || problems.length > 0 || !engine.connected} onClick={() => void run()}>▶ Çalıştır</button>
         </div>
       </section>
@@ -263,6 +285,10 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
               <h2 style={{ margin: "2px 0 0", fontSize: 20 }}>{selOp.title}</h2>
               <p className="note" style={{ margin: "4px 0 0" }}>{selOp.doc}</p>
             </div>
+            <button type="button" className="btn small" title="Yalnızca bu adımı ve okuduğu adımları çalıştırır; değişmeyen sonuçlar yeniden kullanılır"
+              disabled={busy || problems.length > 0 || !engine.connected || (job?.state === "running")} onClick={() => void run(selected)}>
+              ▶ Bu adıma kadar çalıştır
+            </button>
             {selOp.fields.map((f) => f.type === "keyframes" ? (
               <div key={f.name} className="field">
                 <span className="label">{fieldLabel(f.name)}</span>

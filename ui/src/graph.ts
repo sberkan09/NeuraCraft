@@ -2,6 +2,7 @@
 // source of truth (steps in an order where every clip is made before it is read).
 
 import type { Step, Workflow, WorkflowOp } from "./api";
+import type { LiveJob } from "./engine";
 
 export interface StepUi {
   id: string;
@@ -112,4 +113,26 @@ export function freeSpot(steps: Step[], x: number, y: number): StepUi {
     });
   while (taken(y)) y += 170;
   return makeStepUi(x, y);
+}
+
+// The latest run of each node (by id) across the jobs started in this tab, newest first in `jobs`.
+export interface NodeRun {
+  job: LiveJob;
+  index: number; // the step's index in job.workflow
+}
+export function latestRuns(jobs: LiveJob[]): Map<string, NodeRun> {
+  const runs = new Map<string, NodeRun>();
+  for (let k = jobs.length - 1; k >= 0; --k)
+    jobs[k].workflow?.steps.forEach((s, index) => {
+      const id = stepId(s);
+      if (id) runs.set(id, { job: jobs[k], index });
+    });
+  return runs;
+}
+
+// Steps needed to compute step i: it and everything it reads, directly or not (in workflow order).
+export function upstream(steps: Step[], ops: Map<string, WorkflowOp>, i: number): number[] {
+  const need = new Set<number>([i]);
+  for (let k = i; k >= 0; --k) if (need.has(k)) for (const r of references(steps, ops, k)) need.add(r.from);
+  return [...need].sort((a, b) => a - b);
 }

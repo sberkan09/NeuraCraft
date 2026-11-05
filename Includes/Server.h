@@ -14,6 +14,7 @@
 //   POST /api/jobs/<id>/cancel
 //   GET  /api/jobs/<id>/preview.jpg     latest live preview of a running job
 //   GET  /api/jobs/<id>/clips/<clip>/<frame>.jpg
+//   GET  /api/cache, POST /api/cache/clear   results kept for reuse (WorkflowResultCache)
 //   GET  /api/events                    server-sent events: job, progress, preview, output, log
 //   GET  /...                           files of the web UI folder (ServerOptions::uiDir), if set
 //
@@ -35,6 +36,8 @@ struct ServerOptions {
     std::string baseDir = ".";  // relative paths in workflows are taken from here
     std::string uiDir;          // static files served at /, if not empty
     std::size_t keepJobs = 8;   // finished jobs whose clips stay in memory
+    // Step results reused by later jobs when a step and its inputs are unchanged; 0 turns it off.
+    std::size_t cacheBytes = std::size_t(1) << 30;
 };
 
 class StudioServer {

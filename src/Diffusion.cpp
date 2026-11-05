@@ -1,4 +1,5 @@
 #include "Diffusion.h"
+#include "Profile.h"
 #include "Activations.h"
 #include "Dense.h"
 #include "Json.h"
@@ -117,6 +118,7 @@ struct Builder {
 } // namespace
 
 Matrix Vae::encode(const Matrix& img) {
+    NC_PROFILE("vae");
     const Matrix moments = encoder.predict(img);
     const std::size_t n = latent.size();
     Matrix z(moments.rows(), n);
@@ -126,6 +128,7 @@ Matrix Vae::encode(const Matrix& img) {
 }
 
 Matrix Vae::decode(const Matrix& z) {
+    NC_PROFILE("vae");
     Matrix unscaled = z;
     for (float& v : unscaled.values()) v /= scalingFactor;
     return decoder.predict(unscaled);
@@ -226,12 +229,14 @@ void squashInPlace(Matrix& m, float scale, float offset) {
 } // namespace
 
 Matrix TinyVae::encode(const Matrix& img) {
+    NC_PROFILE("vae");
     Matrix x = img;
     squashInPlace(x, 0.5f, 0.5f);  // [-1, 1] -> [0, 1]
     return encoder.predict(x);
 }
 
 Matrix TinyVae::decode(const Matrix& z) {
+    NC_PROFILE("vae");
     Matrix x = z;
     for (float& v : x.values()) v = std::tanh(v / 3.0f) * 3.0f;  // soft clamp to (-3, 3)
     Matrix y = decoder.predict(x);
@@ -310,6 +315,7 @@ TinyVae loadTinyVae(const std::string& dir, std::size_t width, std::size_t heigh
 // ---- CLIP text encoder ------------------------------------------------------------------------
 
 Matrix ClipTextEncoder::encode(const std::vector<int>& ids) {
+    NC_PROFILE("text encoder");
     if (ids.size() != length)
         throw std::invalid_argument("ClipTextEncoder::encode: expected " + std::to_string(length) + " ids, got " +
                                     std::to_string(ids.size()));

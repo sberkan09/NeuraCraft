@@ -41,6 +41,15 @@ public:
     // keeps the inputs exact.
     Matrix multiply(const Matrix& x) const;
     static constexpr std::size_t kGemmRows = 256;
+    // c (outputs() x n, row stride ldc) = W (outputs() x inputs()) * b
+    // (inputs() x n, row stride ldb): the product convolutions use. *MapBytes
+    // as for the Metal GEMM (0: copy). Runs on the GPU straight from the int8
+    // weights when gpuProducts(n) holds, otherwise expands them for the float GEMM.
+    void multiplyLeft(std::size_t n, const float* b, std::size_t ldb, float* c, std::size_t ldc,
+                      std::size_t bMapBytes = 0, std::size_t cMapBytes = 0) const;
+    // Whether products with n input rows / columns run on the GPU int8 kernel
+    // (GPU device active, n >= kGemmRows, enough work, kernel available).
+    bool gpuProducts(std::size_t n) const;
     // Rows j0..j1 as floats, (j1 - j0) x inputs(), into dst.
     void expandRows(std::size_t j0, std::size_t j1, float* dst) const;
     // Same product with float inputs (each weight row expanded to float):
@@ -54,8 +63,9 @@ public:
 
 private:
     std::size_t in_ = 0, out_ = 0, group_ = kDefaultGroup, groupsPerRow_ = 0;
-    std::vector<std::int8_t> q_;  // out x in, row-major
-    std::vector<float> scale_;    // out x groupsPerRow
+    // Page-backed storage (Matrix.h), so the Metal backend maps large layers in place.
+    std::vector<std::int8_t, StorageAllocator<std::int8_t>> q_;  // out x in, row-major
+    FloatVector scale_;                                          // out x groupsPerRow
 };
 
 // Whether QuantizedWeights::multiply quantizes its inputs (default: yes).

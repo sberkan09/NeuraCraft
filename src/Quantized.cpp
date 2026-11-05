@@ -1,4 +1,5 @@
 #include "Quantized.h"
+#include "Profile.h"
 #include "Backend.h"
 #include "Parallel.h"
 
@@ -8,6 +9,11 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
+
+#ifdef NEURACRAFT_HAS_METAL
+#include "MetalBackend.h"
+#endif
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -19,6 +25,11 @@
 namespace nc {
 
 namespace {
+#ifdef NEURACRAFT_HAS_METAL
+// Bytes of a page-backed buffer the GPU may map (0: too small, it is copied).
+std::size_t mapBytes(std::size_t bytes) { return bytes >= kPageBackedBytes ? detail::storageBytesFor(bytes) : 0; }
+#endif
+
 std::int8_t quantizeValue(float v, float inv) {
     const long q = std::lround(v * inv);
     return static_cast<std::int8_t>(std::max(-127L, std::min(127L, q)));
@@ -26,6 +37,7 @@ std::int8_t quantizeValue(float v, float inv) {
 } // namespace
 
 QuantizedWeights QuantizedWeights::fromOutIn(const Matrix& w, std::size_t group) {
+    NC_PROFILE("load: quantize");
     QuantizedWeights q;
     q.out_ = w.rows();
     q.in_ = w.cols();
@@ -253,6 +265,7 @@ const char* QuantizedWeights::kernelName() {
 }
 
 void QuantizedWeights::expandRows(std::size_t j0, std::size_t j1, float* dst) const {
+    NC_PROFILE("int8 expand");
     parallelFor(j0, j1, 8, [&](std::size_t a, std::size_t b) {
         for (std::size_t j = a; j < b; ++j) expandRow(j, dst + (j - j0) * in_);
     });
@@ -263,6 +276,17 @@ Matrix QuantizedWeights::multiply(const Matrix& x) const {
         throw std::invalid_argument("QuantizedWeights::multiply: expected " + std::to_string(in_) + " columns, got " +
                                     std::to_string(x.cols()));
     const std::size_t n = x.rows();
+#ifdef NEURACRAFT_HAS_METAL
+    if (gpuProducts(n)) {
+        // out (n x out) = x * W^T on the GPU, dequantizing tiles of W as they are loaded.
+        NC_PROFILE("int8 gemm gpu");
+        Matrix out(n, out_);
+        metal::gemmQ8(false, n, out_, in_, q_.data(), mapBytes(q_.capacity()), scale_.data(),
+                      mapBytes(scale_.capacity() * sizeof(float)), groupsPerRow_, group_, x.data(), in_,
+                      x.pageBacked() ? x.storageBytes() : 0, out.data(), out_, out.pageBacked() ? out.storageBytes() : 0);
+        return out;
+    }
+#endif
     if (n >= kGemmRows) {
         // Many rows: expand tiles of weight rows (at most ~2M floats each) and use the float GEMM.
         Matrix out(n, out_);
@@ -276,6 +300,7 @@ Matrix QuantizedWeights::multiply(const Matrix& x) const {
         return out;
     }
     if (!int8Inputs()) return multiplyFloat(x);
+    NC_PROFILE("int8 gemm cpu");
     Matrix out(n, out_);
     if (n == 0 || out_ == 0) return out;
 
@@ -323,6 +348,39 @@ Matrix QuantizedWeights::multiply(const Matrix& x) const {
         }
     });
     return out;
+}
+
+bool QuantizedWeights::gpuProducts(std::size_t n) const {
+#ifdef NEURACRAFT_HAS_METAL
+    return n >= kGemmRows && currentDevice() == Device::GPU && n * out_ * in_ >= gpuMinWork() && !q_.empty() &&
+           metal::int8Available();
+#else
+    (void)n;
+    return false;
+#endif
+}
+
+void QuantizedWeights::multiplyLeft(std::size_t n, const float* b, std::size_t ldb, float* c, std::size_t ldc,
+                                    std::size_t bMapBytes, std::size_t cMapBytes) const {
+    if (n == 0 || out_ == 0) return;
+#ifdef NEURACRAFT_HAS_METAL
+    if (gpuProducts(n)) {
+        NC_PROFILE("int8 gemm gpu");
+        metal::gemmQ8(true, out_, n, in_, q_.data(), mapBytes(q_.capacity()), scale_.data(),
+                      mapBytes(scale_.capacity() * sizeof(float)), groupsPerRow_, group_, b, ldb, bMapBytes, c, ldc,
+                      cMapBytes);
+        return;
+    }
+#endif
+    (void)bMapBytes;
+    (void)cMapBytes;
+    const std::size_t tileRows = std::max<std::size_t>(1, std::min(out_, (std::size_t(1) << 21) / std::max<std::size_t>(1, in_)));
+    std::vector<float> tile(tileRows * in_);
+    for (std::size_t j0 = 0; j0 < out_; j0 += tileRows) {
+        const std::size_t j1 = std::min(out_, j0 + tileRows);
+        expandRows(j0, j1, tile.data());
+        gemm(false, false, j1 - j0, n, in_, tile.data(), in_, b, ldb, c + j0 * ldc, ldc, false);
+    }
 }
 
 Matrix QuantizedWeights::multiplyFloat(const Matrix& x) const {

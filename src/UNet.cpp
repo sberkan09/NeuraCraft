@@ -1,4 +1,5 @@
 #include "Backend.h"
+#include "Profile.h"
 #include "Dense.h"
 #include "Diffusion.h"
 #include "Json.h"
@@ -54,12 +55,14 @@ Matrix fromTokens(const Matrix& t) {
 } // namespace
 
 Matrix multiHeadAttention(const Matrix& q, const Matrix& k, const Matrix& v, std::size_t heads) {
+    NC_PROFILE("unet attention");
     const std::size_t N = q.rows(), M = k.rows(), C = q.cols();
     if (heads == 0 || C % heads != 0 || k.cols() != C || v.cols() != C || v.rows() != M)
         throw std::invalid_argument("multiHeadAttention: shapes do not match");
     const std::size_t dh = C / heads;
     const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
     Matrix out(N, C);
+    if (gpuAttention(q, k, v, heads, out)) return out;
     const std::size_t chunk = std::max<std::size_t>(1, std::min(N, (std::size_t(1) << 22) / std::max<std::size_t>(1, M)));
     std::vector<float> scores(chunk * M);
     for (std::size_t h = 0; h < heads; ++h)
@@ -161,6 +164,7 @@ struct TimeResnet {
     }
     // tembAct: silu(time embedding), 1 x tembDim
     Matrix forward(const Matrix& x, const Matrix& tembAct) {
+        NC_PROFILE("unet resnet (norms, adds)");
         Matrix h = n1.forward(x, false);
         siluInPlace(h);
         h = c1.forward(h, false);
@@ -223,6 +227,7 @@ struct CrossTransformer {
         w.linear(ff2, b + ".ff.net.2");
     }
     Matrix forward(const Matrix& x, const Matrix& context) {
+        NC_PROFILE("unet transformer (norms)");
         const std::size_t C = shape.channels, HW = shape.height * shape.width;
         Matrix h = projIn.forward(toTokens(norm.forward(x, false), C, HW), false);  // HW x C
         Matrix a = ln1.forward(h, false);
@@ -314,6 +319,7 @@ struct TemporalTransformer {
 
     // Self-attention within each group of F consecutive rows (one pixel's frames).
     Matrix frameAttention(const Matrix& q, const Matrix& k, const Matrix& v, std::size_t F) const {
+        NC_PROFILE("motion attention");
         const std::size_t rows = q.rows(), C = q.cols(), dh = C / heads, P = rows / F;
         const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
         Matrix out(rows, C);

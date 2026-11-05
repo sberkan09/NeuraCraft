@@ -26,7 +26,7 @@
 //                              Stable Diffusion VAE round trip (scripts/download_sd_turbo.sh)
 //   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
 //
-// Global options: --gpu (Metal on Apple silicon), --threads N
+// Global options: --gpu (Metal on Apple silicon), --threads N, --profile
 
 #include "NeuraCraft.h"
 
@@ -930,6 +930,68 @@ int runBench(bool quick) {
                   << 2.0 * static_cast<double>(rows) * 2048 * 8192 / seconds / 1e9 << " GOPS" << std::setw(8)
                   << static_cast<double>(q.bytes()) / seconds / 1e9 << " GB/s of weights" << std::defaultfloat << '\n';
     }
+
+    // Image models: thousands of pixels through each int8 layer (a 64x64 latent through a 1280-wide
+    // projection). CPU expands the weights for the float GEMM; the GPU int8 kernel reads them as int8.
+    const std::size_t pixels = quick ? 512 : 4096, width = quick ? 320 : 1280;
+    std::cout << "\nint8 image layer, " << pixels << " pixels x " << width << " -> " << width << ":\n";
+    const QuantizedWeights qi = QuantizedWeights::fromOutIn(Matrix::uniform(width, width, -1, 1));
+    const Matrix px = Matrix::uniform(pixels, width, -1, 1);
+    const Matrix reference = qi.multiplyFloat(px);
+    auto timeInt8 = [&](const char* label, Device device) {
+        const Device savedDevice = currentDevice();
+        setDevice(device);
+        Matrix y = qi.multiply(px);
+        int reps = 0;
+        const auto start = std::chrono::steady_clock::now();
+        double elapsed = 0.0;
+        do {
+            y = qi.multiply(px);
+            ++reps;
+            elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        } while (elapsed < (quick ? 0.2 : 1.0));
+        const bool gpuInt8 = qi.gpuProducts(pixels);
+        setDevice(savedDevice);
+        const bool ok = y.approxEquals(reference, 1e-3f * static_cast<float>(width));
+        mismatches += !ok;
+        std::cout << std::setw(22) << label << std::fixed << std::setprecision(1) << std::setw(9)
+                  << 2.0 * static_cast<double>(pixels) * width * width / (elapsed / reps) / 1e9 << " GFLOPS"
+                  << (ok ? "" : "  (disagrees with the reference!)") << (device == Device::GPU && !gpuInt8 ? "  (expanded to float)" : "")
+                  << std::defaultfloat << '\n';
+    };
+    timeInt8("CPU", Device::CPU);
+    if (gpuAvailable()) timeInt8("GPU", Device::GPU);
+
+    // UNet self-attention at the 64x64 latent's top level: 4096 tokens, 320 wide, 8 heads.
+    const std::size_t tokens = quick ? 512 : 4096;
+    std::cout << "\nattention, " << tokens << " tokens x 320, 8 heads:\n";
+    const Matrix aq = Matrix::uniform(tokens, 320, -1, 1), ak = Matrix::uniform(tokens, 320, -1, 1),
+                 av = Matrix::uniform(tokens, 320, -1, 1);
+    Matrix attnRef;
+    auto timeAttention = [&](const char* label, Device device) {
+        const Device savedDevice = currentDevice();
+        setDevice(device);
+        Matrix y = multiHeadAttention(aq, ak, av, 8);
+        int reps = 0;
+        const auto start = std::chrono::steady_clock::now();
+        double elapsed = 0.0;
+        do {
+            y = multiHeadAttention(aq, ak, av, 8);
+            ++reps;
+            elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        } while (elapsed < (quick ? 0.2 : 1.0));
+        Matrix probe(tokens, 320);
+        const bool fused = gpuAttention(aq, ak, av, 8, probe);
+        setDevice(savedDevice);
+        if (attnRef.empty()) attnRef = y;
+        const bool ok = y.approxEquals(attnRef, 1e-3f);
+        mismatches += !ok;
+        std::cout << std::setw(22) << label << std::fixed << std::setprecision(2) << std::setw(9) << 1e3 * elapsed / reps << " ms"
+                  << (device == Device::GPU ? (fused ? "  (fused kernel)" : "  (GEMMs + CPU softmax)") : "")
+                  << (ok ? "" : "  (disagrees with the CPU!)") << std::defaultfloat << '\n';
+    };
+    timeAttention("CPU", Device::CPU);
+    if (gpuAvailable()) timeAttention("GPU", Device::GPU);
     return mismatches == 0 ? 0 : 1;
 }
 
@@ -980,7 +1042,8 @@ void usage() {
               << "  NeuraCraft bench [--quick]   matrix-multiply speed of each backend\n\n"
               << "options:\n"
               << "  --gpu          run large matrix products on the GPU (Metal)\n"
-              << "  --threads N    number of CPU threads (default: all cores)\n";
+              << "  --threads N    number of CPU threads (default: all cores)\n"
+              << "  --profile      print where the time went (GEMMs, int8, convolutions, attention, ...)\n";
 }
 
 } // namespace
@@ -1007,6 +1070,8 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--gpu") {
             wantGpu = true;
+        } else if (a == "--profile") {
+            setProfiling(true);
         } else if (a == "--threads") {
             if (i + 1 >= argc) {
                 std::cerr << "--threads needs a number\n";
@@ -1023,6 +1088,12 @@ int main(int argc, char** argv) {
     std::cout << "device: " << deviceDescription() << '\n';
 
     const std::string cmd = args.empty() ? "all" : args[0];
+    // --profile: where the time went, printed however the command ends.
+    struct ProfileReport {
+        ~ProfileReport() {
+            if (profiling()) printProfile(std::cout);
+        }
+    } profileReport;
     try {
         if (cmd == "all") {
             int failed = 0;

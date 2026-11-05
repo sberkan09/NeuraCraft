@@ -1,4 +1,5 @@
 #include "SafeTensors.h"
+#include "Profile.h"
 #include "Json.h"
 
 #include <algorithm>
@@ -122,6 +123,7 @@ std::vector<std::string> SafeTensors::names() const {
 }
 
 Matrix SafeTensors::load(const std::string& name) const {
+    NC_PROFILE("load: read tensors");
     const Tensor& t = info(name);
     if (t.dtype != "F32" && t.dtype != "F16" && t.dtype != "BF16")
         throw std::runtime_error("SafeTensors: tensor " + name + " has unsupported dtype " + t.dtype);

@@ -40,6 +40,7 @@ add_library(neuracraft_lib STATIC
     src/Optimizer.cpp
     src/Parallel.cpp
     src/Pretrained.cpp
+    src/Profile.cpp
     src/Quantized.cpp
     src/Random.cpp
     src/SafeTensors.cpp

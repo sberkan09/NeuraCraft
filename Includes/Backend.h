@@ -22,6 +22,9 @@ Device currentDevice();
 std::string deviceDescription();
 std::string cpuBackendName();  // "Accelerate" or "NeuraCraft blocked kernel"
 std::string gpuName();         // empty if no GPU
+// Whether int8 layers (QuantizedWeights) multiply on the GPU straight from
+// their int8 weights; otherwise they expand them to float for the GPU GEMM.
+bool gpuInt8Available();
 
 // In GPU mode, products with fewer than this many multiply-adds (M*N*K) still
 // run on the CPU, where they are faster than a GPU round trip.
@@ -39,6 +42,13 @@ void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
 // Matrix products use: same dispatch as gemm(), and on the GPU page-backed
 // matrices (Matrix::pageBacked) are mapped in place instead of copied.
 void matmul(const Matrix& a, bool transA, const Matrix& b, bool transB, Matrix& c);
+
+// Multi-head attention on the GPU: out = softmax(Q_h K_h^T / sqrt(dh)) V_h for
+// each head h (dh = C / heads), fused so the score matrix is never stored.
+// Q is N x C, K and V are M x C; out must be N x C. Returns false (out
+// untouched) when the GPU is not active, the head size is not supported (a
+// multiple of 4 up to 160) or the work is below gpuMinWork().
+bool gpuAttention(const Matrix& q, const Matrix& k, const Matrix& v, std::size_t heads, Matrix& out);
 
 // Vectorized dot product of two float arrays.
 float dot(const float* a, const float* b, std::size_t n);

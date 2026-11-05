@@ -21,11 +21,51 @@
 namespace nc {
 
 namespace {
+// Progress of the running step, with cancellation checks.
+struct StepProgress {
+    const WorkflowEvents* events = nullptr;
+    std::size_t step = 0, steps = 0;
+    std::string op;
+
+    void check() const {
+        if (events && events->cancelled && events->cancelled()) throw WorkflowCancelled();
+    }
+    void stage(const std::string& s) const {
+        check();
+        if (!events || !events->progress) return;
+        double fraction = -1.0;
+        const std::size_t slash = s.rfind('/');
+        if (slash != std::string::npos && slash > 0) {
+            std::size_t b = slash;
+            while (b > 0 && std::isdigit(static_cast<unsigned char>(s[b - 1]))) --b;
+            const std::string num = s.substr(b, slash - b), den = s.substr(slash + 1);
+            if (!num.empty() && !den.empty() && den.find_first_not_of("0123456789") == std::string::npos && std::stod(den) > 0)
+                fraction = std::stod(num) / std::stod(den);
+        }
+        events->progress(step, steps, op, s, fraction);
+    }
+    void frame(std::size_t i, std::size_t n) const { stage("frame " + std::to_string(i + 1) + "/" + std::to_string(n)); }
+    std::function<void(const std::string&, double)> stageCallback() const {
+        if (!events || (!events->progress && !events->cancelled)) return {};
+        const StepProgress* self = this;
+        return [self](const std::string& s, double) { self->stage(s); };
+    }
+    std::function<void(const Image&)> previewCallback() const {
+        if (!events || !events->preview) return {};
+        const StepProgress* self = this;
+        return [self](const Image& im) {
+            self->check();
+            self->events->preview(self->step, im);
+        };
+    }
+};
+
 struct Step {
     const json::Value& v;
     std::string op;
     std::string base;
     std::map<std::string, Clip>& clips;
+    const StepProgress* progress = nullptr;
 
     bool has(const char* k) const { return v.find(k) != nullptr; }
     std::string str(const char* k, const std::string& fallback = "") const {
@@ -94,6 +134,10 @@ TextToImageOptions imageOptions(const Step& s) {
     o.sampler = s.str("sampler", "euler");
     o.int8 = s.flag("int8", true);
     o.loras = s.loras();
+    if (s.progress) {
+        o.progress = s.progress->stageCallback();
+        o.preview = s.progress->previewCallback();
+    }
     o.tinyVae = s.path("tiny_vae");
     const std::string model = s.path("model");
     if (o.tinyVae.empty() && std::filesystem::exists(model + "/taesd/config.json")) o.tinyVae = model + "/taesd";
@@ -202,6 +246,13 @@ void save(const Step& s, const Clip& c) {
 } // namespace
 
 std::map<std::string, Clip> runWorkflow(const std::string& text, const std::string& base, const std::function<void(const std::string&)>& log) {
+    WorkflowEvents events;
+    events.log = log;
+    return runWorkflow(text, base, events);
+}
+
+std::map<std::string, Clip> runWorkflow(const std::string& text, const std::string& base, const WorkflowEvents& events) {
+    const auto& log = events.log;
     const std::vector<std::string> problems = checkWorkflow(text);
     if (!problems.empty()) {
         std::string message = "workflow:";
@@ -226,7 +277,9 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
     std::size_t index = 0;
     for (const json::Value& v : steps->array) {
         ++index;
-        Step s{v, v.at("op").string, base, clips};
+        StepProgress progress{&events, index, steps->array.size(), v.at("op").string};
+        progress.stage("start");
+        Step s{v, v.at("op").string, base, clips, &progress};
         const auto start = std::chrono::steady_clock::now();
         Clip out;
         const std::string& op = s.op;
@@ -243,7 +296,9 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
         } else if (op == "save") {
             save(s, s.clip("in"));
         } else if (op == "resize" || op == "crop") {
-            for (const Image& im : s.clip("in")) {
+            const Clip& in = s.clip("in");
+            for (const Image& im : in) {
+                progress.frame(static_cast<std::size_t>(&im - in.data()), in.size());
                 const std::size_t w = s.size("width", im.width), h = s.size("height", im.height);
                 out.push_back(op == "resize" ? resizeImage(im, w, h) : fitImage(im, w, h));
             }
@@ -283,6 +338,8 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
             o.guidance = static_cast<float>(s.num("guidance", 1));
             o.negativePrompt = io.negativePrompt;
             o.motion = s.path("motion");
+            o.progress = io.progress;
+            o.preview = io.preview;
             o.tinyVae = io.tinyVae;
             o.int8 = io.int8;
             o.loras = io.loras;
@@ -342,14 +399,22 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
                 out = outpaintZoom(sd, prompts, oz, s.has("in") ? &s.image("in") : nullptr);
             }
         } else if (op == "canny") {
-            for (const Image& im : s.clip("in"))
+            const Clip& in = s.clip("in");
+            for (const Image& im : in) {
+                progress.frame(static_cast<std::size_t>(&im - in.data()), in.size());
                 out.push_back(cannyEdges(im, static_cast<float>(s.num("low", 100)), static_cast<float>(s.num("high", 200))));
+            }
         } else if (op == "depth" || op == "parallax") {
             const auto depthHold = smallModel<DepthEstimator>("depth", s.path("model"));
             DepthEstimator& de = *depthHold;
             const std::size_t inputSize = s.size("size", 518);
-            if (op == "depth")
-                for (const Image& im : s.clip("in")) out.push_back(de.depthImage(im, inputSize));
+            if (op == "depth") {
+                const Clip& in = s.clip("in");
+                for (const Image& im : in) {
+                    progress.frame(static_cast<std::size_t>(&im - in.data()), in.size());
+                    out.push_back(de.depthImage(im, inputSize));
+                }
+            }
             else {
                 ParallaxOptions po;
                 po.frames = s.size("frames", 48);
@@ -360,7 +425,11 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
             }
         } else if (op == "upscale") {
             const auto up = smallModel<Upscaler>("upscaler", s.path("model"));
-            for (const Image& im : s.clip("in")) out.push_back(up->upscale(im));
+            const Clip& in = s.clip("in");
+            for (const Image& im : in) {
+                progress.frame(static_cast<std::size_t>(&im - in.data()), in.size());
+                out.push_back(up->upscale(im));
+            }
         } else if (op == "interpolate") {
             out = smallModel<FrameInterpolator>("rife", s.path("model"))->interpolate(s.clip("in"), s.size("passes", 1), s.flag("loop", false));
         } else {
@@ -368,7 +437,13 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
         }
         if (cache) releaseModelsExcept(index < needed.size() ? needed[index] : std::set<std::string>{});
         const std::string outName = s.str("out");
-        if (!out.empty()) clips[outName.empty() ? op : outName] = std::move(out);
+        const std::string clipName = out.empty() ? std::string() : (outName.empty() ? op : outName);
+        if (!out.empty()) clips[clipName] = std::move(out);
+        if (events.output) {
+            static const Clip none;
+            events.output(index, op, clipName, clipName.empty() ? none : clips[clipName],
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        }
         if (log) {
             std::ostringstream line;
             line << "step " << index << " " << op << ": " << std::fixed;

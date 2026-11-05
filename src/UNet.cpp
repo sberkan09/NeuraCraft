@@ -1163,6 +1163,31 @@ void reportStage(const TextToImageOptions& o, const std::string& stage, Pipeline
     if (o.progress) o.progress(stage, std::chrono::duration<double>(PipelineClock::now() - start).count());
 }
 
+std::shared_ptr<TinyVae> tinyVaeModel(const std::string& dir, std::size_t width, std::size_t height, bool encoder, bool decoder);
+
+// The clean latent a denoising step predicts (VE form: x0 = x - sigma * eps), at half size, through
+// TAESD: a cheap live preview for o.preview.
+void reportPreview(const TextToImageOptions& o, const float* latent, const float* eps, double sigma, std::size_t channels) {
+    if (!o.preview || o.tinyVae.empty() || o.width % 16 || o.height % 16) return;
+    NC_PROFILE("preview");
+    const std::size_t h = o.height / 8, w = o.width / 8, h2 = h / 2, w2 = w / 2;
+    Matrix small(1, channels * h2 * w2);
+    for (std::size_t c = 0; c < channels; ++c)
+        for (std::size_t y = 0; y < h2; ++y)
+            for (std::size_t x = 0; x < w2; ++x) {
+                float sum = 0.0f;
+                for (std::size_t dy = 0; dy < 2; ++dy)
+                    for (std::size_t dx = 0; dx < 2; ++dx) {
+                        const std::size_t k = (c * h + 2 * y + dy) * w + 2 * x + dx;
+                        sum += latent[k] - static_cast<float>(sigma) * eps[k];
+                    }
+                small(0, (c * h2 + y) * w2 + x) = 0.25f * sum;
+            }
+    const auto tiny = tinyVaeModel(o.tinyVae, o.width / 2, o.height / 2, false, true);
+    const Matrix img = tiny->decode(small);
+    o.preview(tensorToImage(img.data(), {3, o.height / 2, o.width / 2}));
+}
+
 void checkSize(const TextToImageOptions& o) {
     if (o.width % 64 || o.height % 64 || o.width == 0 || o.height == 0)
         throw std::invalid_argument("textToImage: width and height must be multiples of 64");
@@ -1300,6 +1325,7 @@ void denoise(const std::string& dir, const std::pair<Matrix, Matrix>& context, c
             const Matrix uncond = predict(in, static_cast<float>(sched.timesteps[i]), context.second);
             for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + o.guidance * (eps.data()[k] - uncond.data()[k]);
         }
+        if (o.preview) reportPreview(o, latent.data(), eps.data(), sched.sigmas[i], unet.latentShape().channels);
         sched.step(i, eps, latent);
         reportStage(o, "step " + std::to_string(i - first + 1) + "/" + std::to_string(sched.timesteps.size() - first), t);
     }
@@ -1375,6 +1401,7 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
     o.tinyVae = v.tinyVae;
     o.int8 = v.int8;
     o.progress = v.progress;
+    o.preview = v.preview;
     o.loras = v.loras;
     checkSize(o);
     std::pair<Matrix, Matrix> ipTokens;
@@ -1540,6 +1567,7 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
             const Matrix un = predict(in, static_cast<float>(sched.timesteps[i]), std::vector<Matrix>{uncond});
             for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = un.data()[k] + o.guidance * (eps.data()[k] - un.data()[k]);
         }
+        if (o.preview) reportPreview(o, latents.data() + (F / 2) * n, eps.data() + (F / 2) * n, sched.sigmas[i], n / ((o.width / 8) * (o.height / 8)));
         sched.step(i, eps, latents);
         reportStage(o, "step " + std::to_string(i + 1) + "/" + std::to_string(sched.timesteps.size()), t);
     }
@@ -1721,6 +1749,8 @@ void StableDiffusion::denoise(Matrix& latent, const Matrix& context, const Euler
             const Matrix uncond = unet.forward(in, static_cast<float>(sched.timesteps[i]), negative);
             for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + guidance * (eps.data()[k] - uncond.data()[k]);
         }
+        const TextToImageOptions& o = impl_->options;
+        if (o.preview) reportPreview(o, latent.data(), eps.data(), sched.sigmas[i], unet.latentShape().channels);
         sched.step(i, eps, latent);
     }
 }

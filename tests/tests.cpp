@@ -3928,6 +3928,49 @@ TEST(json_workflows) {
     CHECK(clips.at("clip").size() == 3 && clips.at("gen").front().width == 64);
     CHECK(std::filesystem::exists(work + "/clip.gif") && std::filesystem::exists(work + "/gen.jpg"));
     CHECK(std::filesystem::exists(work + "/frames/frame_0001.png"));
+    // Events: progress with fractions, live previews (with a TAESD), outputs, cancellation.
+    {
+        writeTinyTaesd(dir + "/taesd", false);
+        const std::string two = R"({"steps": [
+            {"op": "load", "path": "in/a.png", "out": "pic"},
+            {"op": "txt2img", "model": ")" + dir + R"(", "tiny_vae": ")" + dir + R"(/taesd", "prompt": "hello", "width": 64,
+             "height": 64, "steps": 3, "out": "gen"}]})";
+        WorkflowEvents ev;
+        std::vector<std::string> stages;
+        std::vector<double> fractions;
+        std::size_t previews = 0;
+        std::vector<std::string> outputs;
+        ev.progress = [&](std::size_t step, std::size_t steps, const std::string& op, const std::string& stage, double f) {
+            CHECK(steps == 2 && step >= 1 && step <= 2 && (op == "load" || op == "txt2img"));
+            stages.push_back(op + ":" + stage);
+            fractions.push_back(f);
+        };
+        ev.preview = [&](std::size_t step, const Image& im) {
+            CHECK(step == 2 && im.width == 32 && im.height == 32);
+            ++previews;
+        };
+        ev.output = [&](std::size_t, const std::string& op, const std::string& clip, const Clip& frames, double seconds) {
+            CHECK(frames.size() == 1 && seconds >= 0);
+            outputs.push_back(op + "->" + clip);
+        };
+        const auto got = runWorkflow(two, work, ev);
+        CHECK(got.at("gen").front().width == 64);
+        CHECK(previews == 3);
+        CHECK((outputs == std::vector<std::string>{"load->pic", "txt2img->gen"}));
+        CHECK(stages.front() == "load:start" && fractions.front() < 0);
+        const auto at = std::find(stages.begin(), stages.end(), "txt2img:step 2/3");
+        CHECK(at != stages.end() && std::fabs(fractions[static_cast<std::size_t>(at - stages.begin())] - 2.0 / 3.0) < 1e-9);
+
+        // Cancelled after the first denoising step: WorkflowCancelled, and the model cache is let go.
+        std::size_t seen = 0;
+        WorkflowEvents stop;
+        stop.progress = [&](std::size_t, std::size_t, const std::string&, const std::string& stage, double) {
+            if (stage.rfind("step ", 0) == 0) ++seen;
+        };
+        stop.cancelled = [&] { return seen >= 1; };
+        CHECK_THROWS(runWorkflow(two, work, stop), WorkflowCancelled);
+        CHECK(seen == 1 && modelCacheEntries() == 0 && !modelCaching());
+    }
     // blend: a skip connection from an earlier step's clip, with a mask and a broadcast single frame.
     const auto mixed = runWorkflow(R"({"steps": [
         {"op": "load", "path": "in/a.png", "out": "a"},

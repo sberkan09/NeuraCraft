@@ -722,7 +722,10 @@ all on the 2-core machine):
 `docs/workflows/fox_video.json` draws a fox, animates it with AnimateDiff
 (the picture as the start and as the IP-Adapter image prompt, so the clip
 keeps the same fox), doubles the frame rate with RIFE and writes a QuickTime
-movie.
+movie: 31 frames at 384 x 384 in 9 minutes. Starting from the picture at
+strength 0.75 keeps the pose, so the motion stays small (a sitting fox that
+breathes and looks around); raise `strength` or drop `init` for more
+movement.
 
 ### Output formats
 

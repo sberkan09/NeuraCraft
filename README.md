@@ -533,6 +533,10 @@ and `img2img`:
 $ ./bin/NeuraCraft txt2img data/checkpoints/sd_xl_turbo_1.0_fp16.safetensors "a lighthouse on a cliff at dusk" xl.png --size 512
 ```
 
+<p><img src="docs/images/sdxl_turbo_fox.jpg" width="320"></p>
+
+SDXL-Turbo from the single file above, 1 step at 512 x 512: 67 s on the 2-core
+CPU (text encoders 10 s, UNet load 22 s, the step 14 s, VAE 21 s), int8 weights.
 The UNet builder takes the SDXL layout from its config (several transformer
 blocks per attention, `transformer_layers_per_block`, and the `text_time`
 added conditions), the prompt goes through both text encoders (the

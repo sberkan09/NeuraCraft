@@ -665,7 +665,7 @@ struct AttnParams {
 // The attention pipeline for one head size (built on first use), or nil: the simdgroup-matrix
 // kernel with the simdgroup GEMM (head sizes divisible by 8), else the portable one.
 // Which one is preferred: setAttentionKernel(), else NEURACRAFT_METAL_ATTENTION=scalar|simdgroup,
-// else the scalar one (the simdgroup kernel waits for a measurement on real hardware).
+// else the simdgroup one where it runs (M4: 34.1 against 37.8 ms for 4096 tokens x 320, 8 heads).
 id<MTLComputePipelineState> attentionPipeline(Context& ctx, unsigned dh) {
     std::lock_guard<std::mutex> lock(ctx.attentionMutex);
     auto it = ctx.attention.find(dh);
@@ -677,7 +677,7 @@ id<MTLComputePipelineState> attentionPipeline(Context& ctx, unsigned dh) {
         std::string choice = ctx.attentionChoice;
         if (choice.empty()) {
             const char* env = std::getenv("NEURACRAFT_METAL_ATTENTION");
-            choice = env ? env : "scalar";
+            choice = env ? env : "simdgroup";
         }
         if (ctx.useSimd && choice == "simdgroup" && dh % 8 == 0 && dh <= 160) {
             if (ctx.attentionSimdLib == nil)

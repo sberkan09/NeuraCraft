@@ -606,6 +606,29 @@ of the LCM fisherman, bicubic (left) and Real-ESRGAN (right); the whole 512 x
 `scripts/convert_pth.py` turns PyTorch `.pth` checkpoints into safetensors
 without PyTorch, unpickling only tensors and dicts.
 
+### Frame interpolation: RIFE
+
+```
+$ scripts/download_rife.sh data/interpolate                # RIFE v4 (ECCV 2022 IFNet), ~12 MB
+$ ./build_and_run.sh interpolate data/interpolate/rife-v4-flownet.safetensors frames/ smooth.gif --passes 2 --fps 8
+$ ./build_and_run.sh video ... --interpolate data/interpolate/rife-v4-flownet.safetensors --interp-passes 2
+```
+
+<p><img src="docs/images/video_animatelcm.gif" width="192"> <img src="docs/images/video_interpolated.gif" width="192"></p>
+
+`FrameInterpolator` runs RIFE's IFNet: three IFBlocks estimate optical flow
+in both directions and a blend mask, coarse to fine (1/4, 1/2 and full size;
+stride-2 convolutions with PReLU, residual blocks, 4x4 transposed
+convolutions), then both frames are warped to the middle and blended. Each
+pass puts a frame between every pair, so two passes turn the 16-frame
+AnimateLCM fox at 8 fps (left) into 61 frames at 32 fps (right) with the same
+duration: 51 s for 45 new 384 x 384 frames on the 2-core machine (2.2 s per
+512 x 512 frame). It matches a NumPy reference exactly on 8-bit output, and
+on AnimateDiff clips its middle frames beat a plain blend against the real
+in-between frame (28.4-29.5 dB vs 27.9-28.1 dB). `video` multiplies the
+frame rate so the clip keeps its length; with `--upscale` too, frames are
+interpolated first, then upscaled.
+
 ### Output formats
 
 All written by the library itself: `.gif` (`saveGif`,
@@ -715,6 +738,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales; integer AVX-VNNI / AVX2 / NEON products, expanded-tile GEMM for many rows), `Network::quantize()` for Dense, Conv2D, attention and embeddings (shared with tied outputs), `setInt8Inputs` |
 | Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG (read / write) and PPM files, `resizeImage` / `fitImage`, `loadVae()`, `loadTinyVae()` (TAESD), `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` / `textToLatent()` / `decodeLatent()` / `imageToImage()`, `StableDiffusion` (models kept in memory; `inpaint()`), `morphAnimation()`, `zoomAnimation()`, `outpaintZoom()`, `textToVideo()` (AnimateDiff motion modules: `loadMotionModules()`, `forwardFrames()`, windows, prompt travel, image / video to video), ControlNet (`controlEmbedding()`, `control()`), `cannyEdges()`, `transformImage()`, `EulerScheduler::lcm` |
 | Upscaling | `Upscale.h` | `Upscaler`: Real-ESRGAN compact (x2 / x4), tiled without seams |
+| Interpolation | `Interpolate.h` | `FrameInterpolator`: RIFE v4 IFNet (middle frames, 2^n x frame rate) |
 | LoRA | `Lora.h` | `LoraMerger`: kohya / A1111 and PEFT LoRA files merged into the UNet and text encoder while they load |
 | Files | `Image.h` | PNG (own inflate and deflate), animated PNG, JPEG (baseline encoder), animated GIF (median-cut palette, LZW), QuickTime Motion-JPEG `.mov`, PPM |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
@@ -787,6 +811,8 @@ APNG / JPEG / QuickTime structure, AnimateDiff motion modules (frames mix only
 with them; per-frame prompts; windows; image and video to video), LoRA merging
 against the formula (kohya and PEFT names), the LCM scheduler's timesteps and
 step, inpainting (pixels outside the mask kept exactly) and the outpaint zoom,
+the Real-ESRGAN upscaler (zero head = nearest upscale, tiling exact), RIFE
+(zero heads = even blend, frame counts),
 ControlNet (zero convolutions change nothing, scale 0 equals no ControlNet)
 and canny edges. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal

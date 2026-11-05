@@ -19,6 +19,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -46,6 +47,27 @@ using Clip = std::vector<Image>;
 // Returns the named clips after the last step.
 std::map<std::string, Clip> runWorkflow(const std::string& json, const std::string& baseDirectory = ".",
                                         const std::function<void(const std::string&)>& log = {});
+
+// What a running workflow reports, for progress bars, live previews and cancellation (the Studio
+// server streams these). Every callback is optional; they run on the workflow's thread.
+struct WorkflowEvents {
+    std::function<void(const std::string& line)> log;  // one line per finished step, as above
+    // A step started ("start") or moved on ("step 2/4", "frame 3/16", "load unet", ...). fraction is
+    // the part of the step done, from the "i/n" at the end of stage, or -1 when unknown.
+    std::function<void(std::size_t step, std::size_t steps, const std::string& op, const std::string& stage, double fraction)> progress;
+    // Live preview of a denoising step (half size; needs a TAESD in the step).
+    std::function<void(std::size_t step, const Image& picture)> preview;
+    // A step finished; clip is the name of what it made ("" for save).
+    std::function<void(std::size_t step, const std::string& op, const std::string& clip, const Clip& frames, double seconds)> output;
+    // Polled between denoising steps and frames; true stops the run with WorkflowCancelled.
+    std::function<bool()> cancelled;
+};
+
+struct WorkflowCancelled : std::runtime_error {
+    WorkflowCancelled() : std::runtime_error("workflow cancelled") {}
+};
+
+std::map<std::string, Clip> runWorkflow(const std::string& json, const std::string& baseDirectory, const WorkflowEvents& events);
 
 // ---- Schema: what each operation takes (drives validation, docs and the Studio UI) ----
 

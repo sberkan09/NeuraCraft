@@ -209,6 +209,9 @@ struct TextToImageOptions {
     Image imagePrompt;
     float ipScale = 0.6f;
     std::function<void(const std::string& stage, double seconds)> progress;  // after each stage / step
+    // Live preview after each denoising step: the predicted clean picture at half size, decoded with
+    // the TAESD in tinyVae (no preview without one). Costs about a quarter of a TAESD decode a step.
+    std::function<void(const Image& picture)> preview;
 };
 
 // The whole Stable Diffusion text-to-image pipeline on a diffusers directory
@@ -380,6 +383,7 @@ struct TextToVideoOptions {
     std::string betaSchedule = "linear";
     std::string sampler = "euler";  // "lcm" for AnimateLCM (with its LoRA; betaSchedule applies to both samplers)
     std::function<void(const std::string& stage, double seconds)> progress;
+    std::function<void(const Image& picture)> preview;  // the middle frame, as TextToImageOptions::preview
 };
 
 // AnimateDiff text to video on an SD 1.x diffusers directory plus a motion

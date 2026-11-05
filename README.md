@@ -759,7 +759,15 @@ paths, strided and 1x1) and int8 UNet / CLIP loading against float, and the
 whole text-to-image pipeline on tiny synthetic models, with either decoder,
 the PNG reader on embedded Pillow / zlib files (all three deflate block kinds,
 palette with transparency, 16-bit), resizing and cropping, and image to image
-(strength picks the number of steps). CI runs
+(strength picks the number of steps), the persistent session against the
+one-shot pipeline, prompt morphs (keyframes exact) and zoom animations, the GIF
+writer (decoded by a test-side LZW reader), compressed PNG round trips and
+APNG / JPEG / QuickTime structure, AnimateDiff motion modules (frames mix only
+with them; per-frame prompts; windows; image and video to video), LoRA merging
+against the formula (kohya and PEFT names), the LCM scheduler's timesteps and
+step, inpainting (pixels outside the mask kept exactly) and the outpaint zoom,
+ControlNet (zero convolutions change nothing, scale 0 equals no ControlNet)
+and canny edges. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal
 kernels).
 

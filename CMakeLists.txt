@@ -50,6 +50,7 @@ add_library(neuracraft_lib STATIC
     src/UNet.cpp
     src/Upscale.cpp
     src/UnicodeTables.cpp
+    src/VectorMath.cpp
     src/Workflow.cpp
 )
 set_target_properties(neuracraft_lib PROPERTIES OUTPUT_NAME neuracraft)
@@ -60,6 +61,9 @@ if(MSVC)
     target_compile_options(neuracraft_lib PRIVATE /W4)
 else()
     target_compile_options(neuracraft_lib PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>)
+    # The exp / erf loops clamp with min / max; without trapping-math semantics GCC vectorizes
+    # them with plain SSE2 too (nothing in NeuraCraft reads floating-point exception flags).
+    set_source_files_properties(src/VectorMath.cpp PROPERTIES COMPILE_OPTIONS "-fno-trapping-math")
     if(NEURACRAFT_NATIVE)
         include(CheckCXXCompilerFlag)
         check_cxx_compiler_flag(-march=native NC_HAS_MARCH_NATIVE)

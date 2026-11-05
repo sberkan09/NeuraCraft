@@ -1,8 +1,10 @@
 #include "SafeTensors.h"
 #include "Profile.h"
 #include "Json.h"
+#include "Parallel.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -131,21 +133,38 @@ Matrix SafeTensors::load(const std::string& name) const {
     const std::size_t cols = t.shape.empty() ? 1 : t.shape.back();
     const std::size_t rows = cols ? n / cols : 0;
 
-    std::ifstream in(path_, std::ios::binary);
-    if (!in) throw std::runtime_error("SafeTensors: cannot open " + path_);
-    in.seekg(static_cast<std::streamoff>(dataStart_ + t.begin));
     Matrix m(t.shape.size() <= 1 ? 1 : rows, t.shape.size() <= 1 ? n : cols);
-    if (t.dtype == "F32") {
-        // Little-endian float32: read straight into the matrix (all supported hosts are little-endian).
-        if (!in.read(reinterpret_cast<char*>(m.data()), static_cast<std::streamsize>(n * 4)))
-            throw std::runtime_error("SafeTensors: truncated data for " + name);
-    } else {
-        std::vector<std::uint16_t> raw(n);
-        if (!in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(n * 2)))
-            throw std::runtime_error("SafeTensors: truncated data for " + name);
-        const bool half = t.dtype == "F16";
-        for (std::size_t i = 0; i < n; ++i) m.data()[i] = half ? halfToFloat(raw[i]) : bf16ToFloat(raw[i]);
-    }
+    const bool f32 = t.dtype == "F32", half = t.dtype == "F16";
+    const std::size_t width = f32 ? 4 : 2;
+    // Large tensors are read in parallel chunks (each thread with its own stream), converting
+    // fp16 / bf16 as they arrive: storage serves several reads at once, and the conversion
+    // runs on every core.
+    const std::size_t chunk = std::size_t(1) << 22;  // elements
+    std::atomic<bool> truncated{false};
+    parallelFor(0, (n + chunk - 1) / chunk, 1, [&](std::size_t c0, std::size_t c1) {
+        std::ifstream in(path_, std::ios::binary);
+        std::vector<std::uint16_t> raw;
+        for (std::size_t c = c0; c < c1; ++c) {
+            const std::size_t i0 = c * chunk, count = std::min(chunk, n - i0);
+            if (!in) break;
+            in.seekg(static_cast<std::streamoff>(dataStart_ + t.begin + i0 * width));
+            if (f32) {
+                // Little-endian float32: straight into the matrix (all supported hosts are little-endian).
+                in.read(reinterpret_cast<char*>(m.data() + i0), static_cast<std::streamsize>(count * 4));
+            } else {
+                raw.resize(count);
+                if (in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(count * 2))) {
+                    float* dst = m.data() + i0;
+                    if (half)
+                        for (std::size_t i = 0; i < count; ++i) dst[i] = halfToFloat(raw[i]);
+                    else
+                        for (std::size_t i = 0; i < count; ++i) dst[i] = bf16ToFloat(raw[i]);
+                }
+            }
+        }
+        if (!in) truncated = true;
+    });
+    if (truncated) throw std::runtime_error("SafeTensors: truncated data for " + name + " in " + path_);
     return m;
 }
 

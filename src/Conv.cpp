@@ -72,7 +72,8 @@ std::size_t Conv2D::quantize() {
 Matrix Conv2D::forwardQuantized(const Matrix& input) const {
     const std::size_t B = input.rows(), P = outH_ * outW_, C = in_.channels, H = in_.height, W = in_.width;
     const std::size_t patch = C * kernel_ * kernel_;
-    if (P >= QuantizedWeights::kGemmRows) {
+    // Large maps, or batches of small ones (expanding the weights once serves every image).
+    if (P >= QuantizedWeights::kGemmRows || (B > 1 && B * P >= QuantizedWeights::kGemmRows)) {
         // GPU: int8 weights go to the shader as they are.
         if (quantized_.gpuProducts(P)) return stripConvolution(input, nullptr, true);
         // Large maps: expand the weights to float (out x patch) once per call and take the float strip path.

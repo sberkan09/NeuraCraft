@@ -231,8 +231,10 @@ Image imageToImage(const std::string& directory, const Image& input, const std::
 // A Stable Diffusion model kept in memory for many generations (animations,
 // interactive use): tokenizer, text encoder, UNet and a decoder (TAESD when
 // options.tinyVae is set, else the full VAE), plus the matching encoder for
-// image to image. Built for options.width x options.height; options.int8 and
-// options.progress apply.
+// image to image. Built for options.width x options.height; options.int8,
+// loras, sampler, guidance / negativePrompt, progress and an IP-Adapter image
+// prompt (ipAdapter, imagePrompt, ipScale: used by every generation, e.g. to
+// keep a style through a zoom or morph) apply.
 class StableDiffusion {
 public:
     StableDiffusion(const std::string& directory, const TextToImageOptions& options = {}, bool withEncoder = true);

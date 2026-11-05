@@ -1261,10 +1261,10 @@ int main(int argc, char** argv) {
                 } else if (a == "--control-scale") vo.controlScale = std::stof(value());
                 else if (a == "--canny") cannyVideo = true;
                 else if (a == "--depth-model") depthModelVideo = value();
-                else if (a == "--ip-adapter") vo.ipAdapter = value();
-                else if (a == "--image-prompt") vo.imagePrompt = loadImage(value());
-                else if (a == "--ip-scale") vo.ipScale = std::stof(value());
-                else if (a == "--image-encoder") vo.imageEncoder = value();
+                else if (a == "--ip-adapter") vo.ipAdapter = o.ipAdapter = value();
+                else if (a == "--image-prompt") vo.imagePrompt = o.imagePrompt = loadImage(value());
+                else if (a == "--ip-scale") vo.ipScale = o.ipScale = std::stof(value());
+                else if (a == "--image-encoder") vo.imageEncoder = o.imageEncoder = value();
                 else if (a == "--upscale") upscaleModel = value();
                 else if (a == "--interpolate") interpolateModel = value();
                 else if (a == "--interp-passes") interpPasses = std::stoul(value());

@@ -2693,6 +2693,16 @@ TEST(compressed_png_and_animated_png) {
     for (int i = 0; i < 200000; ++i) data.push_back(static_cast<std::uint8_t>((i % 7 == 0 ? rng() % 4 : 0) + (i / 1000) % 3));
     const auto z = deflateCompress(data);
     CHECK(z.size() < data.size() / 4 && z[0] == 0x78);
+    // A short input that ends inside a match running to its last byte (the match search must stop there).
+    const std::vector<std::uint8_t> tail{1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4};
+    Image tiny;
+    tiny.width = 4;
+    tiny.height = 4;
+    tiny.channels = 1;
+    tiny.pixels = tail;
+    savePng(path, tiny);
+    CHECK(loadPng(path).pixels == tail);
+    CHECK(deflateCompress(tail).size() > 2);
 
     // APNG: acTL with the frame count, one fcTL per frame, fdAT after the first,
     // sequence numbers in order; the first frame is the still image.
@@ -3713,6 +3723,16 @@ TEST(ip_adapter_image_prompts) {
     CHECK(textToImage(dir, "hello", o).pixels == base.pixels);
     o.ipScale = 1.0f;
     CHECK(textToImage(dir, "hello", o).pixels != base.pixels);
+    // The session uses the image prompt for every generation.
+    StableDiffusion withIp(dir, o, false);
+    o.ipScale = 0.0f;
+    StableDiffusion zeroIp(dir, o, false);
+    TextToImageOptions plainOptions;
+    plainOptions.width = plainOptions.height = 64;
+    StableDiffusion plainSd(dir, plainOptions, false);
+    const Image p0 = plainSd.generate("hello", 3, 2);
+    CHECK(zeroIp.generate("hello", 3, 2).pixels == p0.pixels);
+    CHECK(withIp.generate("hello", 3, 2).pixels != p0.pixels);
     for (const std::string& d : {dir, tok, enc}) std::filesystem::remove_all(d);
 }
 

@@ -32,6 +32,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
+#include <csignal>
 #include <ctime>
 #include <cctype>
 #include <cmath>
@@ -1076,6 +1078,7 @@ void usage() {
               << "  NeuraCraft depth <depth-anything dir> in.png depth.png [--size 518]   (control images: --depth-model dir)\n"
               << "  NeuraCraft parallax <depth-anything dir> in.png out.gif [--frames 48] [--amplitude 0.03] [--zoom 0.06] [--fps 24]\n"
               << "  NeuraCraft workflow steps.json [--check]               (image / video steps in JSON, see Workflow.h)\n"
+              << "  NeuraCraft serve [--port 8188] [--host IP] [--data DIR] [--ui DIR]   (Studio engine: HTTP API, see Server.h)\n"
               << "  NeuraCraft ops                                         (the workflow operations and fields, JSON)\n"
               << "  NeuraCraft models [folder] [--json]                    (models found under data/ or folder)\n"
               << "  video output: .gif (256 colours), .png (animated PNG, full colour) or .mov (QuickTime Motion-JPEG)\n"
@@ -1108,6 +1111,10 @@ static Lora parseLora(const std::string& s) {
         }
     }
     return {s, 1.0f};
+}
+
+namespace {
+volatile std::sig_atomic_t gServeStop = 0;
 }
 
 int main(int argc, char** argv) {
@@ -1144,7 +1151,7 @@ int main(int argc, char** argv) {
     }
     const std::string cmd = args.empty() ? "all" : args[0];
     // Commands whose output is data (JSON for tools such as the Studio UI) print nothing else.
-    const bool quiet = cmd == "ops" || cmd == "models";
+    const bool quiet = cmd == "ops" || cmd == "models" || cmd == "serve";
     if (!quiet)
         std::cout << "device: " << deviceDescription() << (gpuAttentionEnabled() && currentDevice() != Device::GPU ? " + GPU attention" : "")
                   << '\n';
@@ -1529,6 +1536,31 @@ int main(int argc, char** argv) {
             std::cout << "wrote " << output << " (" << video.size() << " frames, " << o.width << "x" << o.height << ", " << fps
                       << " fps) in " << std::fixed << std::setprecision(1)
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() << " s" << std::defaultfloat << '\n';
+            return 0;
+        }
+        if (cmd == "serve") {  // [--port N] [--host IP] [--data DIR] [--ui DIR]: the Studio engine
+            ServerOptions so;
+            for (std::size_t i = 1; i < args.size(); ++i) {
+                const std::string& a = args[i];
+                auto value = [&]() -> std::string {
+                    if (i + 1 >= args.size()) throw std::invalid_argument(a + " needs a value");
+                    return args[++i];
+                };
+                if (a == "--port") so.port = std::stoi(value());
+                else if (a == "--host") so.host = value();
+                else if (a == "--data") so.dataDir = value();
+                else if (a == "--ui") so.uiDir = value();
+                else throw std::invalid_argument("serve: unknown option " + a);
+            }
+            if (so.host != "127.0.0.1" && so.host != "localhost")
+                std::cerr << "warning: listening on " << so.host << ": anyone who can reach this machine can run workflows\n";
+            StudioServer server(so, [](const std::string& line) { std::cerr << line << '\n'; });
+            server.start();
+            std::signal(SIGINT, [](int) { gServeStop = 1; });
+            std::signal(SIGTERM, [](int) { gServeStop = 1; });
+            while (!gServeStop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::cerr << "stopping\n";
+            server.stop();
             return 0;
         }
         if (cmd == "ops") {  // the workflow operations, as JSON (the Studio UI's schema)

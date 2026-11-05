@@ -34,7 +34,7 @@ struct Value {
 Value parse(const std::string& text);
 
 // Compact JSON text of a value (numbers that are integers print without a
-// fraction; others with up to 9 significant digits), and of a string literal.
+// fraction; others with up to 15 significant digits), and of a string literal.
 std::string dump(const Value& value);
 std::string quote(const std::string& text);
 

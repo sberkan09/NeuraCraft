@@ -234,7 +234,7 @@ void dumpTo(const Value& v, std::string& out) {
             out += std::to_string(static_cast<long long>(v.number));
         } else {
             char buf[32];
-            std::snprintf(buf, sizeof buf, "%.9g", v.number);
+            std::snprintf(buf, sizeof buf, "%.15g", v.number);
             out += buf;
         }
         break;

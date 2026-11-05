@@ -6,6 +6,7 @@ import { freeSpot, topoSort, withLayout, type StepUi } from "../graph";
 import { pickModel } from "../templates";
 import { FieldInput, fieldLabel } from "./FieldInput";
 import { GraphCanvas } from "./GraphCanvas";
+import { PromptTimeline } from "./PromptTimeline";
 import { overallFraction } from "./Results";
 
 const groupNames: Record<string, string> = { image: "Resim", video: "Video", analysis: "Analiz", enhance: "İyileştirme", edit: "Düzenle", input: "Giriş / çıkış" };
@@ -31,7 +32,7 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
   const { engine, workflow } = props;
   const ops = useMemo(() => new Map((engine.schema?.ops ?? []).map((o) => [o.name, o] as [string, WorkflowOp])), [engine.schema]);
   const [selected, setSelected] = useState(0);
-  const [view, setView] = useState<"graph" | "steps" | "json">("graph");
+  const [view, setView] = useState<"graph" | "steps" | "json" | "timeline">("graph");
   const [message, setMessage] = useState<string>();
   const [jsonText, setJsonText] = useState(JSON.stringify(workflow, null, 2));
   const [jsonError, setJsonError] = useState<string>();
@@ -139,6 +140,10 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
   const job = engine.jobs.find((j) => j.id === jobId);
   const sel = steps[selected];
   const selOp = sel ? ops.get(sel.op) : undefined;
+  const hasTimeline = !!selOp?.fields.some((f) => f.type === "keyframes");
+  useEffect(() => {
+    if (view === "timeline" && !hasTimeline) setView("graph");
+  }, [view, hasTimeline]);
   const clipsBefore = (i: number) => steps.slice(0, i).filter((s) => ops.get(s.op)?.output).map((s) => String(s.out ?? s.op));
   const groups = groupOrder.map((g) => ({ g, list: [...ops.values()].filter((o) => o.group === g) }));
   const stepState = (i: number) => {
@@ -172,12 +177,15 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
             <button type="button" aria-pressed={view === "graph"} onClick={() => setView("graph")}>Grafik</button>
             <button type="button" aria-pressed={view === "steps"} onClick={() => setView("steps")}>Liste</button>
             <button type="button" aria-pressed={view === "json"} onClick={() => setView("json")}>JSON</button>
+            {hasTimeline ? <button type="button" aria-pressed={view === "timeline"} onClick={() => setView("timeline")}>Zaman</button> : null}
           </div>
           <span className="spacer" />
           <span className="note">{steps.length} adım</span>
         </div>
         {message ? <div className="problems" style={{ margin: "10px 16px 0" }} role="alert">{message}</div> : null}
-        {view === "graph" ? (
+        {view === "timeline" && sel && selOp && hasTimeline ? (
+          <PromptTimeline step={sel} op={selOp} job={job} onChange={(field, x) => update(selected, field, x)} onBack={() => setView("graph")} />
+        ) : view === "graph" ? (
           steps.length === 0 ? (
             <div className="empty">Soldan bir işlem ekleyerek başla. Düğümleri sürükle; bir düğümün sağındaki çıkışı diğerinin solundaki girişe çekerek bağla.</div>
           ) : (
@@ -255,7 +263,15 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
               <h2 style={{ margin: "2px 0 0", fontSize: 20 }}>{selOp.title}</h2>
               <p className="note" style={{ margin: "4px 0 0" }}>{selOp.doc}</p>
             </div>
-            {selOp.fields.map((f) => (
+            {selOp.fields.map((f) => f.type === "keyframes" ? (
+              <div key={f.name} className="field">
+                <span className="label">{fieldLabel(f.name)}</span>
+                <span className="note">
+                  {Array.isArray(sel[f.name]) && (sel[f.name] as unknown[]).length ? `${(sel[f.name] as unknown[]).length} anahtar kare` : "Tek prompt (geçiş yok)"}
+                </span>
+                <button type="button" className="btn small" onClick={() => setView("timeline")}>Zaman çizelgesinde düzenle</button>
+              </div>
+            ) : (
               <FieldInput key={f.name} id={`insp-${f.name}`} field={f} value={sel[f.name]} models={engine.models} clips={clipsBefore(selected)}
                 onChange={(x) => update(selected, f.name, x)} />
             ))}

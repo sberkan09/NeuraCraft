@@ -13,4 +13,4 @@ for f in config.json diffusion_pytorch_model.fp16.safetensors; do
     curl -fL --retry 3 -o "$DIR/$f.part" "https://huggingface.co/$REPO/resolve/main/$f"
     mv "$DIR/$f.part" "$DIR/$f"
 done
-echo "Ready in $DIR. Try: ./build_and_run.sh txt2img data/animatediff \"a cabin in summer\" out.png --controlnet $DIR --control photo.png --canny"
+echo "Ready in $DIR. Try: ./build_and_run.sh txt2img data/animatediff \"a cabin in summer\" out.png --controlnet $DIR --control photo.png --canny  (depth: --depth-model data/depth-anything-v2-small)"

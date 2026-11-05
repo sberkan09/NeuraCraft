@@ -966,6 +966,8 @@ void usage() {
               << "  NeuraCraft inpaint <dir> in.png mask.png \"prompt\" [out.png] [--steps 25] [--strength 1] [--feather 4] [--guidance G]\n"
               << "  NeuraCraft upscale model.safetensors in.png out.png      (Real-ESRGAN compact; video takes --upscale model)\n"
               << "  NeuraCraft interpolate rife.safetensors frames/ out.gif [--passes N] [--fps F] [--loop]   (video: --interpolate rife)\n"
+              << "  NeuraCraft depth <depth-anything dir> in.png depth.png [--size 518]   (control images: --depth-model dir)\n"
+              << "  NeuraCraft parallax <depth-anything dir> in.png out.gif [--frames 48] [--amplitude 0.03] [--zoom 0.06] [--fps 24]\n"
               << "  video output: .gif (256 colours), .png (animated PNG, full colour) or .mov (QuickTime Motion-JPEG)\n"
               << "        [--strength S] [--steps N] [--start in.png] [--seed S] [--size N] [--frames-dir DIR] [--full-vae]\n"
               << "        [--sharpen A] [--noise N] [--no-color-match]\n"
@@ -1125,6 +1127,7 @@ int main(int argc, char** argv) {
             }
             TextToImageOptions o;
             bool canny = false;
+            std::string depthModel;
             if (img2img) o.steps = 2;  // SD-Turbo's image-to-image setting: 2 steps at strength 0.5
             std::string output = img2img ? "img2img.png" : "txt2img.png";
             const std::string prompt = args[img2img ? 3 : 2];
@@ -1151,6 +1154,7 @@ int main(int argc, char** argv) {
                 else if (a == "--control") o.controlImage = loadImage(value());
                 else if (a == "--control-scale") o.controlScale = std::stof(value());
                 else if (a == "--canny") canny = true;
+                else if (a == "--depth-model") depthModel = value();
                 else if (a.rfind("--", 0) != 0) output = a;
                 else {
                     std::cerr << "unknown txt2img option: " << a << "\n";
@@ -1158,6 +1162,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (canny && !o.controlImage.pixels.empty()) o.controlImage = cannyEdges(o.controlImage);
+            if (!depthModel.empty() && !o.controlImage.pixels.empty()) o.controlImage = DepthEstimator(depthModel).depthImage(o.controlImage);
             o.progress = [](const std::string& stage, double seconds) {
                 std::cerr << "  " << stage << ": " << std::fixed << std::setprecision(1) << seconds << " s" << std::defaultfloat << '\n';
             };
@@ -1192,7 +1197,7 @@ int main(int argc, char** argv) {
             std::string output = morph ? "morph.gif" : t2v ? "t2v.gif" : outpaint ? "outpaint.gif" : "zoom.gif", framesDir, start;
             float fps = morph ? 10.0f : 8.0f;
             bool fullVae = false, framesSet = false, strengthSet = false, cannyVideo = false;
-            std::string upscaleModel, interpolateModel;
+            std::string upscaleModel, interpolateModel, depthModelVideo;
             std::size_t interpPasses = 1;
             std::size_t frames = 0;
             auto split = [](const std::string& s) {
@@ -1249,6 +1254,7 @@ int main(int argc, char** argv) {
                     for (const std::string& f : files) vo.controlImages.push_back(loadImage(f));
                 } else if (a == "--control-scale") vo.controlScale = std::stof(value());
                 else if (a == "--canny") cannyVideo = true;
+                else if (a == "--depth-model") depthModelVideo = value();
                 else if (a == "--upscale") upscaleModel = value();
                 else if (a == "--interpolate") interpolateModel = value();
                 else if (a == "--interp-passes") interpPasses = std::stoul(value());
@@ -1302,6 +1308,10 @@ int main(int argc, char** argv) {
                 if (!vo.controlNet.empty() && vo.controlImages.empty()) vo.controlImages = vo.init;
                 if (cannyVideo)
                     for (Image& c : vo.controlImages) c = cannyEdges(c);
+                if (!depthModelVideo.empty()) {
+                    DepthEstimator de(depthModelVideo);
+                    for (Image& c : vo.controlImages) c = de.depthImage(c);
+                }
             } else if (outpaint) {
                 oz.seed = seeds[0];
                 if (framesSet) oz.framesPerKey = frames;
@@ -1377,6 +1387,50 @@ int main(int argc, char** argv) {
             std::cout << "wrote " << output << " (" << video.size() << " frames, " << o.width << "x" << o.height << ", " << fps
                       << " fps) in " << std::fixed << std::setprecision(1)
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() << " s" << std::defaultfloat << '\n';
+            return 0;
+        }
+        if (cmd == "depth" || cmd == "parallax") {  // depth-model in.png out [options]
+            if (args.size() < 4) {
+                usage();
+                return 2;
+            }
+            std::size_t size = 518;
+            ParallaxOptions po;
+            float fps = 24.0f;
+            for (std::size_t i = 4; i < args.size(); ++i) {
+                const std::string& a = args[i];
+                auto value = [&]() -> std::string {
+                    if (i + 1 >= args.size()) throw std::invalid_argument(a + " needs a value");
+                    return args[++i];
+                };
+                if (a == "--size") size = std::stoul(value());
+                else if (a == "--frames") po.frames = std::stoul(value());
+                else if (a == "--amplitude") po.amplitude = std::stof(value());
+                else if (a == "--zoom") po.zoom = std::stof(value());
+                else if (a == "--fps") fps = std::stof(value());
+                else if (a == "--no-loop") po.loop = false;
+                else {
+                    std::cerr << "unknown " << cmd << " option: " << a << "\n";
+                    return 2;
+                }
+            }
+            const auto start = std::chrono::steady_clock::now();
+            DepthEstimator de(args[1]);
+            const Image in = toRgb(loadImage(args[2]));
+            const std::string& o = args[3];
+            auto ends = [&](const char* e) { return o.size() > 4 && o.compare(o.size() - 4, 4, e) == 0; };
+            if (cmd == "depth") {
+                const Image d = de.depthImage(in, size);
+                if (ends(".jpg")) saveJpeg(o, d, 92);
+                else savePng(o, d);
+            } else {
+                const std::vector<Image> frames = parallaxAnimation(in, de.estimate(in, size), po);
+                if (ends(".png")) saveApng(o, frames, fps);
+                else if (ends(".mov")) saveMjpegMov(o, frames, fps);
+                else saveGif(o, frames, fps);
+            }
+            std::cout << "wrote " << o << " in " << std::fixed << std::setprecision(1)
+                      << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() << " s" << std::defaultfloat << '\n';
             return 0;
         }
         if (cmd == "interpolate") {  // model frames-dir out [--passes N] [--fps F] [--loop]

@@ -7,6 +7,7 @@
 #include "Conv.h"
 #include "Data.h"
 #include "Dense.h"
+#include "Depth.h"
 #include "Diffusion.h"
 #include "Image.h"
 #include "Interpolate.h"

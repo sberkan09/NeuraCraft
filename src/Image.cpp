@@ -604,7 +604,7 @@ std::vector<std::uint8_t> zlibCompress(const std::vector<std::uint8_t>& data) {
                 if (l > best) {
                     best = l;
                     dist = i - c;
-                    if (l >= kNice) break;
+                    if (l >= kNice || l >= maxLen) break;  // nothing longer is possible (and data[i + best] would be past the end)
                 }
             }
             const std::int32_t p = prev[c % kWindow];

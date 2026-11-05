@@ -1435,6 +1435,7 @@ struct StableDiffusion::Impl {
     std::unique_ptr<TinyVae> tiny;
     std::unique_ptr<Vae> vae;
     bool encoder = false;
+    std::pair<Matrix, Matrix> ipTokens;  // image prompt and "no picture" tokens (IP-Adapter)
 };
 
 StableDiffusion::StableDiffusion(const std::string& dir, const TextToImageOptions& o, bool withEncoder) : impl_(std::make_unique<Impl>()) {
@@ -1452,8 +1453,10 @@ StableDiffusion::StableDiffusion(const std::string& dir, const TextToImageOption
         if (const json::Value* p = c.find("pad_token"); p && p->isString() && p->string == "!") m.pad = 0;
     }
     reportStage(o, "load text encoder", t);
+    if (!o.ipAdapter.empty()) m.ipTokens = imagePromptTokens(o.ipAdapter, o.imageEncoder, o.imagePrompt, o);
     t = PipelineClock::now();
     m.unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8, o.loras);
+    if (!o.ipAdapter.empty()) loadIpAdapter(m.unet, o.ipAdapter, o.int8);
     reportStage(o, "load unet", t);
     t = PipelineClock::now();
     if (!o.tinyVae.empty()) m.tiny = std::make_unique<TinyVae>(loadTinyVae(o.tinyVae, o.width, o.height, withEncoder, true));
@@ -1524,8 +1527,10 @@ Image StableDiffusion::inpaint(const Image& input, const Image& mask, const std:
         for (std::size_t k = 0; k < C * plane; ++k) in.data()[k] = latent.data()[k] * scale;
         std::copy(latentMask.begin(), latentMask.end(), in.data() + C * plane);
         std::copy(maskedLatent.data(), maskedLatent.data() + C * plane, in.data() + (C + 1) * plane);
+        if (impl_->unet.hasImagePrompt()) impl_->unet.setImagePrompt(impl_->ipTokens.first, impl_->options.ipScale);
         Matrix eps = impl_->unet.forward(in, static_cast<float>(sched.timesteps[i]), context);
         if (guidance > 1.0f) {
+            if (impl_->unet.hasImagePrompt()) impl_->unet.setImagePrompt(impl_->ipTokens.second, impl_->options.ipScale);
             const Matrix un = impl_->unet.forward(in, static_cast<float>(sched.timesteps[i]), negative);
             for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = un.data()[k] + guidance * (eps.data()[k] - un.data()[k]);
         }
@@ -1571,9 +1576,12 @@ void StableDiffusion::denoise(Matrix& latent, const Matrix& context, const Euler
         Matrix in = latent;
         const float scale = static_cast<float>(sched.inputScale(i));
         for (float& v : in.values()) v *= scale;
-        Matrix eps = impl_->unet.forward(in, static_cast<float>(sched.timesteps[i]), context);
+        UNet2DCondition& unet = impl_->unet;
+        if (unet.hasImagePrompt()) unet.setImagePrompt(impl_->ipTokens.first, impl_->options.ipScale);
+        Matrix eps = unet.forward(in, static_cast<float>(sched.timesteps[i]), context);
         if (guidance > 1.0f) {
-            const Matrix uncond = impl_->unet.forward(in, static_cast<float>(sched.timesteps[i]), negative);
+            if (unet.hasImagePrompt()) unet.setImagePrompt(impl_->ipTokens.second, impl_->options.ipScale);
+            const Matrix uncond = unet.forward(in, static_cast<float>(sched.timesteps[i]), negative);
             for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + guidance * (eps.data()[k] - uncond.data()[k]);
         }
         sched.step(i, eps, latent);
@@ -1603,7 +1611,8 @@ Image StableDiffusion::generate(const std::string& prompt, unsigned seed, std::s
     const EulerScheduler sched = scheduler(steps);
     Matrix latent = noise(seed);
     for (float& v : latent.values()) v *= static_cast<float>(sched.initNoiseSigma);
-    denoise(latent, encodePrompt(prompt), sched);
+    const float g = impl_->options.guidance;
+    denoise(latent, encodePrompt(prompt), sched, 0, g, g > 1.0f ? encodePrompt(impl_->options.negativePrompt) : Matrix());
     return decode(latent);
 }
 
@@ -1617,7 +1626,8 @@ Image StableDiffusion::transform(const Image& input, const std::string& prompt, 
         const Matrix n = noise(seed);
         const float sigma = static_cast<float>(sched.sigmas[first]);
         for (std::size_t k = 0; k < latent.size(); ++k) latent.data()[k] += sigma * n.data()[k];
-        denoise(latent, encodePrompt(prompt), sched, first);
+        const float g = impl_->options.guidance;
+        denoise(latent, encodePrompt(prompt), sched, first, g, g > 1.0f ? encodePrompt(impl_->options.negativePrompt) : Matrix());
     }
     return decode(latent);
 }

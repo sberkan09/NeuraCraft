@@ -520,8 +520,28 @@ cannot tell goes in a `<file>.json` next to it, for example
 A separate VAE (`"vae"` in a step, `TextToImageOptions::vae`) can be a
 diffusers VAE folder or a VAE `.safetensors` of its own. ControlNets in the
 original layout (`control_v11p_sd15_canny.safetensors` and the like:
-`control_model.*`, `input_hint_block`, `zero_convs`) load the same way. SDXL
-checkpoints are recognised and refused for now. `Checkpoint.h` has the details.
+`control_model.*`, `input_hint_block`, `zero_convs`) load the same way.
+`Checkpoint.h` has the details.
+
+### SDXL
+
+SDXL models — a diffusers folder (`text_encoder_2/`, `tokenizer_2/`) or a
+single file such as `sd_xl_turbo_1.0_fp16.safetensors` — work for `txt2img`
+and `img2img`:
+
+```
+$ ./bin/NeuraCraft txt2img data/checkpoints/sd_xl_turbo_1.0_fp16.safetensors "a lighthouse on a cliff at dusk" xl.png --size 512
+```
+
+The UNet builder takes the SDXL layout from its config (several transformer
+blocks per attention, `transformer_layers_per_block`, and the `text_time`
+added conditions), the prompt goes through both text encoders (the
+penultimate states of CLIP-L and OpenCLIP bigG side by side, the pooled bigG
+embedding through its projection) and the picture size goes in as the six
+size numbers. An empty negative prompt is all zeros, as the base model expects.
+File names with "turbo" or "lightning" get the "trailing" schedule few-step
+models need. AnimateDiff, morph / zoom / outpaint and IP-Adapter stay SD 1.x /
+2.x for now.
 
 ### LoRA and the LCM sampler
 

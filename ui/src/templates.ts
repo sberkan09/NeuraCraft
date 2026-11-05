@@ -16,6 +16,7 @@ export interface FormField {
   step?: number;
   help?: string;
   model?: string; // model kind for kind "model"
+  alsoModels?: string[]; // other kinds that work too (e.g. sdxl for a picture)
   optional?: boolean;
   wide?: boolean; // full row in the form grid
 }
@@ -100,7 +101,7 @@ export const templates: Template[] = [
     fields: [
       promptField("a red fox in fresh snow, golden hour, photo"),
       negativeField,
-      { key: "model", label: "Model", kind: "model", model: "sd" },
+      { key: "model", label: "Model", kind: "model", model: "sd", alsoModels: ["sdxl"] },
       sizeField(),
       seedField,
       qualityField,

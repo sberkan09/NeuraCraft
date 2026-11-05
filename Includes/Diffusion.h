@@ -65,12 +65,22 @@ struct ClipTextEncoder {
     std::size_t length = 77, dim = 0, layers = 0;
 
     Matrix encode(const std::vector<int>& ids);  // length x dim
+    // SDXL: the hidden states after the second-to-last layer (no final norm), and - when the model has a
+    // text projection (CLIPTextModelWithProjection) - the pooled embedding: the final-normed state at the
+    // end-of-text token (the largest id) times the projection (1 x projection dim).
+    struct Penultimate {
+        Matrix hidden, pooled;
+    };
+    Penultimate encodePenultimate(const std::vector<int>& ids);
+    Matrix projection;  // dim x projection dim; empty without one
 };
 
 // Loads `directory`/text_encoder (or `directory` itself): config.json plus
 // model(.fp16).safetensors. Supports hidden_act gelu (OpenCLIP, SD 2 / Turbo)
 // and quick_gelu (OpenAI CLIP, SD 1.x). int8 quantizes its matrices.
 ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8 = false, const std::vector<Lora>& loras = {});
+// ... one of several: "text_encoder", or "text_encoder_2" (SDXL's OpenCLIP bigG with its projection).
+ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8, const std::vector<Lora>& loras, const std::string& which);
 
 // Multi-head scaled dot-product attention without a mask: q (N x C), k and v
 // (M x C) -> N x C, channels split into `heads` contiguous groups. Queries go
@@ -120,6 +130,10 @@ public:
     // see IpAdapter::tokens) attended in every cross-attention next to the
     // text, weighted by `scale`; empty tokens switch it off.
     bool hasImagePrompt() const;
+    // SDXL ("addition_embed_type": "text_time"): the pooled text embedding and the six size numbers
+    // (original height, width, crop top, left, target height, width), set before each call.
+    bool needsAddedConditions() const;
+    void setAddedConditions(const Matrix& textEmbeds, const std::vector<float>& timeIds);
     void setImagePrompt(const Matrix& tokens, float scale = 1.0f);
     Matrix controlEmbedding(const Matrix& conditionImage);
     // ... and per step, the residuals for the UNet, multiplied by `scale`.

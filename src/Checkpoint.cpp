@@ -1,6 +1,7 @@
 #include "Checkpoint.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -25,6 +26,8 @@ const std::string kControl = "control_model.";                 // a ControlNet (
 const std::string kVae = "first_stage_model.";
 const std::string kClip = "cond_stage_model.transformer.";     // OpenAI CLIP (SD 1.x)
 const std::string kOpenClip = "cond_stage_model.model.";       // OpenCLIP (SD 2.x)
+const std::string kSdxlClip = "conditioner.embedders.0.transformer.";  // SDXL: OpenAI CLIP ViT-L
+const std::string kSdxlOpenClip = "conditioner.embedders.1.model.";    // SDXL: OpenCLIP ViT-bigG (with a projection)
 
 bool startsWith(const std::string& s, const std::string& p) { return s.compare(0, p.size(), p) == 0; }
 
@@ -122,6 +125,8 @@ std::vector<SafeTensors::Rename> unetRenames(const SafeTensors& st) {
         else if (startsWith(key, "out.0.")) to = "conv_norm_out." + key.substr(6);
         else if (startsWith(key, "out.2.")) to = "conv_out." + key.substr(6);
         else if (startsWith(key, "input_blocks.0.0.")) to = "conv_in." + key.substr(17);
+        else if (startsWith(key, "label_emb.0.0.")) to = "add_embedding.linear_1." + key.substr(14);  // SDXL's added conditions
+        else if (startsWith(key, "label_emb.0.2.")) to = "add_embedding.linear_2." + key.substr(14);
         else if (startsWith(key, "input_blocks.")) {
             std::size_t i, part;
             std::string rest, inner;
@@ -188,12 +193,13 @@ json::Value unetConfig(const SafeTensors& st, const CheckpointInfo& info) {
     const std::string kUnet = unetPrefix(st);
     const bool control = kUnet == kControl;
     const UnetLayout l = unetLayout(names, kUnet);
-    std::vector<json::Value> channels, down, up, heads;
+    std::vector<json::Value> channels, down, up, heads, depth;
     for (std::size_t b = 0; b < l.levels; ++b) {
         const std::string first = kUnet + "input_blocks." + std::to_string(1 + b * (l.layers + 1)) + ".";
         const std::size_t ch = count(st, first + "0.out_layers.3.bias");
         channels.push_back(makeNumber(static_cast<double>(ch)));
         const bool attn = anyWithPrefix(names, first + "1.proj_in.");
+        depth.push_back(makeNumber(attn ? static_cast<double>(maxIndex(names, first + "1.transformer_blocks.") + 1) : 1.0));
         down.push_back(makeString(attn ? "CrossAttnDownBlock2D" : "DownBlock2D"));
         // diffusers' attention_head_dim is the number of heads: 8 for SD 1.x, 64-channel heads for SD 2.x.
         heads.push_back(makeNumber(info.family == "sd1" ? 8.0 : static_cast<double>(std::max<std::size_t>(1, ch / 64))));
@@ -217,6 +223,13 @@ json::Value unetConfig(const SafeTensors& st, const CheckpointInfo& info) {
                        {"norm_eps", makeNumber(1e-5)},
                        {"flip_sin_to_cos", makeBool(true)},
                        {"freq_shift", makeNumber(0)}});
+    config.object.emplace_back("transformer_layers_per_block", makeArray(depth));
+    if (st.has(kUnet + "label_emb.0.0.weight")) {  // SDXL: pooled text + six size numbers, 256 channels each
+        config.object.emplace_back("addition_embed_type", makeString("text_time"));
+        config.object.emplace_back("addition_time_embed_dim", makeNumber(256));
+        config.object.emplace_back("projection_class_embeddings_input_dim",
+                                   makeNumber(static_cast<double>(count(st, kUnet + "label_emb.0.0.weight") / count(st, kUnet + "label_emb.0.0.bias"))));
+    }
     if (control) {
         // The hint convs: conv_in, then pairs (same size, stride 2) up to the last before the zero conv.
         const int last = maxIndex(names, kUnet + "input_hint_block.");
@@ -315,10 +328,21 @@ json::Value vaeConfig(const SafeTensors& st) {
 
 // ---- CLIP text encoder ----
 
-std::vector<SafeTensors::Rename> clipRenames(const SafeTensors& st) {
+// The text encoders a file holds: (OpenAI-layout prefix, OpenCLIP-layout prefix) of one component.
+std::pair<std::string, std::string> clipPrefixes(const std::vector<std::string>& names, const std::string& component) {
+    if (anyWithPrefix(names, "conditioner.embedders.")) {  // SDXL: text_encoder = CLIP-L, text_encoder_2 = OpenCLIP bigG
+        if (component == "text_encoder_2") return {"", kSdxlOpenClip};
+        return {kSdxlClip, ""};
+    }
+    if (component == "text_encoder_2") throw std::runtime_error("checkpoint: no second text encoder (not an SDXL file)");
+    return {kClip, kOpenClip};
+}
+
+std::vector<SafeTensors::Rename> clipRenames(const SafeTensors& st, const std::string& component) {
     std::vector<SafeTensors::Rename> out;
     const std::vector<std::string> names = st.names();
-    if (anyWithPrefix(names, kClip)) {  // Hugging Face layout already, under a prefix (older files lack "text_model.")
+    const auto [kClip, kOpenClip] = clipPrefixes(names, component);
+    if (!kClip.empty() && anyWithPrefix(names, kClip)) {  // Hugging Face layout already, under a prefix (older files lack "text_model.")
         for (const std::string& n : names) {
             if (!startsWith(n, kClip)) continue;
             std::string key = n.substr(kClip.size());
@@ -336,6 +360,7 @@ std::vector<SafeTensors::Rename> clipRenames(const SafeTensors& st) {
         if (key == "token_embedding.weight") out.push_back({t + "embeddings.token_embedding.weight", n});
         else if (key == "positional_embedding") out.push_back({t + "embeddings.position_embedding.weight", n});
         else if (startsWith(key, "ln_final.")) out.push_back({t + "final_layer_norm." + key.substr(9), n});
+        else if (key == "text_projection") out.push_back({"text_projection.weight", n});  // stored in x @ P order (see config)
         else if (startsWith(key, "transformer.resblocks.")) {
             const std::string r = key.substr(22);
             const std::size_t dot = r.find('.');
@@ -358,8 +383,10 @@ std::vector<SafeTensors::Rename> clipRenames(const SafeTensors& st) {
     return out;
 }
 
-json::Value clipConfig(const SafeTensors& st) {
+json::Value clipConfig(const SafeTensors& st, const std::string& component) {
     const std::vector<std::string> names = st.names();
+    const auto [kClip, kOpenClip] = clipPrefixes(names, component);
+    const bool sdxl = anyWithPrefix(names, "conditioner.embedders.");
     auto config = [](const char* act, std::size_t vocabElems, std::size_t D, std::size_t intermediate, std::size_t layers, std::size_t posElems) {
         return makeObject({{"hidden_act", makeString(act)},
                            {"vocab_size", makeNumber(static_cast<double>(vocabElems / D))},
@@ -370,7 +397,7 @@ json::Value clipConfig(const SafeTensors& st) {
                            {"max_position_embeddings", makeNumber(static_cast<double>(posElems / D))},
                            {"layer_norm_eps", makeNumber(1e-5)}});
     };
-    if (anyWithPrefix(names, kClip)) {
+    if (!kClip.empty() && anyWithPrefix(names, kClip)) {
         const std::string p = st.has(kClip + "text_model.embeddings.token_embedding.weight") ? kClip + "text_model." : kClip;
         const std::size_t D = count(st, p + "final_layer_norm.weight");
         return config("quick_gelu", count(st, p + "embeddings.token_embedding.weight"), D, count(st, p + "encoder.layers.0.mlp.fc1.bias"),
@@ -379,8 +406,14 @@ json::Value clipConfig(const SafeTensors& st) {
     const std::size_t D = count(st, kOpenClip + "ln_final.weight");
     const int layers = maxIndex(names, kOpenClip + "transformer.resblocks.") + 1;
     // Stable Diffusion 2 conditions on the penultimate layer; diffusers' SD 2 text encoder simply has one layer less.
-    return config("gelu", count(st, kOpenClip + "token_embedding.weight"), D, count(st, kOpenClip + "transformer.resblocks.0.mlp.c_fc.bias"),
-                  static_cast<std::size_t>(std::max(1, layers - 1)), count(st, kOpenClip + "positional_embedding"));
+    // SDXL keeps them all (the pipeline takes the penultimate states and pools the last).
+    json::Value c = config("gelu", count(st, kOpenClip + "token_embedding.weight"), D, count(st, kOpenClip + "transformer.resblocks.0.mlp.c_fc.bias"),
+                           static_cast<std::size_t>(sdxl ? layers : std::max(1, layers - 1)), count(st, kOpenClip + "positional_embedding"));
+    if (st.has(kOpenClip + "text_projection")) {
+        c.object.emplace_back("projection_dim", makeNumber(static_cast<double>(count(st, kOpenClip + "text_projection") / D)));
+        c.object.emplace_back("_projection_in_out", makeBool(true));  // OpenCLIP stores it D x P (x @ P), diffusers P x D
+    }
+    return c;
 }
 
 // Settings a file cannot tell (or that differ from the usual ones), from "<file>.json" next to it:
@@ -444,7 +477,7 @@ CheckpointInfo inspectCheckpoint(const std::string& path) {
     }
     info.hasVae = st.has(kVae + "encoder.conv_in.weight");
     const bool openAi = anyWithPrefix(names, kClip), openClip = anyWithPrefix(names, kOpenClip);
-    info.hasTextEncoder = openAi || openClip;
+    info.hasTextEncoder = openAi || openClip || anyWithPrefix(names, kSdxlClip);
     if (const json::Value extra = sidecar(path); extra.find("family") && extra.at("family").isString()) info.family = extra.at("family").string;
     else if (anyWithPrefix(names, "conditioner.embedders.") || info.contextDim == 2048) info.family = "sdxl";
     else if (openClip || (!openAi && info.contextDim == 1024)) info.family = "sd2";
@@ -456,8 +489,8 @@ CheckpointInfo inspectCheckpoint(const std::string& path) {
 std::vector<SafeTensors::Rename> checkpointRenames(const SafeTensors& file, const std::string& component) {
     if (component == "unet") return unetRenames(file);
     if (component == "vae") return vaeRenames(file);
-    if (component == "text_encoder") return clipRenames(file);
-    throw std::invalid_argument("checkpoint: unknown component '" + component + "' (unet, vae, text_encoder)");
+    if (component == "text_encoder" || component == "text_encoder_2") return clipRenames(file, component);
+    throw std::invalid_argument("checkpoint: unknown component '" + component + "' (unet, vae, text_encoder, text_encoder_2)");
 }
 
 ModelComponent modelComponent(const std::string& model, const std::string& component, const std::string& what) {
@@ -475,17 +508,18 @@ ModelComponent modelComponent(const std::string& model, const std::string& compo
     }
     if (fs::is_regular_file(model, ec)) {
         const CheckpointInfo info = inspectCheckpoint(model);
-        if (info.family != "sd1" && info.family != "sd2")
+        if (info.family != "sd1" && info.family != "sd2" && info.family != "sdxl")
             throw std::runtime_error(what + ": " + model + " is a " + info.family +
-                                     " checkpoint; single files of SD 1.x and 2.x are supported");
+                                     " checkpoint; single files of SD 1.x, 2.x and SDXL are supported");
         const SafeTensors st(model);
         if (component == "unet") c.config = unetConfig(st, info);
         else if (component == "vae") {
             if (!info.hasVae) throw std::runtime_error(what + ": " + model + " has no VAE; pass one with \"vae\"");
             c.config = vaeConfig(st);
-        } else if (component == "text_encoder") {
+            if (info.family == "sdxl") overlay(c.config, makeObject({{"scaling_factor", makeNumber(0.13025)}}));
+        } else if (component == "text_encoder" || component == "text_encoder_2") {
             if (!info.hasTextEncoder) throw std::runtime_error(what + ": " + model + " has no text encoder");
-            c.config = clipConfig(st);
+            c.config = clipConfig(st, component);
         } else {
             throw std::invalid_argument(what + ": unknown component " + component);
         }
@@ -499,7 +533,7 @@ ModelComponent modelComponent(const std::string& model, const std::string& compo
     const std::string config = c.folder + "/config.json";
     if (!std::ifstream(config)) throw std::runtime_error(what + ": no " + config + " (nor a single-file checkpoint at " + model + ")");
     c.config = json::parse(readText(config));
-    const std::string base = component == "text_encoder" || (c.folder == model && fs::exists(model + "/model.safetensors"))
+    const std::string base = component == "text_encoder" || component == "text_encoder_2" || (c.folder == model && fs::exists(model + "/model.safetensors"))
                                  ? "model"
                                  : "diffusion_pytorch_model";
     c.weights = firstExisting({c.folder + "/" + base + ".safetensors", c.folder + "/" + base + ".fp16.safetensors"});
@@ -549,6 +583,27 @@ bool padsWithExclamation(const std::string& model) {
     return p && p->isString() && p->string == "!";
 }
 
+bool isSdxlModel(const std::string& model) {
+    std::error_code ec;
+    if (fs::is_regular_file(model, ec)) return isSingleFileCheckpoint(model) && inspectCheckpoint(model).family == "sdxl";
+    return fs::exists(fs::path(model) / "text_encoder_2" / "config.json", ec);
+}
+
+std::string secondTokenizerDirectory(const std::string& model) {
+    std::error_code ec;
+    if (!fs::is_regular_file(model, ec) && fs::exists(fs::path(model) / "tokenizer_2" / "vocab.json", ec)) return model + "/tokenizer_2";
+    return tokenizerDirectory(model);  // the vocabulary is the same
+}
+
+bool secondPadsWithExclamation(const std::string& model) {
+    std::error_code ec;
+    const fs::path config = fs::path(model) / "tokenizer_2" / "tokenizer_config.json";
+    if (fs::is_regular_file(model, ec) || !fs::exists(config, ec)) return true;
+    const json::Value c = json::parse(readText(config.string()));
+    const json::Value* p = c.find("pad_token");
+    return !p || !p->isString() || p->string == "!";
+}
+
 std::string schedulerConfig(const std::string& model) {
     std::error_code ec;
     if (fs::is_regular_file(model, ec)) {
@@ -560,6 +615,11 @@ std::string schedulerConfig(const std::string& model) {
                                         {"beta_schedule", makeString("scaled_linear")},
                                         {"timestep_spacing", makeString("leading")},
                                         {"steps_offset", makeNumber(1)}});
+        // Few-step distilled models (SD-Turbo, SDXL-Turbo, Lightning) need the last timestep first: "trailing".
+        std::string lower = fs::path(model).filename().string();
+        for (char& ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (lower.find("turbo") != std::string::npos || lower.find("lightning") != std::string::npos)
+            overlay(sched, makeObject({{"timestep_spacing", makeString("trailing")}}));
         const json::Value extra = sidecar(model);
         if (const json::Value* o = extra.find("scheduler")) overlay(sched, *o);
         const std::string text = json::dump(sched);

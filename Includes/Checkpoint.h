@@ -59,9 +59,14 @@ std::vector<SafeTensors::Rename> checkpointRenames(const SafeTensors& file, cons
 std::string tokenizerDirectory(const std::string& model);
 // True when prompts are padded with "!" (id 0, SD 2.x / Turbo) instead of <|endoftext|> (SD 1.x).
 bool padsWithExclamation(const std::string& model);
+// SDXL (two text encoders, added size conditions): a folder with text_encoder_2/, or an SDXL file.
+bool isSdxlModel(const std::string& model);
+// SDXL's second tokenizer (tokenizer_2/, else the first) and whether it pads with "!" (it does in SDXL).
+std::string secondTokenizerDirectory(const std::string& model);
+bool secondPadsWithExclamation(const std::string& model);
 // The scheduler config file of a model: scheduler/scheduler_config.json of a folder ("" if missing), or
-// for a single file the SD 1.x / 2.x release schedule (scaled_linear, "leading", offset 1) with the
-// sidecar's "scheduler" on top.
+// for a single file the SD 1.x / 2.x / XL release schedule (scaled_linear, "leading", offset 1;
+// "trailing" when the file name says turbo or lightning) with the sidecar's "scheduler" on top.
 std::string schedulerConfig(const std::string& model);
 
 } // namespace nc

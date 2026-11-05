@@ -323,8 +323,37 @@ Matrix ClipTextEncoder::encode(const std::vector<int>& ids) {
     return net.predict(x);
 }
 
+ClipTextEncoder::Penultimate ClipTextEncoder::encodePenultimate(const std::vector<int>& ids) {
+    NC_PROFILE("text encoder");
+    if (ids.size() != length)
+        throw std::invalid_argument("ClipTextEncoder::encodePenultimate: expected " + std::to_string(length) + " ids, got " +
+                                    std::to_string(ids.size()));
+    if (layers < 2) throw std::logic_error("ClipTextEncoder::encodePenultimate: needs at least two layers");
+    Matrix x(1, ids.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) x(0, i) = static_cast<float>(ids[i]);
+    // Layers: the embedding, two residual blocks per transformer layer, the final norm.
+    Penultimate out;
+    const std::size_t stop = 1 + 2 * (layers - 1);
+    for (std::size_t i = 0; i < net.layerCount(); ++i) {
+        x = net.layer(i).forward(x, false);
+        if (i + 1 == stop) {
+            out.hidden = x;
+            if (projection.empty()) return out;
+        }
+    }
+    const std::size_t eos = static_cast<std::size_t>(std::max_element(ids.begin(), ids.end()) - ids.begin());
+    Matrix row(1, dim);
+    std::copy(x.data() + eos * dim, x.data() + (eos + 1) * dim, row.data());
+    out.pooled = row * projection;
+    return out;
+}
+
 ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8, const std::vector<Lora>& loras) {
-    const ModelComponent component = modelComponent(directory, "text_encoder", "loadClipTextEncoder");  // folder or single file
+    return loadClipTextEncoder(directory, int8, loras, "text_encoder");
+}
+
+ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8, const std::vector<Lora>& loras, const std::string& which) {
+    const ModelComponent component = modelComponent(directory, which, "loadClipTextEncoder");  // folder or single file
     const json::Value& c = component.config;
     const std::string& file = component.weights;
     const std::string act = c.find("hidden_act") ? c.at("hidden_act").string : "quick_gelu";
@@ -343,7 +372,7 @@ ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8, con
     enc.dim = D;
     const float eps = static_cast<float>(c.numberOr("layer_norm_eps", 1e-5));
     SafeTensors st(file);
-    LoraMerger lora(loras, "text_encoder");
+    LoraMerger lora(loras, which);
     auto load = [&](const std::string& name, std::size_t rows, std::size_t cols) {
         Matrix m = st.load(name);
         lora.apply(name, m);
@@ -395,6 +424,11 @@ ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8, con
         auto& lnf = enc.net.add<LayerNorm>(D, eps);
         lnf.gamma() = load(p + "final_layer_norm.weight", 1, D);
         lnf.beta() = load(p + "final_layer_norm.bias", 1, D);
+        if (st.has("text_projection.weight")) {
+            const std::size_t P = static_cast<std::size_t>(c.numberOr("projection_dim", static_cast<double>(D)));
+            const bool inOut = c.find("_projection_in_out") && c.at("_projection_in_out").boolean;
+            enc.projection = inOut ? load("text_projection.weight", D, P) : load("text_projection.weight", P, D).transpose();
+        }
     }
     enc.net.releaseGradients();
     if (int8) enc.net.quantize();

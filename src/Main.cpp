@@ -1075,7 +1075,9 @@ void usage() {
               << "  NeuraCraft interpolate rife.safetensors frames/ out.gif [--passes N] [--fps F] [--loop]   (video: --interpolate rife)\n"
               << "  NeuraCraft depth <depth-anything dir> in.png depth.png [--size 518]   (control images: --depth-model dir)\n"
               << "  NeuraCraft parallax <depth-anything dir> in.png out.gif [--frames 48] [--amplitude 0.03] [--zoom 0.06] [--fps 24]\n"
-              << "  NeuraCraft workflow steps.json                         (image / video steps in JSON, see Workflow.h)\n"
+              << "  NeuraCraft workflow steps.json [--check]               (image / video steps in JSON, see Workflow.h)\n"
+              << "  NeuraCraft ops                                         (the workflow operations and fields, JSON)\n"
+              << "  NeuraCraft models [folder] [--json]                    (models found under data/ or folder)\n"
               << "  video output: .gif (256 colours), .png (animated PNG, full colour) or .mov (QuickTime Motion-JPEG)\n"
               << "        [--strength S] [--steps N] [--start in.png] [--seed S] [--size N] [--frames-dir DIR] [--full-vae]\n"
               << "        [--sharpen A] [--noise N] [--no-color-match]\n"
@@ -1140,9 +1142,13 @@ int main(int argc, char** argv) {
     if (wantGpu && !setDevice(Device::GPU)) {
         std::cerr << "warning: no GPU available in this build/machine, using the CPU\n";
     }
-    std::cout << "device: " << deviceDescription() << (gpuAttentionEnabled() && currentDevice() != Device::GPU ? " + GPU attention" : "") << '\n';
-
     const std::string cmd = args.empty() ? "all" : args[0];
+    // Commands whose output is data (JSON for tools such as the Studio UI) print nothing else.
+    const bool quiet = cmd == "ops" || cmd == "models";
+    if (!quiet)
+        std::cout << "device: " << deviceDescription() << (gpuAttentionEnabled() && currentDevice() != Device::GPU ? " + GPU attention" : "")
+                  << '\n';
+
     // --profile: where the time went, printed however the command ends.
     struct ProfileReport {
         ~ProfileReport() {
@@ -1525,7 +1531,22 @@ int main(int argc, char** argv) {
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() << " s" << std::defaultfloat << '\n';
             return 0;
         }
-        if (cmd == "workflow") {  // file.json
+        if (cmd == "ops") {  // the workflow operations, as JSON (the Studio UI's schema)
+            std::cout << workflowSchemaJson() << '\n';
+            return 0;
+        }
+        if (cmd == "models") {  // [folder]: models found under it (default data)
+            const auto models = findModels(args.size() > 1 ? args[1] : "data");
+            if (args.size() > 2 && args[2] == "--json") {
+                std::cout << modelsJson(models) << '\n';
+                return 0;
+            }
+            for (const ModelInfo& m : models)
+                std::cout << std::left << std::setw(14) << m.kind << std::right << std::setw(8) << std::fixed << std::setprecision(0)
+                          << static_cast<double>(m.bytes) / 1048576.0 << " MB  " << m.path << std::defaultfloat << '\n';
+            return 0;
+        }
+        if (cmd == "workflow") {  // file.json [--check]
             if (args.size() < 2) {
                 usage();
                 return 2;
@@ -1534,6 +1555,13 @@ int main(int argc, char** argv) {
             if (!f) throw std::runtime_error("cannot open " + args[1]);
             std::stringstream text;
             text << f.rdbuf();
+            const bool checkOnly = args.size() > 2 && args[2] == "--check";
+            const std::vector<std::string> problems = checkWorkflow(text.str());
+            if (checkOnly || !problems.empty()) {
+                for (const std::string& p : problems) std::cerr << args[1] << ": " << p << '\n';
+                if (problems.empty()) std::cout << args[1] << ": ok\n";
+                return problems.empty() ? 0 : 1;
+            }
             const auto start = std::chrono::steady_clock::now();
             const auto clips = runWorkflow(text.str(), ".", [](const std::string& line) { std::cerr << "  " << line << '\n'; });
             std::cout << "workflow done (" << clips.size() << " clips) in " << std::fixed << std::setprecision(1)

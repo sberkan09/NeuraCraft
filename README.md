@@ -728,6 +728,14 @@ back into a redrawn one:
 {"op": "blend", "in": ["painted", "photo"], "weight": 0.3, "out": "result"}
 ```
 
+`NeuraCraft workflow steps.json --check` validates a workflow without running
+it: unknown operations and fields come back with a "did you mean", along with
+wrong types, numbers out of range and missing fields (every run checks first).
+`NeuraCraft ops` prints the operations and their fields as JSON (the schema the
+Studio UI builds its forms from), and `NeuraCraft models` lists the models it
+recognises under `data/` (Stable Diffusion, ControlNet, motion modules, LoRA,
+TAESD, IP-Adapter, CLIP vision, Depth Anything, Real-ESRGAN, RIFE).
+
 Models are cached between steps: each one is loaded by the first step that
 needs it and released after the last one, so three `txt2img` steps with the
 same model and size load it once (on the 2-core machine 59 s → 32 s, the

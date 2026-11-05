@@ -202,9 +202,14 @@ void save(const Step& s, const Clip& c) {
 } // namespace
 
 std::map<std::string, Clip> runWorkflow(const std::string& text, const std::string& base, const std::function<void(const std::string&)>& log) {
+    const std::vector<std::string> problems = checkWorkflow(text);
+    if (!problems.empty()) {
+        std::string message = "workflow:";
+        for (const std::string& p : problems) message += "\n  " + p;
+        throw std::invalid_argument(message);
+    }
     const json::Value doc = json::parse(text);
     const json::Value* steps = doc.find("steps");
-    if (!steps || !steps->isArray()) throw std::invalid_argument("workflow: needs a \"steps\" array");
     std::map<std::string, Clip> clips;
 
     // Models stay loaded from the step that first needs them to the last one that does.

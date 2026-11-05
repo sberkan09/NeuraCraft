@@ -33,6 +33,18 @@ struct Value {
 // byte offset on malformed input.
 Value parse(const std::string& text);
 
+// Compact JSON text of a value (numbers that are integers print without a
+// fraction; others with up to 9 significant digits), and of a string literal.
+std::string dump(const Value& value);
+std::string quote(const std::string& text);
+
+// Builders for writing JSON.
+Value makeString(const std::string& s);
+Value makeNumber(double n);
+Value makeBool(bool b);
+Value makeArray(std::vector<Value> items = {});
+Value makeObject(std::vector<std::pair<std::string, Value>> members = {});
+
 } // namespace json
 } // namespace nc
 

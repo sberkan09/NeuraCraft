@@ -15,7 +15,9 @@
 
 #include "Image.h"
 
+#include <cstddef>
 #include <functional>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -44,6 +46,48 @@ using Clip = std::vector<Image>;
 // Returns the named clips after the last step.
 std::map<std::string, Clip> runWorkflow(const std::string& json, const std::string& baseDirectory = ".",
                                         const std::function<void(const std::string&)>& log = {});
+
+// ---- Schema: what each operation takes (drives validation, docs and the Studio UI) ----
+
+struct WorkflowField {
+    std::string name;
+    // int, float, bool, string, text (a prompt), enum (see options), clip (a clip name), clips (names),
+    // model (see model), loras ("file" / "file:scale" list), file, dir, strings, ints, keyframes ([[frame, "prompt"]])
+    std::string type;
+    std::string defaultJson;            // JSON text of the default, "" = none
+    std::string doc;
+    std::string model;                  // for model fields: sd, controlnet, motion, lora, taesd, ip-adapter,
+                                        // image-encoder, depth, esrgan, rife
+    std::vector<std::string> options;   // for enum fields
+    double min = std::numeric_limits<double>::quiet_NaN(), max = std::numeric_limits<double>::quiet_NaN();
+    bool required = false;
+};
+
+struct WorkflowOp {
+    std::string name, title, group, doc;  // group: input, edit, image, video, analysis, enhance
+    bool output = true;                   // makes a clip (named by "out")
+    std::vector<WorkflowField> fields;
+};
+
+const std::vector<WorkflowOp>& workflowOps();
+const WorkflowOp* findWorkflowOp(const std::string& name);  // nullptr if unknown
+// {"version": 1, "ops": [{name, title, group, doc, output, fields: [{name, type, doc, required, default?,
+// model?, options?, min?, max?}]}]}
+std::string workflowSchemaJson();
+
+// Problems with a workflow before running it: unknown ops or fields (with a "did you mean"), wrong
+// types, numbers out of range, missing required fields. Empty when it looks runnable. Besides its
+// fields a step may carry "op", "ui" (editor data such as a node position), "label", "comment" and
+// keys starting with "_"; they are ignored.
+std::vector<std::string> checkWorkflow(const std::string& json);
+
+// Models under a folder, recognised by their config files or tensor names.
+struct ModelInfo {
+    std::string path, kind, name;  // kind: as WorkflowField::model, plus sd-inpaint
+    std::size_t bytes = 0;
+};
+std::vector<ModelInfo> findModels(const std::string& root, std::size_t maxDepth = 4);
+std::string modelsJson(const std::vector<ModelInfo>& models);  // [{path, kind, name, bytes}]
 
 } // namespace nc
 

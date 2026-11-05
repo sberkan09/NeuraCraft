@@ -3842,6 +3842,49 @@ TEST(model_cache_loads_once_and_releases) {
     CHECK(modelTag("data/sd/../sd/") == "data/sd" && modelTag("data/sd", 512, 768) == "data/sd@512x768");
 }
 
+TEST(workflow_schema_checks_and_lists_models) {
+    // The schema is valid JSON with every op, and each op's field names are unique.
+    const json::Value schema = json::parse(workflowSchemaJson());
+    CHECK(schema.at("ops").array.size() == workflowOps().size());
+    for (const WorkflowOp& op : workflowOps()) {
+        std::set<std::string> names;
+        for (const WorkflowField& f : op.fields) CHECK(names.insert(f.name).second);
+        // Every op is one runWorkflow knows: only its missing fields are reported.
+        for (const std::string& p : checkWorkflow("{\"steps\": [{\"op\": \"" + op.name + "\"}]}"))
+            CHECK(p.find("unknown op") == std::string::npos && p.find("needs") != std::string::npos);
+    }
+    CHECK(checkWorkflow(R"({"steps": [{"op": "upscale", "model": "m", "in": "a", "ui": {"x": 10}, "label": "x", "_note": 1}]})").empty());
+    const auto bad = checkWorkflow(R"({"steps": [{"op": "txt2imgg"}, {"op": "txt2img", "model": "m", "promt": "a", "steps": 0, "sampler": "ddim", "int8": 1}]})");
+    CHECK(bad.size() == 6);
+    CHECK(bad[0].find("did you mean \"txt2img\"") != std::string::npos);
+    CHECK(bad[1].find("did you mean \"prompt\"") != std::string::npos);
+    CHECK(checkWorkflow("{nope").size() == 1 && checkWorkflow("{}").size() == 1);
+    CHECK_THROWS(runWorkflow(R"({"steps": [{"op": "upscale", "modle": "m", "in": "a"}]})"), std::invalid_argument);
+
+    // JSON writer round trip.
+    const json::Value v = json::parse(R"({"a": [1, 2.5, "x\"y\n", true, null], "b": {"c": -3}})");
+    CHECK(json::dump(v) == R"({"a":[1,2.5,"x\"y\n",true,null],"b":{"c":-3}})");
+    CHECK(json::dump(json::parse(json::dump(v))) == json::dump(v));
+
+    // Model discovery.
+    const std::string dir = (std::filesystem::temp_directory_path() / "nc_models_test").string();
+    std::filesystem::remove_all(dir);
+    std::string tok;
+    std::filesystem::create_directories(dir);
+    std::filesystem::rename(writeTinyStableDiffusion("sd_for_models", tok), dir + "/sd");
+    std::filesystem::create_directories(dir + "/loras");
+    std::map<std::string, Matrix> lora{{"lora_unet_down_blocks_0_attentions_0_proj_in.lora_down.weight", Matrix(2, 4)}};
+    saveAll(dir + "/loras/style.safetensors", lora);
+    std::map<std::string, Matrix> junk{{"something.weight", Matrix(2, 2)}};
+    saveAll(dir + "/loras/other.safetensors", junk);
+    const auto models = findModels(dir);
+    std::map<std::string, std::string> kinds;
+    for (const ModelInfo& m : models) kinds[std::filesystem::path(m.path).filename().string()] = m.kind;
+    CHECK(kinds["sd"] == "sd" && kinds["style.safetensors"] == "lora" && kinds.count("other.safetensors") == 0);
+    CHECK(json::parse(modelsJson(models)).array.size() == models.size());
+    std::filesystem::remove_all(dir);
+}
+
 TEST(json_workflows) {
     std::string tok;
     const std::string dir = writeTinyStableDiffusion("sd_workflow", tok);

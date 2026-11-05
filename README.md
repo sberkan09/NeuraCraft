@@ -518,8 +518,10 @@ cannot tell goes in a `<file>.json` next to it, for example
 `{"scheduler": {"timestep_spacing": "trailing"}}` for a Turbo model;
 `"unet"`, `"vae"`, `"text_encoder"` and `"tokenizer"` keys work the same way.
 A separate VAE (`"vae"` in a step, `TextToImageOptions::vae`) can be a
-diffusers VAE folder or a VAE `.safetensors` of its own. SDXL checkpoints are
-recognised and refused for now. `Checkpoint.h` has the details.
+diffusers VAE folder or a VAE `.safetensors` of its own. ControlNets in the
+original layout (`control_v11p_sd15_canny.safetensors` and the like:
+`control_model.*`, `input_hint_block`, `zero_convs`) load the same way. SDXL
+checkpoints are recognised and refused for now. `Checkpoint.h` has the details.
 
 ### LoRA and the LCM sampler
 

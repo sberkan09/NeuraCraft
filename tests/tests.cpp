@@ -3614,6 +3614,36 @@ TEST(controlnet_and_canny_edges) {
     for (std::size_t k = 0; k < r.mid.size(); ++k) CHECK_NEAR(r.mid.data()[k], 0.7f * r1.mid.data()[k], 1e-5);
     CHECK(unet.forward(latent, 10.0f, ctx, &r).values() != plain.values());
 
+    // The same ControlNet as one file in the original layout (control_model.*, input_hint_block, zero_convs).
+    {
+        std::map<std::string, Matrix> ldm;
+        for (const auto& [n, m] : loadAllTensors(dir + "/cn/diffusion_pytorch_model.safetensors")) {
+            std::string to;
+            std::size_t k;
+            std::string rest;
+            if (n.rfind("controlnet_cond_embedding.conv_in.", 0) == 0) to = "input_hint_block.0." + n.substr(34);
+            else if (n.rfind("controlnet_cond_embedding.conv_out.", 0) == 0) to = "input_hint_block.14." + n.substr(35);
+            else if (splitIndex(n, "controlnet_cond_embedding.blocks.", k, rest)) to = "input_hint_block." + std::to_string(2 * k + 2) + "." + rest;
+            else if (splitIndex(n, "controlnet_down_blocks.", k, rest)) to = "zero_convs." + std::to_string(k) + ".0." + rest;
+            else if (n.rfind("controlnet_mid_block.", 0) == 0) to = "middle_block_out.0." + n.substr(21);
+            else to = ldmUnetName(n, 1, {false, true}).substr(22);  // drop "model.diffusion_model."
+            ldm["control_model." + to] = m;
+        }
+        std::filesystem::create_directories(dir + "/controlnets");
+        const std::string file = dir + "/controlnets/cn_single.safetensors";
+        saveAll(file, ldm);
+        std::ofstream(dir + "/controlnets/cn_single.json") << R"({"family": "sd1", "unet": {"attention_head_dim": [2, 2], "norm_num_groups": 4}})";
+        CHECK(inspectCheckpoint(file).controlNet && !isSingleFileCheckpoint(file));
+        UNet2DCondition one = loadUNet(file, 8, 8);
+        CHECK(one.isControlNet());
+        const ControlResiduals a = cn.control(latent, 10.0f, ctx, cn.controlEmbedding(image)), b = one.control(latent, 10.0f, ctx, one.controlEmbedding(image));
+        CHECK(a.mid.values() == b.mid.values() && a.down.size() == b.down.size() && a.down.back().values() == b.down.back().values());
+        bool listed = false;
+        for (const ModelInfo& m : findModels(dir))
+            if (m.path == file) listed = m.kind == "controlnet";
+        CHECK(listed);
+    }
+
     // Pipelines: scale 0 equals no ControlNet; a control image steers the picture.
     TextToImageOptions o;
     o.width = o.height = 64;

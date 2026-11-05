@@ -14,7 +14,7 @@
 // the tensor sizes. So any SD 1.x / 2.x fine-tune (and its inpainting variant) loads without a
 // conversion step. The tokenizer (not part of the file) comes from a folder next to it. What a
 // file cannot tell can be set in "<file>.json" next to it: {"unet": {...}, "vae": {...},
-// "text_encoder": {...}, "scheduler": {...}, "tokenizer": {"pad_token": "!"}}, each replacing the
+// "text_encoder": {...}, "scheduler": {...}, "tokenizer": {"pad_token": "!"}, "family": "sd1"}, each replacing the
 // derived settings it names (e.g. "scheduler": {"timestep_spacing": "trailing"} for a Turbo model).
 
 #include "Json.h"
@@ -31,9 +31,11 @@ struct CheckpointInfo {
     std::size_t inChannels = 4;  // 9 for inpainting models
     std::size_t contextDim = 0;  // text hidden size the UNet attends to (768 / 1024)
     bool hasVae = false, hasTextEncoder = false;
+    bool controlNet = false;     // a ControlNet file (control_model.*): its "unet" component is the ControlNet
 };
 
-// True for a .safetensors file in the single-file layout (reads only the header).
+// True for a .safetensors file in the single-file layout (reads only the header). ControlNets in the
+// original layout (control_model.*, input_hint_block, zero_convs) load the same way as "unet".
 bool isSingleFileCheckpoint(const std::string& path);
 // What kind of model it is, from tensor names and shapes; throws if it is not one.
 CheckpointInfo inspectCheckpoint(const std::string& path);

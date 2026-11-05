@@ -475,7 +475,9 @@ scene, so a 16-frame clip shows a blend of both prompts; over a longer clip
 (32 frames above: three overlapping windows, 384 x 384, 29 minutes on the
 2-core machine) the change from spring to winter comes through.
 
-**LoRA and LCM.** `--lora file.safetensors[:scale]` merges LoRA adapters
+### LoRA and the LCM sampler
+
+`--lora file.safetensors[:scale]` merges LoRA adapters
 (kohya / A1111 `lora_unet_*` / `lora_te_*` and diffusers / PEFT `lora_A` /
 `lora_B` files, linear and convolution layers) into the UNet and text encoder
 while they load, before int8 quantization, for every image and video command
@@ -584,7 +586,9 @@ edges as ControlNet input (right): the motion and outline follow the
 source, the light and colours follow the prompt (16 frames at 384 x 384,
 3 steps with ControlNet on every frame: 17 minutes on the 2-core machine).
 
-**Output formats**, all written by the library itself: `.gif` (`saveGif`,
+### Output formats
+
+All written by the library itself: `.gif` (`saveGif`,
 256 colours, plays everywhere), `.png` (`saveApng`, animated PNG, full
 colour and lossless, plays in browsers), `.mov` (`saveMjpegMov`, a QuickTime
 movie of JPEG frames that QuickTime, Finder previews, VLC and ffmpeg play),
@@ -689,7 +693,9 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Losses | `Loss.h` | `MSE`, `BinaryCrossEntropy`, `CategoricalCrossEntropy`, `SoftmaxCrossEntropy` (fused, on logits), `SparseSoftmaxCrossEntropy` (integer targets) |
 | Transformer | `Transformer.h` | `TokenEmbedding` (optional learned positions), `LayerNorm`, `RMSNorm`, `GELU`, `SwiGLUGate`, multi-head `CausalSelfAttention` (optional RoPE with Llama 3 scaling, grouped-query attention, KV cache, sliding window), `Residual` blocks, `TiedOutput`, `buildGPT()` with `GPTConfig::modern()` |
 | Quantization | `Quantized.h` | `QuantizedWeights` (int8, per-group scales; integer AVX-VNNI / AVX2 / NEON products, expanded-tile GEMM for many rows), `Network::quantize()` for Dense, Conv2D, attention and embeddings (shared with tied outputs), `setInt8Inputs` |
-| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG (read / write) and PPM files, `resizeImage` / `fitImage`, `loadVae()`, `loadTinyVae()` (TAESD), `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` / `textToLatent()` / `decodeLatent()` / `imageToImage()`, `StableDiffusion` (models kept in memory), `morphAnimation()`, `zoomAnimation()`, `transformImage()`, `saveGif()` (animated GIF) |
+| Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG (read / write) and PPM files, `resizeImage` / `fitImage`, `loadVae()`, `loadTinyVae()` (TAESD), `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` / `textToLatent()` / `decodeLatent()` / `imageToImage()`, `StableDiffusion` (models kept in memory; `inpaint()`), `morphAnimation()`, `zoomAnimation()`, `outpaintZoom()`, `textToVideo()` (AnimateDiff motion modules: `loadMotionModules()`, `forwardFrames()`, windows, prompt travel, image / video to video), ControlNet (`controlEmbedding()`, `control()`), `cannyEdges()`, `transformImage()`, `EulerScheduler::lcm` |
+| LoRA | `Lora.h` | `LoraMerger`: kohya / A1111 and PEFT LoRA files merged into the UNet and text encoder while they load |
+| Files | `Image.h` | PNG (own inflate and deflate), animated PNG, JPEG (baseline encoder), animated GIF (median-cut palette, LZW), QuickTime Motion-JPEG `.mov`, PPM |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
 | Text | `Text.h` | `Tokenizer` interface, `CharTokenizer`, byte-level `BpeTokenizer` (train / save / load), `makeNextTokenDataset`, `generate()` (temperature, top-k, top-p, repetition penalty, streaming callback, stop tokens), `Generator` (multi-turn, KV cache kept between calls) |
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |

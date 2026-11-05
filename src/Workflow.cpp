@@ -3,14 +3,18 @@
 #include "Diffusion.h"
 #include "Interpolate.h"
 #include "Json.h"
+#include "ModelCache.h"
 #include "Upscale.h"
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -107,6 +111,73 @@ TextToImageOptions imageOptions(const Step& s) {
     return o;
 }
 
+// Cache tags (ModelCache.h) of the models a step loads, so each one is released after its last use.
+std::set<std::string> modelsUsed(const Step& s) {
+    std::set<std::string> out;
+    const std::string& op = s.op;
+    const bool diffusion = op == "txt2img" || op == "img2img" || op == "inpaint" || op == "t2v" || op == "morph" ||
+                           op == "zoom" || op == "outpaint";
+    if (diffusion) {
+        const std::size_t w = s.size("width", 512), h = s.size("height", 512);
+        const std::string model = s.path("model");
+        out.insert(modelTag(model));        // text encoder
+        out.insert(modelTag(model, w, h));  // UNet (with motion modules / IP-Adapter), VAE
+        std::string tiny = s.path("tiny_vae");
+        if (tiny.empty() && std::filesystem::exists(model + "/taesd/config.json")) tiny = model + "/taesd";
+        if (!tiny.empty()) out.insert(modelTag(tiny, w, h));
+        if (s.has("controlnet")) out.insert(modelTag(s.path("controlnet"), w, h));
+        if (s.has("ip_adapter")) {
+            const std::string ip = s.path("ip_adapter");
+            std::string enc = s.path("image_encoder");
+            if (enc.empty()) enc = std::filesystem::path(ip).parent_path().append("image_encoder").string();
+            out.insert(modelTag(ip));
+            out.insert(modelTag(enc));
+        }
+    } else if (op == "depth" || op == "parallax" || op == "upscale" || op == "interpolate") {
+        out.insert(modelTag(s.path("model")));
+    }
+    return out;
+}
+
+// blend: frame by frame, `b` (resized to a's size) over `a`. Clips of different lengths: a one-frame
+// clip is used for every frame, otherwise the shorter one sets the length.
+Clip blendClips(const Clip& a, const Clip& b, const Clip* mask, const std::string& mode, float weight) {
+    if (mode != "mix" && mode != "add" && mode != "multiply" && mode != "difference")
+        throw std::invalid_argument("blend: unknown mode \"" + mode + "\" (mix, add, multiply, difference)");
+    const std::size_t n = a.size() == 1 ? b.size() : b.size() == 1 ? a.size() : std::min(a.size(), b.size());
+    Clip out;
+    for (std::size_t f = 0; f < n; ++f) {
+        const Image base = toRgb(a[a.size() == 1 ? 0 : f]);
+        Image over = toRgb(b[b.size() == 1 ? 0 : f]);
+        if (over.width != base.width || over.height != base.height) over = resizeImage(over, base.width, base.height);
+        Image m;
+        if (mask) {
+            m = toRgb((*mask)[mask->size() == 1 ? 0 : std::min(f, mask->size() - 1)]);
+            if (m.width != base.width || m.height != base.height) m = resizeImage(m, base.width, base.height);
+        }
+        Image r = base;
+        for (std::size_t i = 0; i < base.pixels.size(); ++i) {
+            const float x = base.pixels[i] / 255.0f, y = over.pixels[i] / 255.0f;
+            const float w = weight * (mask ? (m.pixels[i - i % 3] * 0.299f + m.pixels[i - i % 3 + 1] * 0.587f +
+                                              m.pixels[i - i % 3 + 2] * 0.114f) / 255.0f
+                                           : 1.0f);
+            float v;
+            if (mode == "mix") v = x + w * (y - x);
+            else if (mode == "add") v = x + w * y;
+            else if (mode == "multiply") v = x + w * (x * y - x);
+            else v = x + w * (std::fabs(x - y) - x);
+            r.pixels[i] = static_cast<std::uint8_t>(std::lround(255.0f * std::min(1.0f, std::max(0.0f, v))));
+        }
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+template <typename T>
+std::shared_ptr<T> smallModel(const char* kind, const std::string& path) {
+    return cachedModel<T>(std::string(kind) + "|" + modelTag(path), modelTag(path), [&] { return std::make_shared<T>(path); });
+}
+
 void save(const Step& s, const Clip& c) {
     const std::string path = s.path("path");
     if (path.empty()) throw std::invalid_argument("save: needs \"path\"");
@@ -135,6 +206,18 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
     const json::Value* steps = doc.find("steps");
     if (!steps || !steps->isArray()) throw std::invalid_argument("workflow: needs a \"steps\" array");
     std::map<std::string, Clip> clips;
+
+    // Models stay loaded from the step that first needs them to the last one that does.
+    const bool cache = doc.find("cache") ? doc.at("cache").boolean : true;
+    std::unique_ptr<ModelCacheScope> cacheScope;
+    if (cache) cacheScope = std::make_unique<ModelCacheScope>();
+    std::vector<std::set<std::string>> needed;  // needed[i]: models used from step i on
+    for (const json::Value& v : steps->array) {
+        std::map<std::string, Clip> none;
+        needed.push_back(modelsUsed(Step{v, v.at("op").string, base, none}));
+    }
+    for (std::size_t i = needed.size(); i-- > 1;) needed[i - 1].insert(needed[i].begin(), needed[i].end());
+
     std::size_t index = 0;
     for (const json::Value& v : steps->array) {
         ++index;
@@ -165,6 +248,16 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
                 if (it == clips.end()) throw std::invalid_argument("concat: no clip named \"" + name + "\"");
                 out.insert(out.end(), it->second.begin(), it->second.end());
             }
+        } else if (op == "blend") {
+            const std::vector<std::string> names = s.strings("in");
+            if (names.size() != 2) throw std::invalid_argument("blend: \"in\" needs two clips");
+            auto find = [&](const std::string& name) -> const Clip& {
+                auto it = clips.find(name);
+                if (it == clips.end() || it->second.empty()) throw std::invalid_argument("blend: no clip named \"" + name + "\"");
+                return it->second;
+            };
+            out = blendClips(find(names[0]), find(names[1]), s.has("mask") ? &s.clip("mask") : nullptr, s.str("mode", "mix"),
+                             static_cast<float>(s.num("weight", 0.5)));
         } else if (op == "txt2img") {
             out.push_back(textToImage(s.path("model"), s.need("prompt"), imageOptions(s)));
         } else if (op == "img2img") {
@@ -247,7 +340,8 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
             for (const Image& im : s.clip("in"))
                 out.push_back(cannyEdges(im, static_cast<float>(s.num("low", 100)), static_cast<float>(s.num("high", 200))));
         } else if (op == "depth" || op == "parallax") {
-            DepthEstimator de(s.path("model"));
+            const auto depthHold = smallModel<DepthEstimator>("depth", s.path("model"));
+            DepthEstimator& de = *depthHold;
             const std::size_t inputSize = s.size("size", 518);
             if (op == "depth")
                 for (const Image& im : s.clip("in")) out.push_back(de.depthImage(im, inputSize));
@@ -260,13 +354,14 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
                 out = parallaxAnimation(s.image("in"), de.estimate(s.image("in"), inputSize), po);
             }
         } else if (op == "upscale") {
-            const Upscaler up(s.path("model"));
-            for (const Image& im : s.clip("in")) out.push_back(up.upscale(im));
+            const auto up = smallModel<Upscaler>("upscaler", s.path("model"));
+            for (const Image& im : s.clip("in")) out.push_back(up->upscale(im));
         } else if (op == "interpolate") {
-            out = FrameInterpolator(s.path("model")).interpolate(s.clip("in"), s.size("passes", 1), s.flag("loop", false));
+            out = smallModel<FrameInterpolator>("rife", s.path("model"))->interpolate(s.clip("in"), s.size("passes", 1), s.flag("loop", false));
         } else {
             throw std::invalid_argument("workflow: unknown op \"" + op + "\" in step " + std::to_string(index));
         }
+        if (cache) releaseModelsExcept(index < needed.size() ? needed[index] : std::set<std::string>{});
         const std::string outName = s.str("out");
         if (!out.empty()) clips[outName.empty() ? op : outName] = std::move(out);
         if (log) {

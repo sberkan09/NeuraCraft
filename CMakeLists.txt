@@ -36,6 +36,7 @@ add_library(neuracraft_lib STATIC
     src/Lora.cpp
     src/Loss.cpp
     src/Matrix.cpp
+    src/ModelCache.cpp
     src/Network.cpp
     src/Optimizer.cpp
     src/Parallel.cpp

@@ -34,7 +34,12 @@ using Clip = std::vector<Image>;
 //   context, overlap} - morph {model, prompts, seeds, frames, steps} - zoom {model, prompts, frames, zoom, strength,
 //   steps, seed, in} - outpaint {model, prompts, keyframes, shrink, frames, steps, seed, in, sampler, lora, guidance}
 //   - canny {in, low, high} - depth {model, in, size} - parallax {model, in, frames, amplitude, zoom}
-//   - upscale {model, in} - interpolate {model, in, passes, loop} - concat {in: [clips]}.
+//   - upscale {model, in} - interpolate {model, in, passes, loop} - concat {in: [clips]}
+//   - blend {in: [a, b], mode: mix | add | multiply | difference, weight (0.5), mask (clip)}: b over a frame by
+//   frame (b resized to a; a one-frame clip is used for every frame), e.g. a skip connection from an earlier step.
+// Any step can read any clip made before it, so a workflow is a graph run in the listed order.
+// Models are cached between steps ("cache": false at the top level turns it off): each one is loaded by the
+// first step that needs it and released after the last one (ModelCache.h).
 // Relative paths are taken from `baseDirectory`. `log` receives one line per step.
 // Returns the named clips after the last step.
 std::map<std::string, Clip> runWorkflow(const std::string& json, const std::string& baseDirectory = ".",

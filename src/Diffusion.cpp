@@ -6,6 +6,7 @@
 #include "Json.h"
 #include "SafeTensors.h"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <memory>

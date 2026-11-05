@@ -102,6 +102,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 const post = <T,>(path: string, body: unknown) =>
   request<T>(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
+export interface CacheInfo {
+  enabled: boolean;
+  entries: number;
+  bytes: number;
+  hits: number;
+}
+
 export const api = {
   info: () => request<EngineInfo>("/api/info"),
   schema: () => request<Schema>("/api/ops"),
@@ -110,6 +117,9 @@ export const api = {
   check: (wf: Workflow) => post<{ problems: string[] }>("/api/check", wf),
   run: (wf: Workflow) => post<{ job: number }>("/api/run", wf),
   cancel: (id: number) => post<unknown>(`/api/jobs/${id}/cancel`, {}),
+  // Step results the engine keeps for reuse.
+  cache: () => request<CacheInfo>("/api/cache"),
+  clearCache: () => post<CacheInfo>("/api/cache/clear", {}),
   // A picture the user picked, as PNG, saved by the engine; returns its path for workflows.
   upload: (name: string, pngBase64: string) => post<{ path: string }>("/api/upload", { name, data: pngBase64 }),
 };

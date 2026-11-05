@@ -751,10 +751,15 @@ $ ./bin/NeuraCraft studio
   "Advanced" section shows every field of every step. Results show a live
   preview and progress while running, then thumbnails and a frame player;
   outputs are saved under `outputs/<date>-<task>/`.
-- **Graph mode**: any workflow, step by step, with an operation palette and an
-  inspector for each step's fields, both built from the engine's schema; a JSON
-  view; live checking; run and stop. "Grafikte aç" carries a task's workflow
-  over.
+- **Graph mode**: any workflow as a node canvas — steps are nodes, clips are
+  edges; drag an output onto an input to connect (cycles are refused), Delete
+  removes nodes or edges, and each node shows the status and a thumbnail of its
+  latest run. An operation palette and an inspector for each step's fields are
+  built from the engine's schema; list and JSON views; live checking; run and
+  stop, or "Bu adıma kadar çalıştır" to run only a step and what it reads.
+  Video steps get a prompt-travel timeline (keyframes on a frame ruler, the
+  sampling windows under it, the frames of the last run along it). "Grafikte
+  aç" carries a task's workflow over.
 - `npm run dev` serves the UI with hot reload on :5173 and forwards `/api` to a
   running `NeuraCraft serve`.
 
@@ -765,7 +770,10 @@ progress with a fraction, a live half-size TAESD preview after every denoising
 step, each step's output (frames served as JPEG) — and can cancel a job between
 steps. It listens on 127.0.0.1:8188, answers browsers only from
 `http://localhost` origins and takes changes only as `application/json`, so
-other web pages cannot drive it. The endpoints are listed in `Server.h`:
+other web pages cannot drive it. It keeps step results between jobs
+(`WorkflowResultCache`, 1 GB by default, `--cache-mb`): a step whose fields,
+input clips and named files are unchanged is reused, so after editing a late
+step only it and what follows run again. The endpoints are listed in `Server.h`:
 
 ```
 $ ./bin/NeuraCraft serve --data data

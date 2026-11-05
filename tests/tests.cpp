@@ -3952,6 +3952,11 @@ TEST(studio_server_api) {
     CHECK(json::parse(http(port, "GET", "/api/ops").body).at("ops").array.size() == workflowOps().size());
     CHECK(json::parse(http(port, "GET", "/api/models").body).isArray());
     CHECK(http(port, "GET", "/api/nothing").status == 404);
+    {
+        const json::Value cache = json::parse(http(port, "GET", "/api/cache").body);
+        CHECK(cache.at("enabled").boolean && cache.at("entries").number == 0);
+        CHECK(http(port, "POST", "/api/cache/clear", "{}").status == 200 && http(port, "POST", "/api/cache/nope", "{}").status == 404);
+    }
     const json::Value check = json::parse(http(port, "POST", "/api/check", R"({"steps": [{"op": "fly"}]})").body);
     CHECK(check.at("problems").array.size() == 1);
 
@@ -4129,6 +4134,55 @@ TEST(json_workflows) {
         stop.cancelled = [&] { return seen >= 1; };
         CHECK_THROWS(runWorkflow(two, work, stop), WorkflowCancelled);
         CHECK(seen == 1 && modelCacheEntries() == 0 && !modelCaching());
+    }
+    // Result cache: an unchanged step (and what it reads) is reused; a changed field, a changed input
+    // file or a changed upstream step re-runs it and what follows.
+    {
+        WorkflowResultCache results;
+        const std::string wf = R"({"steps": [
+            {"op": "load", "path": "in/a.png", "out": "pic"},
+            {"op": "crop", "in": "pic", "width": 64, "height": 64, "out": "square", "ui": {"x": 1}},
+            {"op": "txt2img", "model": ")" + dir + R"(", "prompt": "hello", "width": 64, "height": 64, "steps": 2, "out": "gen"},
+            {"op": "canny", "in": "square", "low": LOW, "out": "edges"},
+            {"op": "save", "in": "edges", "path": "edges.png"}]})";
+        auto withLow = [&](const std::string& low) {
+            std::string t = wf;
+            t.replace(t.find("LOW"), 3, low);
+            return t;
+        };
+        auto run = [&](const std::string& t, std::vector<std::string>& stages) {
+            WorkflowEvents ev;
+            ev.progress = [&](std::size_t, std::size_t, const std::string& op, const std::string& stage, double) {
+                if (stage == "start" || stage == "cached") stages.push_back(op + ":" + stage);
+            };
+            return runWorkflow(t, work, ev, &results);
+        };
+        std::vector<std::string> first, second, third, fourth;
+        const auto c1 = run(withLow("100"), first);
+        CHECK((first == std::vector<std::string>{"load:start", "crop:start", "txt2img:start", "canny:start", "save:start"}));
+        CHECK(results.size() == 4 && results.bytes() > 0);
+        // Same workflow with only editor data and a clip name changed: everything but save is reused.
+        std::string renamed = withLow("100");
+        renamed.replace(renamed.find("{\"x\": 1}"), 8, "{\"x\": 2}");
+        for (std::size_t at; (at = renamed.find("\"square\"")) != std::string::npos;) renamed.replace(at, 8, "\"sq\"");
+        const auto c2 = run(renamed, second);
+        CHECK((second == std::vector<std::string>{"load:cached", "crop:cached", "txt2img:cached", "canny:cached", "save:start"}));
+        CHECK(c2.at("gen").front().pixels == c1.at("gen").front().pixels && c2.at("edges").front().pixels == c1.at("edges").front().pixels);
+        CHECK(c2.count("sq") && !c2.count("square"));
+        // A changed threshold re-runs canny only.
+        run(withLow("60"), third);
+        CHECK((third == std::vector<std::string>{"load:cached", "crop:cached", "txt2img:cached", "canny:start", "save:start"}));
+        // A changed input file re-runs load and the steps that read it, not txt2img.
+        std::filesystem::last_write_time(work + "/in/a.png", std::filesystem::last_write_time(work + "/in/a.png") + std::chrono::seconds(5));
+        run(withLow("60"), fourth);
+        CHECK((fourth == std::vector<std::string>{"load:start", "crop:start", "txt2img:cached", "canny:start", "save:start"}));
+        CHECK(results.hits() == 4 + 3 + 1 && modelCacheEntries() == 0);
+        // A tiny limit keeps nothing too big; clear empties it.
+        WorkflowResultCache tiny(16);
+        tiny.put("k", c1.at("gen"));
+        CHECK(tiny.size() == 0);
+        results.clear();
+        CHECK(results.size() == 0 && results.bytes() == 0);
     }
     // blend: a skip connection from an earlier step's clip, with a mask and a broadcast single frame.
     const auto mixed = runWorkflow(R"({"steps": [

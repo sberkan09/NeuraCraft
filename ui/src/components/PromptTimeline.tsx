@@ -1,7 +1,6 @@
 import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { frameUrl, type Step, type WorkflowOp } from "../api";
-import type { LiveJob } from "../engine";
-import { stepId } from "../graph";
+import type { NodeRun } from "../graph";
 
 // Prompt travel editor for a video step: the main prompt sits at frame 0, keyframes ([frame, prompt])
 // after it. The engine interpolates the text condition linearly between neighbouring keyframes and
@@ -32,11 +31,11 @@ function windowStarts(frames: number, context: number, overlap: number): number[
 export function PromptTimeline(props: {
   step: Step;
   op: WorkflowOp;
-  job?: LiveJob;
+  run?: NodeRun; // latest run of this step
   onChange(field: string, value: unknown): void;
   onBack(): void;
 }) {
-  const { step, op, job } = props;
+  const { step, op, run } = props;
   const frames = Math.max(2, Number(step.frames ?? numberDefault(op, "frames", 16)));
   const context = Number(step.context ?? numberDefault(op, "context", 16));
   const overlap = Number(step.overlap ?? numberDefault(op, "overlap", 4));
@@ -98,11 +97,10 @@ export function PromptTimeline(props: {
   const starts = windowStarts(frames, context, overlap);
 
   // Frames of the latest run of this step, if any.
-  let strip: { clip: string; count: number } | undefined;
-  if (job?.workflow) {
-    const i = job.workflow.steps.findIndex((s) => stepId(s) && stepId(s) === stepId(step));
-    const out = job.outputs.find((o) => o.step === i + 1);
-    if (i >= 0 && out?.clip && out.frames) strip = { clip: out.clip, count: out.frames };
+  let strip: { job: number; clip: string; count: number } | undefined;
+  if (run) {
+    const out = run.job.outputs.find((o) => o.step === run.index + 1);
+    if (out?.clip && out.frames && run.job.clipsKept !== false) strip = { job: run.job.id, clip: out.clip, count: out.frames };
   }
   const every = strip ? Math.max(1, Math.ceil(strip.count / 12)) : 1;
 
@@ -167,7 +165,7 @@ export function PromptTimeline(props: {
         {strip ? (
           <div className="tl-strip">
             {Array.from({ length: Math.ceil(strip.count / every) }, (_, k) => k * every).map((f) => (
-              <img key={f} src={frameUrl(job!.id, strip!.clip, f, 128)} alt={`Kare ${f}`} style={{ left: x(Math.min(f, frames - 1)) }} loading="lazy" />
+              <img key={f} src={frameUrl(strip!.job, strip!.clip, f, 128)} alt={`Kare ${f}`} style={{ left: x(Math.min(f, frames - 1)) }} loading="lazy" />
             ))}
           </div>
         ) : (

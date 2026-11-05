@@ -16,8 +16,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { memo, useEffect, useMemo, useState } from "react";
 import { frameUrl, type ModelInfo, type Step, type WorkflowOp } from "../api";
-import type { LiveJob } from "../engine";
-import { clipFields, outName, references, stepId, topoSort, uniqueName, type StepUi } from "../graph";
+import { clipFields, outName, references, stepId, topoSort, uniqueName, type NodeRun, type StepUi } from "../graph";
 import { fieldLabel } from "./FieldInput";
 
 interface StepData extends Record<string, unknown> {
@@ -25,6 +24,7 @@ interface StepData extends Record<string, unknown> {
   op?: WorkflowOp;
   index: number;
   status: "" | "running" | "done" | "failed";
+  cached: boolean;
   stage: string;
   thumb?: string;
   frames?: number;
@@ -40,7 +40,7 @@ const summary = (s: Step): string => {
 };
 
 const StepNode = memo(function StepNode({ data, selected }: NodeProps<Node<StepData>>) {
-  const { step, op, status, stage, thumb, frames, invalid } = data;
+  const { step, op, status, stage, thumb, frames, invalid, cached } = data;
   const inputs = clipFields(op);
   const border = status === "running" ? "var(--run)" : selected ? "var(--accent)" : invalid ? "var(--bad)" : "var(--line2)";
   return (
@@ -59,11 +59,11 @@ const StepNode = memo(function StepNode({ data, selected }: NodeProps<Node<StepD
         <span className="note">{summary(step) || op?.doc}</span>
         {thumb ? (
           <div className="node-thumb">
-            <img src={thumb} alt="" loading="lazy" />
+            <img src={thumb} alt="" loading="lazy" onError={(e) => (e.currentTarget.style.visibility = "hidden")} />
             {frames && frames > 1 ? <span>{frames} kare</span> : null}
           </div>
         ) : null}
-        {status ? <span className={`state ${status}`}>{status === "running" ? stage || "çalışıyor" : status === "done" ? "bitti" : "hata"}</span> : null}
+        {status ? <span className={`state ${status}`}>{status === "running" ? stage || "çalışıyor" : status === "done" ? (cached ? "önbellekten" : "bitti") : "hata"}</span> : null}
       </div>
       {op?.output ? (
         <div className="node-port out">
@@ -81,36 +81,34 @@ export function GraphCanvas(props: {
   steps: Step[];
   ops: Map<string, WorkflowOp>;
   models: ModelInfo[];
-  job?: LiveJob;
+  runs: Map<string, NodeRun>;
   invalidSteps: Set<number>;
   selected: number;
   onSelect(i: number): void;
   onChange(steps: Step[]): void;
   onMessage(text: string): void;
 }) {
-  const { steps, ops, job } = props;
+  const { steps, ops, runs } = props;
 
-  // Status and thumbnails of the latest run, matched to nodes by id (indices change while editing).
+  // Status and thumbnails of each node's latest run (matched by id; indices change while editing).
   const runInfo = useMemo(() => {
-    const info = new Map<string, { status: StepData["status"]; stage: string; thumb?: string; frames?: number }>();
-    if (!job?.workflow) return info;
-    job.workflow.steps.forEach((s, i) => {
-      const id = stepId(s);
-      if (!id) return;
-      const out = job.outputs.find((o) => o.step === i + 1);
+    const info = new Map<string, { status: StepData["status"]; stage: string; thumb?: string; frames?: number; cached: boolean }>();
+    for (const [id, { job, index }] of runs) {
+      const out = job.outputs.find((o) => o.step === index + 1);
       let status: StepData["status"] = "";
       if (out) status = "done";
-      else if (job.state === "running" && job.step === i + 1) status = "running";
-      else if (job.state === "failed" && job.step === i + 1) status = "failed";
+      else if (job.state === "running" && job.step === index + 1) status = "running";
+      else if (job.state === "failed" && job.step === index + 1) status = "failed";
       info.set(id, {
         status,
-        stage: job.step === i + 1 ? job.stage : "",
-        thumb: out?.clip && out.frames ? frameUrl(job.id, out.clip, 0, 192) : undefined,
+        stage: job.step === index + 1 ? job.stage : "",
+        thumb: out?.clip && out.frames && job.clipsKept !== false ? frameUrl(job.id, out.clip, 0, 192) : undefined,
         frames: out?.frames,
+        cached: !!out && out.seconds === 0 && out.op !== "save",
       });
-    });
+    }
     return info;
-  }, [job]);
+  }, [runs]);
 
   const derived = useMemo<Node<StepData>[]>(
     () =>
@@ -122,7 +120,7 @@ export function GraphCanvas(props: {
           type: "step",
           position: { x: ui.x, y: ui.y },
           selected: i === props.selected,
-          data: { step: s, op: ops.get(s.op), index: i, status: r?.status ?? "", stage: r?.stage ?? "", thumb: r?.thumb, frames: r?.frames, invalid: props.invalidSteps.has(i) },
+          data: { step: s, op: ops.get(s.op), index: i, status: r?.status ?? "", cached: r?.cached ?? false, stage: r?.stage ?? "", thumb: r?.thumb, frames: r?.frames, invalid: props.invalidSteps.has(i) },
         };
       }),
     [steps, ops, runInfo, props.selected, props.invalidSteps],

@@ -78,7 +78,7 @@ export function useEngine(): Engine {
               const old = next.get(e.data.job);
               if (!old) return prev;
               const outputs = [...old.outputs.filter((o) => o.step !== e.data.step), { ...e.data, width: 0, height: 0 }];
-              next.set(e.data.job, { ...old, outputs });
+              next.set(e.data.job, { ...old, outputs, clipsKept: true });
               return next;
             });
             break;
@@ -104,10 +104,16 @@ export function useEngine(): Engine {
     async (wf: Workflow, title: string) => {
       const { job } = await api.run(wf);
       meta.current.set(job, { workflow: wf, title });
-      merge(job, { state: "queued" });
+      // Events may have arrived before this response (a fully cached job finishes at once): keep their state.
+      setJobs((prev) => {
+        const next = new Map(prev);
+        const old = next.get(job);
+        next.set(job, { ...(old ?? ({ id: job, log: [], outputs: [], state: "queued" } as unknown as LiveJob)), workflow: wf, title, id: job });
+        return next;
+      });
       return job;
     },
-    [merge],
+    [],
   );
 
   const cancel = useCallback(async (id: number) => {

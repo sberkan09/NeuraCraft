@@ -254,7 +254,140 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
     return runWorkflow(text, base, events);
 }
 
+std::shared_ptr<const Clip> WorkflowResultCache::find(const std::string& key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = entries_.begin(); it != entries_.end(); ++it)
+        if (it->key == key) {
+            entries_.splice(entries_.begin(), entries_, it);
+            ++hits_;
+            return it->clip;
+        }
+    return nullptr;
+}
+
+void WorkflowResultCache::put(const std::string& key, const Clip& clip) {
+    std::size_t bytes = 0;
+    for (const Image& im : clip) bytes += im.pixels.size();
+    if (bytes > maxBytes_) return;
+    auto copy = std::make_shared<const Clip>(clip);
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = entries_.begin(); it != entries_.end(); ++it)
+        if (it->key == key) {
+            bytes_ -= it->bytes;
+            entries_.erase(it);
+            break;
+        }
+    entries_.push_front({key, std::move(copy), bytes});
+    bytes_ += bytes;
+    while (bytes_ > maxBytes_ && !entries_.empty()) {
+        bytes_ -= entries_.back().bytes;
+        entries_.pop_back();
+    }
+}
+
+void WorkflowResultCache::clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    entries_.clear();
+    bytes_ = 0;
+}
+
+std::size_t WorkflowResultCache::bytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return bytes_;
+}
+std::size_t WorkflowResultCache::size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return entries_.size();
+}
+std::size_t WorkflowResultCache::hits() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return hits_;
+}
+
+namespace {
+std::string fnv64(const std::string& s) {
+    std::uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ull;
+    }
+    char buf[17];
+    std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(h));
+    return buf;
+}
+
+// Size and modification time of a file (or of every file directly in a folder), so edited inputs and
+// replaced models change the key.
+std::string fileStamp(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto stamp = [&](const fs::path& p) {
+        const auto size = fs::file_size(p, ec);
+        if (ec) return std::string("?");
+        const auto t = fs::last_write_time(p, ec).time_since_epoch().count();
+        return std::to_string(size) + "@" + std::to_string(static_cast<long long>(t));
+    };
+    if (fs::is_regular_file(path, ec)) return stamp(path);
+    if (!fs::is_directory(path, ec)) return "-";
+    std::vector<std::string> parts;
+    for (const auto& e : fs::directory_iterator(path, ec))
+        if (e.is_regular_file(ec)) parts.push_back(e.path().filename().string() + "=" + stamp(e.path()));
+    std::sort(parts.begin(), parts.end());
+    std::string out;
+    for (const auto& p : parts) out += p + ";";
+    return fnv64(out);
+}
+
+// Key of a step's result: its fields, the keys of the clips it reads and stamps of the files it names.
+std::string stepKey(const json::Value& v, const std::string& base, const std::map<std::string, std::string>& clipKeys) {
+    const WorkflowOp* op = findWorkflowOp(v.at("op").string);
+    std::string sig = v.at("op").string + "\n" + base + "\n";
+    std::vector<std::pair<std::string, const json::Value*>> fields;
+    for (const auto& [k, x] : v.object)
+        if (k != "op" && k != "out" && k != "ui" && k != "label" && k != "comment" && (k.empty() || k[0] != '_')) fields.emplace_back(k, &x);
+    std::sort(fields.begin(), fields.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& [k, x] : fields) {
+        const WorkflowField* f = nullptr;
+        if (op)
+            for (const WorkflowField& g : op->fields)
+                if (g.name == k) f = &g;
+        // Clips count by what made them, not by name, so renaming a clip keeps the results.
+        sig += k + "=" + (f && (f->type == "clip" || f->type == "clips") ? std::string() : json::dump(*x)) + "\n";
+        if (!f) continue;
+        auto names = [&] {
+            std::vector<std::string> out;
+            if (x->isString()) out.push_back(x->string);
+            else
+                for (const auto& e : x->array)
+                    if (e.isString()) out.push_back(e.string);
+            return out;
+        };
+        if (f->type == "clip" || f->type == "clips") {
+            for (const std::string& n : names()) {
+                auto it = clipKeys.find(n);
+                sig += "  <" + (it == clipKeys.end() ? "?" + n : it->second) + "\n";
+            }
+        } else if (f->type == "file" || f->type == "dir" || f->type == "model" || f->type == "loras") {
+            for (std::string n : names()) {
+                if (f->type == "loras") {
+                    const std::size_t colon = n.rfind(':');
+                    if (colon != std::string::npos && colon > 1) n = n.substr(0, colon);
+                }
+                const std::filesystem::path p(n);
+                sig += "  @" + fileStamp(p.is_absolute() ? n : (std::filesystem::path(base) / p).string()) + "\n";
+            }
+        }
+    }
+    return fnv64(sig) + fnv64(sig + "#");
+}
+} // namespace
+
 std::map<std::string, Clip> runWorkflow(const std::string& text, const std::string& base, const WorkflowEvents& events) {
+    return runWorkflow(text, base, events, nullptr);
+}
+
+std::map<std::string, Clip> runWorkflow(const std::string& text, const std::string& base, const WorkflowEvents& events,
+                                        WorkflowResultCache* results) {
     const auto& log = events.log;
     const std::vector<std::string> problems = checkWorkflow(text);
     if (!problems.empty()) {
@@ -277,10 +410,26 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
     }
     for (std::size_t i = needed.size(); i-- > 1;) needed[i - 1].insert(needed[i].begin(), needed[i].end());
 
+    std::map<std::string, std::string> clipKeys;  // clip name -> key of the step that made it
     std::size_t index = 0;
     for (const json::Value& v : steps->array) {
         ++index;
         StepProgress progress{&events, index, steps->array.size(), v.at("op").string};
+        const std::string& stepOp = v.at("op").string;
+        const std::string key = results ? stepKey(v, base, clipKeys) : std::string();
+        const std::string outField = v.find("out") && v.at("out").isString() ? v.at("out").string : std::string();
+        if (results && stepOp != "save") {
+            if (std::shared_ptr<const Clip> hit = results->find(key); hit && !hit->empty()) {
+                progress.stage("cached");
+                const std::string clipName = outField.empty() ? stepOp : outField;
+                clips[clipName] = *hit;
+                clipKeys[clipName] = key;
+                if (cache) releaseModelsExcept(index < needed.size() ? needed[index] : std::set<std::string>{});
+                if (events.output) events.output(index, stepOp, clipName, clips[clipName], 0.0);
+                if (log) log("step " + std::to_string(index) + " " + stepOp + ": cached");
+                continue;
+            }
+        }
         progress.stage("start");
         Step s{v, v.at("op").string, base, clips, &progress};
         const auto start = std::chrono::steady_clock::now();
@@ -441,7 +590,11 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
         if (cache) releaseModelsExcept(index < needed.size() ? needed[index] : std::set<std::string>{});
         const std::string outName = s.str("out");
         const std::string clipName = out.empty() ? std::string() : (outName.empty() ? op : outName);
-        if (!out.empty()) clips[clipName] = std::move(out);
+        if (!out.empty()) {
+            if (results) results->put(key, out);
+            clipKeys[clipName] = key;
+            clips[clipName] = std::move(out);
+        }
         if (events.output) {
             static const Clip none;
             events.output(index, op, clipName, clipName.empty() ? none : clips[clipName],

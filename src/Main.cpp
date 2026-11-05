@@ -1078,7 +1078,7 @@ void usage() {
               << "  NeuraCraft depth <depth-anything dir> in.png depth.png [--size 518]   (control images: --depth-model dir)\n"
               << "  NeuraCraft parallax <depth-anything dir> in.png out.gif [--frames 48] [--amplitude 0.03] [--zoom 0.06] [--fps 24]\n"
               << "  NeuraCraft workflow steps.json [--check]               (image / video steps in JSON, see Workflow.h)\n"
-              << "  NeuraCraft studio [--port 8188] [--no-open]            (NeuraCraft Studio: engine + web UI in the browser)\n"
+              << "  NeuraCraft studio [--port 8188] [--no-open] [--cache-mb 1024]   (NeuraCraft Studio: engine + web UI in the browser)\n"
               << "  NeuraCraft serve [--port 8188] [--host IP] [--data DIR] [--ui DIR]   (Studio engine: HTTP API, see Server.h)\n"
               << "  NeuraCraft ops                                         (the workflow operations and fields, JSON)\n"
               << "  NeuraCraft models [folder] [--json]                    (models found under data/ or folder)\n"
@@ -1539,7 +1539,7 @@ int main(int argc, char** argv) {
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() << " s" << std::defaultfloat << '\n';
             return 0;
         }
-        if (cmd == "serve" || cmd == "studio") {  // [--port N] [--host IP] [--data DIR] [--ui DIR] [--no-open]
+        if (cmd == "serve" || cmd == "studio") {  // [--port N] [--host IP] [--data DIR] [--ui DIR] [--no-open] [--cache-mb N]
             // studio = serve + the built web UI (ui/dist) + open it in the browser.
             ServerOptions so;
             bool open = cmd == "studio";
@@ -1560,6 +1560,7 @@ int main(int argc, char** argv) {
                 else if (a == "--data") so.dataDir = value();
                 else if (a == "--ui") so.uiDir = value();
                 else if (a == "--no-open") open = false;
+                else if (a == "--cache-mb") so.cacheBytes = static_cast<std::size_t>(std::stod(value()) * 1024 * 1024);
                 else throw std::invalid_argument(cmd + ": unknown option " + a);
             }
             if (cmd == "studio" && so.uiDir.empty())

@@ -310,6 +310,7 @@ struct StudioServer::Impl {
     std::map<int, std::shared_ptr<Job>> jobs;
     std::deque<int> queue;
     int nextId = 1;
+    std::unique_ptr<WorkflowResultCache> results;  // shared by all jobs (has its own lock)
     int nextUpload = 1;
     std::list<int> clients;  // event-stream sockets
     std::mutex sendMutex;    // serializes writes to clients
@@ -438,7 +439,7 @@ struct StudioServer::Impl {
         ev.cancelled = [&] { return job.cancel.load() || !running.load(); };
         std::string state = "done", error;
         try {
-            runWorkflow(job.workflow, opt.baseDir, ev);
+            runWorkflow(job.workflow, opt.baseDir, ev, results.get());
         } catch (const WorkflowCancelled&) {
             state = "cancelled";
         } catch (const std::exception& e) {
@@ -483,6 +484,17 @@ struct StudioServer::Impl {
                                                 {"threads", makeNumber(static_cast<double>(threadCount()))},
                                                 {"dataDir", makeString(opt.dataDir)},
                                                 {"baseDir", makeString(std::filesystem::absolute(opt.baseDir).string())}}));
+            }
+            if (p.size() >= 2 && p[1] == "cache") {
+                if (p.size() == 3 && p[2] == "clear" && post) {
+                    if (results) results->clear();
+                } else if (!(p.size() == 2 && get)) {
+                    return errorResponse(404, "not found");
+                }
+                return jsonResponse(makeObject({{"enabled", makeBool(results != nullptr)},
+                                                {"entries", makeNumber(results ? static_cast<double>(results->size()) : 0)},
+                                                {"bytes", makeNumber(results ? static_cast<double>(results->bytes()) : 0)},
+                                                {"hits", makeNumber(results ? static_cast<double>(results->hits()) : 0)}}));
             }
             if (p.size() == 2 && p[1] == "ops" && get) {
                 Response r;
@@ -754,6 +766,7 @@ struct StudioServer::Impl {
 StudioServer::StudioServer(ServerOptions options, std::function<void(const std::string&)> log) : impl_(std::make_unique<Impl>()) {
     impl_->opt = std::move(options);
     impl_->log = std::move(log);
+    if (impl_->opt.cacheBytes) impl_->results = std::make_unique<WorkflowResultCache>(impl_->opt.cacheBytes);
 }
 
 StudioServer::~StudioServer() { stop(); }

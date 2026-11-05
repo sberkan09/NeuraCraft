@@ -3941,6 +3941,7 @@ TEST(studio_server_api) {
     o.port = 0;
     o.baseDir = work;
     o.dataDir = work;
+    o.keepJobs = 2;
     StudioServer server(o);
     server.start();
     const int port = server.port();
@@ -4043,6 +4044,23 @@ TEST(studio_server_api) {
         CHECK(path.rfind("uploads/", 0) == 0 && path.find(' ') == std::string::npos);
         CHECK(loadImage(work + "/" + path).pixels == a.pixels);
         CHECK(http(port, "POST", "/api/upload", R"({"data": "aGVsbG8="})").status == 400);  // "hello", not a PNG
+    }
+    // The same workflow again comes from the result cache; with keepJobs = 2 the first job gives its frames back.
+    {
+        const int again = static_cast<int>(json::parse(http(port, "POST", "/api/run", wf).body).at("job").number);
+        for (int i = 0; i < 500; ++i) {
+            job = json::parse(http(port, "GET", "/api/jobs/" + std::to_string(again)).body);
+            if (job.at("state").string == "done" || job.at("state").string == "failed") break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECK(job.at("state").string == "done" && job.at("outputs").array.size() == 2);
+        for (const json::Value& out : job.at("outputs").array) CHECK(out.at("seconds").number == 0);
+        CHECK(json::parse(http(port, "GET", "/api/cache").body).at("hits").number == 2);
+        for (int i = 0; i < 100 && json::parse(http(port, "GET", "/api/jobs/" + std::to_string(id)).body).at("clipsKept").boolean; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(!json::parse(http(port, "GET", "/api/jobs/" + std::to_string(id)).body).at("clipsKept").boolean);
+        CHECK(http(port, "GET", "/api/jobs/" + std::to_string(id) + "/clips/small/0.jpg").status == 404);
+        CHECK(http(port, "GET", "/api/jobs/" + std::to_string(again) + "/clips/small/0.jpg").status == 200);
     }
     server.stop();
     CHECK(http(port, "GET", "/api/info").status == 0);  // closed

@@ -97,7 +97,9 @@ export function Results(props: { engine: Engine; onOpenWorkflow?(job: LiveJob): 
                 <span className={`state ${j.state}`}>{stateNames[j.state] ?? j.state}</span>
               </div>
               {j.state === "failed" ? <div className="error-text">{j.error}</div> : null}
-              {outs.length ? (
+              {outs.length && j.clipsKept === false && j.state !== "running" && j.state !== "queued" ? (
+                <div className="note">{outs.length} çıktı · kareler artık bellekte değil (kaydedilen dosyalar duruyor)</div>
+              ) : outs.length ? (
                 <div className="thumbs">
                   {outs.slice(-6).map((o) => (
                     <button key={o.step} type="button" className="thumb" onClick={() => setViewing({ job: j.id, output: o })} aria-label={`${o.clip} çıktısını aç`}>

@@ -454,16 +454,21 @@ struct StudioServer::Impl {
 
     // Older finished jobs give their clips back (their summaries stay).
     void trimJobs() {
-        std::lock_guard<std::mutex> l(mutex);
-        std::size_t kept = 0;
-        for (auto it = jobs.rbegin(); it != jobs.rend(); ++it) {
-            Job& j = *it->second;
-            if (j.state == "queued" || j.state == "running") continue;
-            if (++kept > opt.keepJobs) {
-                j.clips.clear();
-                j.preview = Image();
+        std::vector<json::Value> trimmed;  // told to the clients, so they stop showing those frames
+        {
+            std::lock_guard<std::mutex> l(mutex);
+            std::size_t kept = 0;
+            for (auto it = jobs.rbegin(); it != jobs.rend(); ++it) {
+                Job& j = *it->second;
+                if (j.state == "queued" || j.state == "running") continue;
+                if (++kept > opt.keepJobs && !j.clips.empty()) {
+                    j.clips.clear();
+                    j.preview = Image();
+                    trimmed.push_back(jobJson(j));
+                }
             }
         }
+        for (const json::Value& v : trimmed) broadcast("job", v);
     }
 
     // ---- HTTP ----

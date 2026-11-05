@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import type { CacheInfo, Step, Workflow, WorkflowOp } from "../api";
-import { api } from "../api";
+import { api, frameUrl } from "../api";
 import type { Engine } from "../engine";
-import { freeSpot, latestRuns, stepId, topoSort, upstream, withLayout, type StepUi } from "../graph";
+import { freeSpot, latestRuns, references, stepId, topoSort, uniqueName, upstream, withLayout, type StepUi } from "../graph";
 import { pickModel } from "../templates";
 import { FieldInput, fieldLabel } from "./FieldInput";
 import { GraphCanvas } from "./GraphCanvas";
+import { MaskPainter } from "./MaskPainter";
 import { PromptTimeline } from "./PromptTimeline";
 import { overallFraction } from "./Results";
 
@@ -32,7 +33,7 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
   const { engine, workflow } = props;
   const ops = useMemo(() => new Map((engine.schema?.ops ?? []).map((o) => [o.name, o] as [string, WorkflowOp])), [engine.schema]);
   const [selected, setSelected] = useState(0);
-  const [view, setView] = useState<"graph" | "steps" | "json" | "timeline">("graph");
+  const [view, setView] = useState<"graph" | "steps" | "json" | "timeline" | "mask">("graph");
   const [message, setMessage] = useState<string>();
   const [jsonText, setJsonText] = useState(JSON.stringify(workflow, null, 2));
   const [jsonError, setJsonError] = useState<string>();
@@ -156,9 +157,37 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
   const sel = steps[selected];
   const selOp = sel ? ops.get(sel.op) : undefined;
   const hasTimeline = !!selOp?.fields.some((f) => f.type === "keyframes");
+  const hasMask = !!selOp?.fields.some((f) => f.name === "mask" && f.type === "clip") && !!selOp?.fields.some((f) => f.name === "in");
   useEffect(() => {
-    if (view === "timeline" && !hasTimeline) setView("graph");
-  }, [view, hasTimeline]);
+    if ((view === "timeline" && !hasTimeline) || (view === "mask" && !hasMask)) setView("graph");
+  }, [view, hasTimeline, hasMask]);
+
+  // Mask painting for the selected step: over the picture its "in" reads (from that step's latest run),
+  // saved as a load step that feeds "mask".
+  const maskInfo = useMemo(() => {
+    if (!hasMask) return undefined;
+    const refs = references(steps, ops, selected);
+    const input = refs.find((r) => r.field === "in" && r.slot === 0);
+    const maskRef = refs.find((r) => r.field === "mask");
+    let source: string | undefined;
+    if (input) {
+      const run = runs.get(stepId(steps[input.from]));
+      const out = run?.job.outputs.find((o) => o.step === run.index + 1);
+      if (run && out?.clip && out.frames && run.job.clipsKept !== false) source = frameUrl(run.job.id, out.clip, 0);
+    }
+    const loader = maskRef && steps[maskRef.from].op === "load" ? maskRef.from : undefined;
+    return { input, source, loader, path: loader !== undefined ? String(steps[loader].path ?? "") : undefined };
+  }, [hasMask, steps, ops, selected, runs]);
+  function setMask(path: string) {
+    if (!maskInfo) return;
+    if (maskInfo.loader !== undefined) return update(maskInfo.loader, "path", path);
+    const me = steps[selected];
+    const ui = me.ui as StepUi | undefined;
+    const name = uniqueName(steps, "mask");
+    const loader: Step = { op: "load", path, out: name, ui: freeSpot(steps, (ui?.x ?? 340) - 300, (ui?.y ?? 40) + 170) };
+    setSteps([...steps.slice(0, selected), loader, { ...me, mask: name }, ...steps.slice(selected + 1)]);
+    setSelected(selected + 1);
+  }
   const clipsBefore = (i: number) => steps.slice(0, i).filter((s) => ops.get(s.op)?.output).map((s) => String(s.out ?? s.op));
   const groups = groupOrder.map((g) => ({ g, list: [...ops.values()].filter((o) => o.group === g) }));
   const stepState = (i: number) => {
@@ -199,7 +228,32 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
           <span className="note">{steps.length} adım</span>
         </div>
         {message ? <div className="problems" style={{ margin: "10px 16px 0" }} role="alert">{message}</div> : null}
-        {view === "timeline" && sel && selOp && hasTimeline ? (
+        {view === "mask" && maskInfo ? (
+          <div className="mask-view">
+            <div className="timeline-head">
+              <button type="button" className="btn small ghost" onClick={() => setView("graph")}>← Grafik</button>
+              <div>
+                <strong>Maskeyi boya</strong>
+                <div className="note">Boyadığın alan yeniden çizilir, gerisi korunur · adım {selected + 1} ({sel.op})</div>
+              </div>
+            </div>
+            {maskInfo.source ? (
+              <MaskPainter key={maskInfo.source} source={maskInfo.source} feather={typeof sel.feather === "number" ? sel.feather : sel.op === "inpaint" ? 4 : undefined}
+                value={{ mask: maskInfo.path }} onChange={(v) => v.mask && v.mask !== maskInfo.path && setMask(v.mask)} />
+            ) : maskInfo.input ? (
+              <div className="empty">
+                Maskeyi çizmek için önce girdi resmi gerekiyor.
+                <div style={{ marginTop: 12 }}>
+                  <button type="button" className="btn primary" disabled={busy || problems.length > 0} onClick={() => void run(maskInfo.input!.from)}>
+                    ▶ Girdiyi üret (adım {maskInfo.input.from + 1})
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="empty">Önce bu adımın girdisini bağla.</div>
+            )}
+          </div>
+        ) : view === "timeline" && sel && selOp && hasTimeline ? (
           <PromptTimeline step={sel} op={selOp} run={runs.get(stepId(sel))} onChange={(field, x) => update(selected, field, x)} onBack={() => setView("graph")} />
         ) : view === "graph" ? (
           steps.length === 0 ? (
@@ -289,7 +343,13 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
               disabled={busy || problems.length > 0 || !engine.connected || (job?.state === "running")} onClick={() => void run(selected)}>
               ▶ Bu adıma kadar çalıştır
             </button>
-            {selOp.fields.map((f) => f.type === "keyframes" ? (
+            {selOp.fields.map((f) => f.name === "mask" && hasMask ? (
+              <div key={f.name} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <FieldInput id={`insp-${f.name}`} field={f} value={sel[f.name]} models={engine.models} clips={clipsBefore(selected)}
+                  onChange={(x) => update(selected, f.name, x)} />
+                <button type="button" className="btn small" onClick={() => setView("mask")}>Maskeyi çiz</button>
+              </div>
+            ) : f.type === "keyframes" ? (
               <div key={f.name} className="field">
                 <span className="label">{fieldLabel(f.name)}</span>
                 <span className="note">

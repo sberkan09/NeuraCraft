@@ -26,6 +26,7 @@
 #include "Quantized.h"
 #include "Random.h"
 #include "SafeTensors.h"
+#include "Checkpoint.h"
 #include "Server.h"
 #include "Text.h"
 #include "Transformer.h"

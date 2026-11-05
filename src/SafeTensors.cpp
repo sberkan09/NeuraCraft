@@ -1,4 +1,5 @@
 #include "SafeTensors.h"
+#include "Checkpoint.h"
 #include "Profile.h"
 #include "Json.h"
 #include "Parallel.h"
@@ -73,6 +74,11 @@ std::size_t SafeTensors::Tensor::elements() const {
 }
 
 SafeTensors::SafeTensors(const std::string& path) : path_(path) {
+    if (const std::size_t hash = path.rfind('#'); hash != std::string::npos && !std::ifstream(path)) {
+        const SafeTensors file(path.substr(0, hash));
+        *this = file.renamed(checkpointRenames(file, path.substr(hash + 1)));
+        return;
+    }
     std::ifstream in(path, std::ios::binary | std::ios::ate);
     if (!in) throw std::runtime_error("SafeTensors: cannot open " + path);
     fileSize_ = static_cast<std::size_t>(in.tellg());
@@ -108,6 +114,29 @@ SafeTensors::SafeTensors(const std::string& path) : path_(path) {
             throw std::runtime_error("SafeTensors: inconsistent size for tensor " + name);
         tensors_.emplace(name, std::move(t));
     }
+}
+
+SafeTensors SafeTensors::renamed(const std::vector<Rename>& entries) const {
+    SafeTensors out;
+    out.path_ = path_;
+    out.dataStart_ = dataStart_;
+    out.fileSize_ = fileSize_;
+    out.metadata_ = metadata_;
+    for (const Rename& r : entries) {
+        Tensor t = info(r.source);
+        if (r.count) {
+            const std::size_t n = t.elements(), width = n ? (t.end - t.begin) / n : 0;
+            if (r.first + r.count > n)
+                throw std::runtime_error("SafeTensors: elements " + std::to_string(r.first) + "+" + std::to_string(r.count) + " out of range for " + r.source);
+            t.begin += r.first * width;
+            t.end = t.begin + r.count * width;
+            const std::size_t row = t.shape.size() >= 2 ? n / t.shape[0] : 0;
+            if (row && r.count % row == 0 && r.first % row == 0) t.shape[0] = r.count / row;
+            else t.shape = {r.count};
+        }
+        out.tensors_[r.name] = std::move(t);
+    }
+    return out;
 }
 
 const SafeTensors::Tensor& SafeTensors::info(const std::string& name) const {

@@ -1,4 +1,5 @@
 #include "Diffusion.h"
+#include "Checkpoint.h"
 #include "Profile.h"
 #include "Activations.h"
 #include "Dense.h"
@@ -135,11 +136,9 @@ Matrix Vae::decode(const Matrix& z) {
 }
 
 Vae loadVae(const std::string& directory, std::size_t width, std::size_t height, bool withEncoder, bool withDecoder) {
-    const std::string dir = exists(directory + "/config.json") ? directory : directory + "/vae";
-    const json::Value c = json::parse(readFile(dir + "/config.json"));
-    std::string file = dir + "/diffusion_pytorch_model.safetensors";
-    if (!exists(file)) file = dir + "/diffusion_pytorch_model.fp16.safetensors";
-    if (!exists(file)) throw std::runtime_error("loadVae: no diffusion_pytorch_model(.fp16).safetensors in " + dir);
+    const ModelComponent component = modelComponent(directory, "vae", "loadVae");  // folder or single file
+    const json::Value& c = component.config;
+    const std::string& file = component.weights;
 
     std::vector<std::size_t> channels;
     for (const auto& v : c.at("block_out_channels").array) channels.push_back(static_cast<std::size_t>(v.number));
@@ -325,11 +324,9 @@ Matrix ClipTextEncoder::encode(const std::vector<int>& ids) {
 }
 
 ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8, const std::vector<Lora>& loras) {
-    const std::string dir = exists(directory + "/config.json") ? directory : directory + "/text_encoder";
-    const json::Value c = json::parse(readFile(dir + "/config.json"));
-    std::string file = dir + "/model.safetensors";
-    if (!exists(file)) file = dir + "/model.fp16.safetensors";
-    if (!exists(file)) throw std::runtime_error("loadClipTextEncoder: no model(.fp16).safetensors in " + dir);
+    const ModelComponent component = modelComponent(directory, "text_encoder", "loadClipTextEncoder");  // folder or single file
+    const json::Value& c = component.config;
+    const std::string& file = component.weights;
     const std::string act = c.find("hidden_act") ? c.at("hidden_act").string : "quick_gelu";
     GELU::Approximation gelu;
     if (act == "gelu") gelu = GELU::Approximation::Erf;

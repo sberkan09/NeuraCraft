@@ -4,6 +4,7 @@
 #include "VectorMath.h"
 #include "Dense.h"
 #include "Diffusion.h"
+#include "Checkpoint.h"
 #include "Json.h"
 #include "Parallel.h"
 #include "Pretrained.h"
@@ -837,11 +838,10 @@ Matrix UNet2DCondition::forward(const Matrix& latent, float timestep, const Matr
 
 UNet2DCondition loadUNet(const std::string& directory, std::size_t latentWidth, std::size_t latentHeight, bool int8,
                          const std::vector<Lora>& loras) {
-    const std::string dir = exists(directory + "/config.json") ? directory : directory + "/unet";
-    const json::Value c = json::parse(readFile(dir + "/config.json"));
-    std::string file = dir + "/diffusion_pytorch_model.safetensors";
-    if (!exists(file)) file = dir + "/diffusion_pytorch_model.fp16.safetensors";
-    if (!exists(file)) throw std::runtime_error("loadUNet: no diffusion_pytorch_model(.fp16).safetensors in " + dir);
+    // A diffusers folder or a single-file checkpoint (Checkpoint.h).
+    const ModelComponent component = modelComponent(directory, "unet", "loadUNet");
+    const json::Value& c = component.config;
+    const std::string& file = component.weights;
 
     auto list = [&](const char* key) {
         std::vector<std::size_t> v;
@@ -1242,15 +1242,11 @@ std::shared_ptr<TinyVae> tinyVaeModel(const std::string& dir, std::size_t width,
 // CLIP hidden states of the prompt (and of the negative prompt when guided).
 std::pair<Matrix, Matrix> encodePrompts(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
     const auto t = PipelineClock::now();
-    const ClipTokenizer tok = ClipTokenizer::fromDirectory(dir + "/tokenizer");
+    const ClipTokenizer tok = ClipTokenizer::fromDirectory(tokenizerDirectory(dir));
     const std::shared_ptr<ClipTextEncoder> encHold = textEncoder(dir, o.int8, o.loras);
     ClipTextEncoder& enc = *encHold;
     // SD 2 / Turbo pad with "!" (id 0); SD 1.x pads with <|endoftext|>.
-    int pad = tok.endOfText();
-    if (std::ifstream(dir + "/tokenizer/tokenizer_config.json")) {
-        const json::Value c = json::parse(readFile(dir + "/tokenizer/tokenizer_config.json"));
-        if (const json::Value* p = c.find("pad_token"); p && p->isString() && p->string == "!") pad = 0;
-    }
+    const int pad = padsWithExclamation(dir) ? 0 : tok.endOfText();
     std::pair<Matrix, Matrix> out;
     out.first = enc.encode(tok.encodeForModel(prompt, enc.length, pad));
     if (o.guidance > 1.0f) out.second = enc.encode(tok.encodeForModel(o.negativePrompt, enc.length, pad));
@@ -1279,10 +1275,10 @@ std::pair<Matrix, Matrix> imagePromptTokens(const std::string& adapter, const st
 }
 
 EulerScheduler schedulerFor(const std::string& dir, std::size_t steps, const std::string& sampler = "euler") {
-    const std::string config = dir + "/scheduler/scheduler_config.json";
-    if (sampler == "lcm") return exists(config) ? EulerScheduler::lcmFromConfig(config, steps) : EulerScheduler::lcm(steps);
+    const std::string config = schedulerConfig(dir);  // "" for a single file without a sidecar
+    if (sampler == "lcm") return !config.empty() ? EulerScheduler::lcmFromConfig(config, steps) : EulerScheduler::lcm(steps);
     if (sampler != "euler") throw std::invalid_argument("unknown sampler '" + sampler + "' (euler, lcm)");
-    return exists(config) ? EulerScheduler::fromConfig(config, steps) : EulerScheduler::standard(steps);
+    return !config.empty() ? EulerScheduler::fromConfig(config, steps) : EulerScheduler::standard(steps);
 }
 
 // Runs the scheduler's steps [first, end) on `latent` with the UNet.
@@ -1348,7 +1344,7 @@ Image imageToImage(const std::string& dir, const Image& input, const std::string
     {
         const auto t = PipelineClock::now();
         if (!o.tinyVae.empty()) latent = tinyVaeModel(o.tinyVae, o.width, o.height, true, false)->encode(imageToTensor(fitted));
-        else latent = vaeModel(dir, o.width, o.height, true, false)->encode(imageToTensor(fitted));
+        else latent = vaeModel(o.vae.empty() ? dir : o.vae, o.width, o.height, true, false)->encode(imageToTensor(fitted));
         reportStage(o, o.tinyVae.empty() ? "vae encode" : "taesd encode", t);
     }
     // As diffusers: the last steps * strength steps of the schedule run, starting from the
@@ -1376,7 +1372,7 @@ Image decodeLatent(const std::string& dir, const Matrix& latent, const TextToIma
         img = vae->decode(latent);
         shape = vae->image;
     } else {
-        const auto vae = vaeModel(dir, o.width, o.height, false, true);
+        const auto vae = vaeModel(o.vae.empty() ? dir : o.vae, o.width, o.height, false, true);
         img = vae->decode(latent);
         shape = vae->image;
     }
@@ -1428,14 +1424,10 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
     Matrix uncond;
     {
         auto te = PipelineClock::now();
-        const ClipTokenizer tok = ClipTokenizer::fromDirectory(dir + "/tokenizer");
+        const ClipTokenizer tok = ClipTokenizer::fromDirectory(tokenizerDirectory(dir));
         const std::shared_ptr<ClipTextEncoder> encHold = textEncoder(dir, o.int8, o.loras);
-    ClipTextEncoder& enc = *encHold;
-        int pad = tok.endOfText();
-        if (std::ifstream(dir + "/tokenizer/tokenizer_config.json")) {
-            const json::Value c = json::parse(readFile(dir + "/tokenizer/tokenizer_config.json"));
-            if (const json::Value* p = c.find("pad_token"); p && p->isString() && p->string == "!") pad = 0;
-        }
+        ClipTextEncoder& enc = *encHold;
+        const int pad = padsWithExclamation(dir) ? 0 : tok.endOfText();
         auto encode = [&](const std::string& s) { return enc.encode(tok.encodeForModel(s, enc.length, pad)); };
         std::vector<std::pair<std::size_t, Matrix>> keys{{0, encode(prompt)}};
         std::vector<std::pair<std::size_t, std::string>> at = v.promptAt;
@@ -1497,7 +1489,7 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
         std::shared_ptr<TinyVae> tiny;
         std::shared_ptr<Vae> vae;
         if (!o.tinyVae.empty()) tiny = tinyVaeModel(o.tinyVae, o.width, o.height, true, false);
-        else vae = vaeModel(dir, o.width, o.height, true, false);
+        else vae = vaeModel(o.vae.empty() ? dir : o.vae, o.width, o.height, true, false);
         Matrix z;
         for (std::size_t f = 0; f < F; ++f) {
             if (f < v.init.size()) {
@@ -1577,7 +1569,7 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
     std::shared_ptr<TinyVae> tiny;
     std::shared_ptr<Vae> vae;
     if (!o.tinyVae.empty()) tiny = tinyVaeModel(o.tinyVae, o.width, o.height, false, true);
-    else vae = vaeModel(dir, o.width, o.height, false, true);
+    else vae = vaeModel(o.vae.empty() ? dir : o.vae, o.width, o.height, false, true);
     std::vector<Image> frames;
     for (std::size_t f = 0; f < F; ++f) {
         Matrix one(1, n);
@@ -1611,13 +1603,9 @@ StableDiffusion::StableDiffusion(const std::string& dir, const TextToImageOption
     m.options = o;
     m.encoder = withEncoder;
     auto t = PipelineClock::now();
-    m.tokenizer = std::make_unique<ClipTokenizer>(ClipTokenizer::fromDirectory(dir + "/tokenizer"));
+    m.tokenizer = std::make_unique<ClipTokenizer>(ClipTokenizer::fromDirectory(tokenizerDirectory(dir)));
     m.clip = textEncoder(dir, o.int8, o.loras);
-    m.pad = m.tokenizer->endOfText();
-    if (std::ifstream(dir + "/tokenizer/tokenizer_config.json")) {
-        const json::Value c = json::parse(readFile(dir + "/tokenizer/tokenizer_config.json"));
-        if (const json::Value* p = c.find("pad_token"); p && p->isString() && p->string == "!") m.pad = 0;
-    }
+    m.pad = padsWithExclamation(dir) ? 0 : m.tokenizer->endOfText();
     reportStage(o, "load text encoder", t);
     if (!o.ipAdapter.empty()) m.ipTokens = imagePromptTokens(o.ipAdapter, o.imageEncoder, o.imagePrompt, o);
     t = PipelineClock::now();
@@ -1625,7 +1613,7 @@ StableDiffusion::StableDiffusion(const std::string& dir, const TextToImageOption
     reportStage(o, "load unet", t);
     t = PipelineClock::now();
     if (!o.tinyVae.empty()) m.tiny = tinyVaeModel(o.tinyVae, o.width, o.height, withEncoder, true);
-    else m.vae = vaeModel(dir, o.width, o.height, withEncoder, true);
+    else m.vae = vaeModel(o.vae.empty() ? dir : o.vae, o.width, o.height, withEncoder, true);
     reportStage(o, "load autoencoder", t);
 }
 

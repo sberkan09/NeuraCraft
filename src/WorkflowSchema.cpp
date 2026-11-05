@@ -1,6 +1,7 @@
 #include "Json.h"
 #include "SafeTensors.h"
 #include "Workflow.h"
+#include "Checkpoint.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -43,7 +44,7 @@ WorkflowField number(const char* name, const char* type, const char* def, const 
 // Fields every Stable Diffusion step shares.
 std::vector<WorkflowField> diffusionFields(const char* steps, const char* strength, bool prompt = true) {
     std::vector<WorkflowField> f;
-    f.push_back(model("model", "sd", "Stable Diffusion model folder (diffusers layout)", true));
+    f.push_back(model("model", "sd", "Stable Diffusion model: a diffusers folder or a single-file .safetensors checkpoint", true));
     if (prompt) f.push_back(field("prompt", "text", "", "What to draw", true));
     f.push_back(field("negative", "string", "", "What to avoid (used with guidance > 1)"));
     f.push_back(number("steps", "int", steps, "Denoising steps", 1, 200));
@@ -56,6 +57,7 @@ std::vector<WorkflowField> diffusionFields(const char* steps, const char* streng
     f.push_back(field("int8", "bool", "true", "int8 weights (half the memory, slightly less exact)"));
     f.push_back(field("lora", "loras", "[]", "LoRA files, \"file\" or \"file:scale\""));
     f.push_back(model("tiny_vae", "taesd", "TAESD decoder (default: the model's taesd folder if present)"));
+    f.push_back(model("vae", "vae", "Another VAE: a diffusers VAE folder or a VAE .safetensors (default: the model's own)"));
     f.push_back(model("controlnet", "controlnet", "ControlNet model folder"));
     f.push_back(field("control", "clip", "", "Control picture(s) for the ControlNet"));
     f.push_back(number("control_scale", "float", "1", "ControlNet strength", 0, 2));
@@ -217,6 +219,7 @@ std::string folderKind(const std::filesystem::path& dir) {
         const std::string name = cls && cls->isString() ? cls->string : "";
         if (name == "ControlNetModel") return "controlnet";
         if (name == "AutoencoderTiny") return "taesd";
+        if (name == "AutoencoderKL") return "vae";
         if (const json::Value* arch = c.find("architectures"))
             for (const auto& a : arch->array) {
                 if (a.string.find("DepthAnything") != std::string::npos) return "depth";
@@ -235,6 +238,12 @@ std::string folderKind(const std::filesystem::path& dir) {
 std::string fileKind(const std::filesystem::path& file) {
     try {
         const SafeTensors st(file.string());
+        if (st.has("model.diffusion_model.input_blocks.0.0.weight")) {  // a single-file Stable Diffusion checkpoint
+            const CheckpointInfo info = inspectCheckpoint(file.string());
+            if (info.family != "sd1" && info.family != "sd2") return "";  // SDXL and others are not supported yet
+            return info.inChannels == 9 ? "sd-inpaint" : "sd";
+        }
+        if (st.has("encoder.conv_in.weight") && st.has("decoder.conv_out.weight") && st.has("post_quant_conv.weight")) return "vae";
         bool motion = false, lora = false, ip = false, esrgan = false, rife = false;
         for (const std::string& n : st.names()) {
             if (n.find("motion_modules") != std::string::npos) motion = true;

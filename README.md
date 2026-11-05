@@ -494,6 +494,33 @@ scene, so a 16-frame clip shows a blend of both prompts; over a longer clip
 (32 frames above: three overlapping windows, 384 x 384, 29 minutes on the
 2-core machine) the change from spring to winter comes through.
 
+### Single-file checkpoints and custom models
+
+Most Stable Diffusion fine-tunes are shared as one `.safetensors` file in the
+original layout (`model.diffusion_model.*`, `first_stage_model.*`,
+`cond_stage_model.*`). NeuraCraft loads them where a diffusers folder is
+expected — on the command line, in workflows and in Studio's model lists —
+with no conversion step:
+
+```
+$ ./bin/NeuraCraft txt2img data/checkpoints/dreamshaper_8.safetensors "a red fox, studio light" fox.png --steps 20 --guidance 7
+```
+
+The tensors are renamed to diffusers names in place (nothing is copied; SD
+2.x's OpenCLIP q/k/v are split from the fused projection), and each
+component's config is worked out from the tensor sizes: SD 1.x or 2.x, the
+block layout, inpainting (9-channel) models. The schedule is SD's release one.
+A SD 1.5 and a SD 2.x (SD-Turbo) checkpoint written this way give pictures
+byte-identical to their diffusers folders. The tokenizer is not in the file:
+it is taken from a `tokenizer/` folder next to it or from a sibling model
+folder (any SD 1.x / 2.x one; `NEURACRAFT_TOKENIZER` overrides). What a file
+cannot tell goes in a `<file>.json` next to it, for example
+`{"scheduler": {"timestep_spacing": "trailing"}}` for a Turbo model;
+`"unet"`, `"vae"`, `"text_encoder"` and `"tokenizer"` keys work the same way.
+A separate VAE (`"vae"` in a step, `TextToImageOptions::vae`) can be a
+diffusers VAE folder or a VAE `.safetensors` of its own. SDXL checkpoints are
+recognised and refused for now. `Checkpoint.h` has the details.
+
 ### LoRA and the LCM sampler
 
 `--lora file.safetensors[:scale]` merges LoRA adapters

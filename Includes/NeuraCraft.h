@@ -11,6 +11,7 @@
 #include "Diffusion.h"
 #include "Image.h"
 #include "Interpolate.h"
+#include "IpAdapter.h"
 #include "Json.h"
 #include "Layer.h"
 #include "Lora.h"

@@ -6,6 +6,7 @@
 
 #include "Conv.h"
 #include "Image.h"
+#include "IpAdapter.h"
 #include "Lora.h"
 #include "Network.h"
 #include "Transformer.h"
@@ -115,6 +116,11 @@ public:
     // image size, channel-major, values 0..1, e.g. canny edges) -> features,
     // computed once per image ...
     bool isControlNet() const;
+    // IP-Adapter (after loadIpAdapter): image prompt tokens (tokens x contextDim,
+    // see IpAdapter::tokens) attended in every cross-attention next to the
+    // text, weighted by `scale`; empty tokens switch it off.
+    bool hasImagePrompt() const;
+    void setImagePrompt(const Matrix& tokens, float scale = 1.0f);
     Matrix controlEmbedding(const Matrix& conditionImage);
     // ... and per step, the residuals for the UNet, multiplied by `scale`.
     ControlResiduals control(const Matrix& latent, float timestep, const Matrix& context, const Matrix& embedding, float scale = 1.0f);
@@ -130,7 +136,13 @@ private:
     std::unique_ptr<Impl> impl_;
     friend UNet2DCondition loadUNet(const std::string&, std::size_t, std::size_t, bool, const std::vector<Lora>&);
     friend void loadMotionModules(UNet2DCondition&, const std::string&, bool);
+    friend void loadIpAdapter(UNet2DCondition&, const std::string&, bool);
 };
+
+// Adds an IP-Adapter's image key / value projections (h94/IP-Adapter
+// ip-adapter_sd15.safetensors: ip_adapter.N.to_k_ip / to_v_ip for every
+// cross-attention, in diffusers' processor order) to an SD 1.x UNet.
+void loadIpAdapter(UNet2DCondition& unet, const std::string& file, bool int8 = false);
 
 // Adds an AnimateDiff motion adapter (diffusers MotionAdapter safetensors, such
 // as AnimateDiff-Lightning or mm_sd_v15_v2) to an SD 1.x UNet: a temporal
@@ -191,6 +203,11 @@ struct TextToImageOptions {
     std::string controlNet;
     Image controlImage;
     float controlScale = 1.0f;
+    // IP-Adapter image prompt: the adapter file, the picture and its weight;
+    // the CLIP image encoder defaults to image_encoder/ next to the adapter.
+    std::string ipAdapter, imageEncoder;
+    Image imagePrompt;
+    float ipScale = 0.6f;
     std::function<void(const std::string& stage, double seconds)> progress;  // after each stage / step
 };
 
@@ -345,6 +362,10 @@ struct TextToVideoOptions {
     std::string controlNet;
     std::vector<Image> controlImages;
     float controlScale = 1.0f;
+    // IP-Adapter image prompt for every frame (keeps a subject or style across the clip).
+    std::string ipAdapter, imageEncoder;
+    Image imagePrompt;
+    float ipScale = 0.6f;
     std::size_t steps = 4;                  // AnimateDiff-Lightning: the step count the module was distilled for
     unsigned seed = 0;
     float guidance = 1.0f;                  // <= 1: off (Lightning); else classifier-free guidance

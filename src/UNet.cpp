@@ -191,6 +191,10 @@ struct CrossTransformer {
     Dense projIn, projOut;
     LayerNorm ln1, ln2, ln3;
     Dense q1, k1, v1, o1, q2, k2, v2, o2, ff1, ff2;
+    // IP-Adapter: a second key / value projection of image prompt tokens, attended next to the text.
+    std::unique_ptr<Dense> kIp, vIp;
+    const Matrix* ipTokens = nullptr;
+    float ipScale = 0.0f;
 
     CrossTransformer(ImageShape s, std::size_t h, std::size_t contextDim, std::size_t groups)
         : shape(s), heads(h), norm(s, groups, 1e-6f), projIn(s.channels, s.channels), projOut(s.channels, s.channels),
@@ -224,8 +228,15 @@ struct CrossTransformer {
         Matrix a = ln1.forward(h, false);
         addInPlace(h, o1.forward(multiHeadAttention(q1.forward(a, false), k1.forward(a, false), v1.forward(a, false), heads), false));
         a = ln2.forward(h, false);
-        addInPlace(h, o2.forward(multiHeadAttention(q2.forward(a, false), k2.forward(context, false), v2.forward(context, false), heads),
-                                 false));
+        {
+            const Matrix q = q2.forward(a, false);
+            Matrix att = multiHeadAttention(q, k2.forward(context, false), v2.forward(context, false), heads);
+            if (kIp && ipTokens && ipScale != 0.0f) {
+                const Matrix ip = multiHeadAttention(q, kIp->forward(*ipTokens, false), vIp->forward(*ipTokens, false), heads);
+                for (std::size_t k = 0; k < att.size(); ++k) att.data()[k] += ipScale * ip.data()[k];
+            }
+            addInPlace(h, o2.forward(att, false));
+        }
         a = ln3.forward(h, false);
         const Matrix g = ff1.forward(a, false);  // HW x 8C: [hidden | gate]
         Matrix geglu(HW, 4 * C);
@@ -444,6 +455,8 @@ struct UNet2DCondition::Impl {
     std::vector<UpBlock> ups;
     std::unique_ptr<GroupNorm> normOut;
     std::size_t groups = 32;
+    Matrix ipTokens;  // current image prompt tokens (IP-Adapter)
+    bool ipLoaded = false;
     // ControlNet parts (a ControlNetModel loads as a UNet without up blocks).
     bool controlNet = false;
     std::vector<std::unique_ptr<Conv2D>> condConvs;  // conditioning embedding, SiLU after each
@@ -453,6 +466,19 @@ struct UNet2DCondition::Impl {
     // Down / up block shapes after each resnet, for building motion modules.
     std::vector<std::vector<ImageShape>> downShapes, upShapes;
 };
+
+namespace {
+// Cross-attention layers in diffusers' attention-processor order: down blocks, up blocks, mid block.
+std::vector<CrossTransformer*> crossLayers(UNet2DCondition::Impl& m) {
+    std::vector<CrossTransformer*> out;
+    for (auto& d : m.downs)
+        for (auto& a : d.attentions) out.push_back(a.get());
+    for (auto& u : m.ups)
+        for (auto& a : u.attentions) out.push_back(a.get());
+    if (m.midAttention) out.push_back(m.midAttention.get());
+    return out;
+}
+} // namespace
 
 UNet2DCondition::UNet2DCondition() = default;
 UNet2DCondition::~UNet2DCondition() = default;
@@ -556,6 +582,24 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
     return out;
 }
 
+void loadIpAdapter(UNet2DCondition& unet, const std::string& file, bool int8) {
+    UNet2DCondition::Impl& m = *unet.impl_;
+    Weights w(file);
+    w.int8 = int8;
+    SkipParameterInit skip;
+    const std::vector<CrossTransformer*> layers = crossLayers(m);
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const std::string p = "ip_adapter." + std::to_string(2 * i + 1);
+        if (!w.has(p + ".to_k_ip.weight")) throw std::runtime_error("loadIpAdapter: " + file + " has no " + p + " (an SD 1.5 IP-Adapter?)");
+        const std::size_t C = layers[i]->shape.channels;
+        layers[i]->kIp = std::make_unique<Dense>(m.contextDim, C);
+        layers[i]->vIp = std::make_unique<Dense>(m.contextDim, C);
+        w.linear(*layers[i]->kIp, p + ".to_k_ip");
+        w.linear(*layers[i]->vIp, p + ".to_v_ip");
+    }
+    m.ipLoaded = true;
+}
+
 void loadMotionModules(UNet2DCondition& unet, const std::string& file, bool int8) {
     UNet2DCondition::Impl& m = *unet.impl_;
     Weights w(file);
@@ -586,6 +630,20 @@ Matrix UNet2DCondition::forward(const Matrix& latent, float timestep, const Matr
 }
 
 bool UNet2DCondition::isControlNet() const { return impl_->controlNet; }
+
+bool UNet2DCondition::hasImagePrompt() const { return impl_->ipLoaded; }
+
+void UNet2DCondition::setImagePrompt(const Matrix& tokens, float scale) {
+    Impl& m = *impl_;
+    if (!m.ipLoaded) throw std::logic_error("UNet2DCondition::setImagePrompt: no IP-Adapter loaded");
+    if (!tokens.empty() && tokens.cols() != m.contextDim)
+        throw std::invalid_argument("UNet2DCondition::setImagePrompt: tokens must have " + std::to_string(m.contextDim) + " columns");
+    m.ipTokens = tokens;
+    for (CrossTransformer* c : crossLayers(m)) {
+        c->ipTokens = m.ipTokens.empty() ? nullptr : &m.ipTokens;
+        c->ipScale = scale;
+    }
+}
 
 Matrix UNet2DCondition::controlEmbedding(const Matrix& image) {
     Impl& m = *impl_;
@@ -1038,6 +1096,23 @@ std::pair<Matrix, Matrix> encodePrompts(const std::string& dir, const std::strin
     return out;
 }
 
+// IP-Adapter tokens for the picture and for "no picture" (a zero embedding, as diffusers uses for guidance).
+std::pair<Matrix, Matrix> imagePromptTokens(const std::string& adapter, const std::string& encoderDir, const Image& picture,
+                                            const TextToImageOptions& o) {
+    if (picture.pixels.empty()) throw std::invalid_argument("IP-Adapter: no image prompt");
+    const auto t = PipelineClock::now();
+    const std::string dir = encoderDir.empty() ? std::filesystem::path(adapter).parent_path().append("image_encoder").string() : encoderDir;
+    Matrix embedding;
+    {
+        ClipImageEncoder enc(dir);  // freed before the UNet loads
+        embedding = enc.embed(picture);
+    }
+    const IpAdapter ip(adapter);
+    std::pair<Matrix, Matrix> tokens{ip.tokens(embedding), ip.tokens(Matrix(1, embedding.cols()))};
+    reportStage(o, "image prompt", t);
+    return tokens;
+}
+
 EulerScheduler schedulerFor(const std::string& dir, std::size_t steps, const std::string& sampler = "euler") {
     const std::string config = dir + "/scheduler/scheduler_config.json";
     if (sampler == "lcm") return exists(config) ? EulerScheduler::lcmFromConfig(config, steps) : EulerScheduler::lcm(steps);
@@ -1048,8 +1123,11 @@ EulerScheduler schedulerFor(const std::string& dir, std::size_t steps, const std
 // Runs the scheduler's steps [first, end) on `latent` with the UNet.
 void denoise(const std::string& dir, const std::pair<Matrix, Matrix>& context, const EulerScheduler& sched, std::size_t first,
              Matrix& latent, const TextToImageOptions& o) {
+    std::pair<Matrix, Matrix> ipTokens;
+    if (!o.ipAdapter.empty()) ipTokens = imagePromptTokens(o.ipAdapter, o.imageEncoder, o.imagePrompt, o);
     auto t = PipelineClock::now();
     UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8, o.loras);
+    if (!o.ipAdapter.empty()) loadIpAdapter(unet, o.ipAdapter, o.int8);
     reportStage(o, "load unet", t);
     UNet2DCondition controlNet;
     Matrix embedding;
@@ -1076,8 +1154,10 @@ void denoise(const std::string& dir, const std::pair<Matrix, Matrix>& context, c
         Matrix in = latent;
         const float scale = static_cast<float>(sched.inputScale(i));
         for (float& v : in.values()) v *= scale;
+        if (unet.hasImagePrompt()) unet.setImagePrompt(ipTokens.first, o.ipScale);
         Matrix eps = predict(in, static_cast<float>(sched.timesteps[i]), context.first);
         if (o.guidance > 1.0f) {
+            if (unet.hasImagePrompt()) unet.setImagePrompt(ipTokens.second, o.ipScale);
             const Matrix uncond = predict(in, static_cast<float>(sched.timesteps[i]), context.second);
             for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + o.guidance * (eps.data()[k] - uncond.data()[k]);
         }
@@ -1158,6 +1238,8 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
     o.progress = v.progress;
     o.loras = v.loras;
     checkSize(o);
+    std::pair<Matrix, Matrix> ipTokens;
+    if (!v.ipAdapter.empty()) ipTokens = imagePromptTokens(v.ipAdapter, v.imageEncoder, v.imagePrompt, o);
     if (v.frames == 0) throw std::invalid_argument("textToVideo: frames must be > 0");
     if (v.context == 0 || v.context > 32 || v.overlap >= v.context)
         throw std::invalid_argument("textToVideo: context must be in 1..32 and overlap below it");
@@ -1217,6 +1299,7 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
     auto t = PipelineClock::now();
     UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8, o.loras);
     loadMotionModules(unet, motion, o.int8);
+    if (!v.ipAdapter.empty()) loadIpAdapter(unet, v.ipAdapter, o.int8);
     reportStage(o, "load unet + motion", t);
     UNet2DCondition controlNet;
     std::vector<Matrix> embeddings;  // one, or one per frame
@@ -1312,8 +1395,10 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
         Matrix in = latents;
         const float scale = static_cast<float>(sched.inputScale(i));
         for (float& x : in.values()) x *= scale;
+        if (unet.hasImagePrompt()) unet.setImagePrompt(ipTokens.first, v.ipScale);
         Matrix eps = predict(in, static_cast<float>(sched.timesteps[i]), conds);
         if (o.guidance > 1.0f) {
+            if (unet.hasImagePrompt()) unet.setImagePrompt(ipTokens.second, v.ipScale);
             const Matrix un = predict(in, static_cast<float>(sched.timesteps[i]), std::vector<Matrix>{uncond});
             for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = un.data()[k] + o.guidance * (eps.data()[k] - un.data()[k]);
         }

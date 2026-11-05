@@ -30,6 +30,7 @@ add_library(neuracraft_lib STATIC
     src/Diffusion.cpp
     src/Image.cpp
     src/Interpolate.cpp
+    src/IpAdapter.cpp
     src/Json.cpp
     src/Layer.cpp
     src/Lora.cpp

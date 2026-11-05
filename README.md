@@ -299,6 +299,7 @@ tokenizer.json files with other pre-tokenizers (e.g. Metaspace).
 | Prompt morph / infinite zoom | `video DIR morph` / `zoom` | SD-Turbo | |
 | Outpaint zoom | `video DIR outpaint` | SD 1.5 inpainting | |
 | Text / image / video to video | `video DIR t2v` (`--init`, `--init-dir`, `--prompt-at`) | SD 1.5 + AnimateDiff-Lightning or AnimateLCM | `download_animatediff.sh` |
+| Image prompt (style / subject from a picture) | `--ip-adapter file --image-prompt pic` | IP-Adapter SD 1.5 | `download_ip_adapter.sh` |
 | Style / speed adapters | `--lora file[:scale]`, `--sampler lcm` | kohya / PEFT LoRA files | |
 | Depth map / 3D photo | `depth`, `parallax`, `--depth-model` | Depth Anything V2 Small | `download_depth_anything.sh` |
 | Upscale x4 | `upscale`, `video --upscale` | Real-ESRGAN compact | `download_upscaler.sh` |
@@ -632,6 +633,29 @@ took 7 s including the depth map. `--depth-model` turns control pictures into
 depth maps for the depth ControlNet (`control_v11f1p_sd15_depth`), here
 redrawing the LCM fisherman as a bronze statue (4 LCM steps, 111 s).
 
+### Image prompts: IP-Adapter
+
+```
+$ scripts/download_ip_adapter.sh data/ip-adapter       # adapter (~45 MB) + CLIP ViT-H image encoder (~2.5 GB)
+$ ./build_and_run.sh txt2img data/animatediff "a dog in a garden, photo" out.png \
+      --ip-adapter data/ip-adapter/ip-adapter_sd15.safetensors --image-prompt cabin.png --ip-scale 0.35 \
+      --steps 4 --sampler lcm --lora data/loras/lcm-lora-sdv1-5.safetensors
+```
+
+<p><img src="docs/images/ip_adapter.jpg" width="640"></p>
+
+A picture as part of the prompt: `ClipImageEncoder` (Hugging Face
+`CLIPVisionModelWithProjection`, ViT-H/14, 32 layers; agrees with a NumPy
+reference within 4e-7) embeds it, `IpAdapter` projects the embedding to four
+context tokens, and `loadIpAdapter()` gives every cross-attention of the
+UNet a second key / value projection for them, added to the text attention
+with the image prompt's weight (`setImagePrompt`). Above: the cabin picture,
+the prompt alone, image prompt weight 0.35 (garden, dog, the cabin and its
+mood) and 0.6 (the picture takes over). It works for text and image to
+image and for AnimateDiff clips (`video DIR t2v ... --ip-adapter`), where the
+same tokens steer every frame; the 2.5 GB encoder is freed before the UNet
+loads.
+
 ### Upscaling: Real-ESRGAN
 
 ```
@@ -786,6 +810,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Upscaling | `Upscale.h` | `Upscaler`: Real-ESRGAN compact (x2 / x4), tiled without seams |
 | Interpolation | `Interpolate.h` | `FrameInterpolator`: RIFE v4 IFNet (middle frames, 2^n x frame rate) |
 | Depth | `Depth.h` | `DepthEstimator` (Depth Anything V2), `parallaxAnimation()` (3D photo) |
+| Image prompts | `IpAdapter.h` | `ClipImageEncoder` (CLIP vision), `IpAdapter`, `loadIpAdapter()` / `setImagePrompt()` |
 | LoRA | `Lora.h` | `LoraMerger`: kohya / A1111 and PEFT LoRA files merged into the UNet and text encoder while they load |
 | Files | `Image.h` | PNG (own inflate and deflate), animated PNG, JPEG (baseline encoder), animated GIF (median-cut palette, LZW), QuickTime Motion-JPEG `.mov`, PPM |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
@@ -861,6 +886,7 @@ step, inpainting (pixels outside the mask kept exactly) and the outpaint zoom,
 the Real-ESRGAN upscaler (zero head = nearest upscale, tiling exact), RIFE
 (zero heads = even blend, frame counts), Depth Anything (native and
 interpolated position grids) and the parallax animation (first frame exact),
+IP-Adapter (weight 0 or no tokens = no change),
 ControlNet (zero convolutions change nothing, scale 0 equals no ControlNet)
 and canny edges. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal

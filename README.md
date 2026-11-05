@@ -288,6 +288,22 @@ scaling types (linear, dynamic, YaRN), attention biases (Qwen 2; its
 tokenizer pattern is supported), sliding-window attention (Mistral v0.1) and
 tokenizer.json files with other pre-tokenizers (e.g. Metaspace).
 
+### Image and video workflows at a glance
+
+| Task | Command | Model(s) | Script |
+|---|---|---|---|
+| Text to image | `txt2img` | SD-Turbo (1 step), any SD 1.5 (+ LCM-LoRA: 4 steps) | `download_sd_turbo.sh`, `download_lcm_lora.sh` |
+| Image to image | `img2img` | same | |
+| Inpainting | `inpaint` | SD 1.5 inpainting | `download_sd_inpaint.sh` |
+| Structure control | `--controlnet DIR --control pic --canny` | ControlNet 1.1 (SD 1.5) | `download_controlnet.sh` |
+| Prompt morph / infinite zoom | `video DIR morph` / `zoom` | SD-Turbo | |
+| Outpaint zoom | `video DIR outpaint` | SD 1.5 inpainting | |
+| Text / image / video to video | `video DIR t2v` (`--init`, `--init-dir`, `--prompt-at`) | SD 1.5 + AnimateDiff-Lightning or AnimateLCM | `download_animatediff.sh` |
+| Style / speed adapters | `--lora file[:scale]`, `--sampler lcm` | kohya / PEFT LoRA files | |
+| Upscale x4 | `upscale`, `video --upscale` | Real-ESRGAN compact | `download_upscaler.sh` |
+| Smoother motion | `interpolate`, `video --interpolate` | RIFE v4 | `download_rife.sh` |
+| Output | `.png` `.jpg` / `.gif` `.png` (APNG) `.mov` | | |
+
 ### Text to image: Stable Diffusion (SD-Turbo)
 
 ```

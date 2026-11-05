@@ -401,6 +401,140 @@ kernel void attention_flash(device const float* Q [[buffer(0)]],
 }
 )METAL";
 
+// The same attention with simdgroup matrices (Apple7+, M1 and later). Four
+// simdgroups per threadgroup each own 8 query rows; keys and values stream
+// through threadgroup memory 16 at a time. Per tile: S = Q K^T (8 x 16) with
+// 8x8 hardware products, an online softmax in a small per-simdgroup scratch
+// (four lanes per row), O = diag(correction) O + P V. DB = head size / 8 is a
+// function constant so the loops over head dimensions unroll.
+const char* const kAttentionSimdSource = R"METAL(
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+struct AttnParams { uint N; uint M; uint C; uint dh; float scale; };
+constant uint DB [[function_constant(0)]];
+
+#define BC 16
+#define DMAX 160
+#define DBMAX 20
+
+kernel void attention_simd(device const float* Q [[buffer(0)]],
+                           device const float* K [[buffer(1)]],
+                           device const float* V [[buffer(2)]],
+                           device float* O [[buffer(3)]],
+                           constant AttnParams& p [[buffer(4)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint tidx [[thread_index_in_threadgroup]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float Ks[BC * DMAX];
+    threadgroup float Vs[BC * DMAX];
+    threadgroup float scratch[4][8 * BC + 64];  // per simdgroup: S / P (8 x 16), then an 8 x 8 matrix
+    threadgroup float* Ss = scratch[sg];
+    threadgroup float* Ds = scratch[sg] + 8 * BC;
+
+    const uint base = tg.y * p.dh;
+    const uint row0 = tg.x * 32 + sg * 8;
+    const uint r = lane / 4, c0 = (lane % 4) * 4;  // softmax: four lanes per row, four columns each
+
+    // Q (8 x dh) into simdgroup matrices through the 8 x 8 scratch; rows past N are zero.
+    simdgroup_float8x8 q[DBMAX], o[DBMAX];
+    for (uint d = 0; d < DB; ++d) {
+        for (uint e = lane; e < 64; e += 32) {
+            const uint qr = row0 + e / 8;
+            Ds[e] = qr < p.N ? Q[ulong(qr) * p.C + base + d * 8 + e % 8] : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(q[d], Ds, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        o[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    float m = -1e30f, l = 0.0f;  // this lane's row; finite: Metal compiles with fast math
+
+    for (uint j0 = 0; j0 < p.M; j0 += BC) {
+        const uint nk = min(uint(BC), p.M - j0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint t = tidx; t < BC * p.dh; t += 128) {
+            const uint j = t / p.dh, e = t % p.dh;
+            const bool in = j < nk;
+            Ks[j * DMAX + e] = in ? K[ulong(j0 + j) * p.C + base + e] : 0.0f;
+            Vs[j * DMAX + e] = in ? V[ulong(j0 + j) * p.C + base + e] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // S = Q K^T for the two 8-key halves of the tile.
+        for (uint h = 0; h < 2; ++h) {
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint d = 0; d < DB; ++d) {
+                simdgroup_float8x8 kt;
+                simdgroup_load(kt, Ks + (h * 8) * DMAX + d * 8, DMAX, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc, q[d], kt, acc);
+            }
+            simdgroup_store(acc, Ss + h * 8, BC);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Online softmax of this lane's four scores.
+        float s[4];
+        float mt = -1e30f;
+        for (uint i = 0; i < 4; ++i) {
+            s[i] = j0 + c0 + i < p.M ? Ss[r * BC + c0 + i] * p.scale : -1e30f;
+            mt = max(mt, s[i]);
+        }
+        mt = max(mt, simd_shuffle_xor(mt, ushort(1)));
+        mt = max(mt, simd_shuffle_xor(mt, ushort(2)));
+        const float mNew = max(m, mt);
+        const float corr = exp(m - mNew);
+        float sum = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            const float e = j0 + c0 + i < p.M ? exp(s[i] - mNew) : 0.0f;
+            Ss[r * BC + c0 + i] = e;
+            sum += e;
+        }
+        sum += simd_shuffle_xor(sum, ushort(1));
+        sum += simd_shuffle_xor(sum, ushort(2));
+        l = l * corr + sum;
+        m = mNew;
+        // diag(corr) in the 8 x 8 scratch: entries 2 lane, 2 lane + 1 lie in this lane's row.
+        for (uint t = 0; t < 2; ++t) Ds[2 * lane + t] = (2 * lane + t) % 8 == r ? corr : 0.0f;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 dcorr, p0, p1;
+        simdgroup_load(dcorr, Ds, 8);
+        simdgroup_load(p0, Ss, BC);
+        simdgroup_load(p1, Ss + 8, BC);
+        for (uint d = 0; d < DB; ++d) {
+            simdgroup_float8x8 scaled, v0, v1;
+            simdgroup_multiply(scaled, dcorr, o[d]);
+            simdgroup_load(v0, Vs + d * 8, DMAX);
+            simdgroup_load(v1, Vs + 8 * DMAX + d * 8, DMAX);
+            simdgroup_multiply_accumulate(scaled, p0, v0, scaled);
+            simdgroup_multiply_accumulate(o[d], p1, v1, scaled);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // O / l, out through the 8 x 8 scratch for rows < N.
+    for (uint t = 0; t < 2; ++t) Ds[2 * lane + t] = (2 * lane + t) % 8 == r ? 1.0f / l : 0.0f;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dinv;
+    simdgroup_load(dinv, Ds, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint d = 0; d < DB; ++d) {
+        simdgroup_float8x8 res;
+        simdgroup_multiply(res, dinv, o[d]);
+        simdgroup_store(res, Ss, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = lane; e < 64; e += 32) {
+            const uint orow = row0 + e / 8;
+            if (orow < p.N) O[ulong(orow) * p.C + base + d * 8 + e % 8] = Ss[e];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+)METAL";
+
 struct GemmParams {
     std::uint32_t M, N, K, lda, ldb, ldc, transA, transB, accumulate;
 };
@@ -415,7 +549,9 @@ struct Context {
     std::string name;
     std::string error;
     std::string q8Error;
-    id<MTLLibrary> attentionLib = nil;  // attention_flash, specialized per head size
+    id<MTLLibrary> attentionLib = nil;      // attention_flash, specialized per head size
+    id<MTLLibrary> attentionSimdLib = nil;  // attention_simd (Apple7+)
+    std::map<unsigned, bool> attentionSimd;  // head size -> the pipeline is the simdgroup one
     std::map<unsigned, id<MTLComputePipelineState>> attention;
     std::mutex attentionMutex;
     bool ok = false;
@@ -522,26 +658,49 @@ struct AttnParams {
     float scale;
 };
 
-// The attention pipeline for one head size (built on first use), or nil.
+// The attention pipeline for one head size (built on first use), or nil: the simdgroup-matrix
+// kernel with the simdgroup GEMM (head sizes divisible by 8), else the portable one.
+// NEURACRAFT_METAL_ATTENTION=scalar forces the portable kernel.
 id<MTLComputePipelineState> attentionPipeline(Context& ctx, unsigned dh) {
     std::lock_guard<std::mutex> lock(ctx.attentionMutex);
     auto it = ctx.attention.find(dh);
     if (it != ctx.attention.end()) return it->second;
     id<MTLComputePipelineState> pipe = nil;
+    bool simd = false;
     @autoreleasepool {
         NSError* err = nil;
-        if (ctx.attentionLib == nil)
-            ctx.attentionLib = [ctx.device newLibraryWithSource:[NSString stringWithUTF8String:kAttentionSource] options:nil error:&err];
-        if (ctx.attentionLib != nil) {
-            MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
-            const std::uint32_t dq = dh / 4;
-            [values setConstantValue:&dq type:MTLDataTypeUInt atIndex:0];
-            id<MTLFunction> fn = [ctx.attentionLib newFunctionWithName:@"attention_flash" constantValues:values error:&err];
-            if (fn) pipe = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
-            if (pipe != nil && [pipe maxTotalThreadsPerThreadgroup] < 128) pipe = nil;
+        const char* forced = std::getenv("NEURACRAFT_METAL_ATTENTION");
+        const bool allowSimd = !(forced && std::string(forced) == "scalar");
+        if (ctx.useSimd && allowSimd && dh % 8 == 0 && dh <= 160) {
+            if (ctx.attentionSimdLib == nil)
+                ctx.attentionSimdLib = [ctx.device newLibraryWithSource:[NSString stringWithUTF8String:kAttentionSimdSource]
+                                                                options:nil
+                                                                  error:&err];
+            if (ctx.attentionSimdLib != nil) {
+                MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
+                const std::uint32_t db = dh / 8;
+                [values setConstantValue:&db type:MTLDataTypeUInt atIndex:0];
+                id<MTLFunction> fn = [ctx.attentionSimdLib newFunctionWithName:@"attention_simd" constantValues:values error:&err];
+                if (fn) pipe = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
+                if (pipe != nil && [pipe maxTotalThreadsPerThreadgroup] < 128) pipe = nil;
+                simd = pipe != nil;
+            }
+        }
+        if (pipe == nil) {
+            if (ctx.attentionLib == nil)
+                ctx.attentionLib = [ctx.device newLibraryWithSource:[NSString stringWithUTF8String:kAttentionSource] options:nil error:&err];
+            if (ctx.attentionLib != nil) {
+                MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
+                const std::uint32_t dq = dh / 4;
+                [values setConstantValue:&dq type:MTLDataTypeUInt atIndex:0];
+                id<MTLFunction> fn = [ctx.attentionLib newFunctionWithName:@"attention_flash" constantValues:values error:&err];
+                if (fn) pipe = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
+                if (pipe != nil && [pipe maxTotalThreadsPerThreadgroup] < 128) pipe = nil;
+            }
         }
     }
     ctx.attention[dh] = pipe;
+    ctx.attentionSimd[dh] = simd;
     return pipe;
 }
 
@@ -703,6 +862,14 @@ void gemmQ8(bool quantLeft, std::size_t M, std::size_t N, std::size_t K,
         }
     }
     if (!failure.empty()) throw std::runtime_error("Metal gemmQ8: " + failure);
+}
+
+std::string attentionKernelName(std::size_t headSize) {
+    Context& ctx = context();
+    if (!ctx.ok || headSize == 0 || headSize % 4 != 0 || headSize > 160) return "";
+    if (attentionPipeline(ctx, static_cast<unsigned>(headSize)) == nil) return "";
+    std::lock_guard<std::mutex> lock(ctx.attentionMutex);
+    return ctx.attentionSimd[static_cast<unsigned>(headSize)] ? "simdgroup" : "scalar";
 }
 
 bool attentionSupported(std::size_t headSize) {

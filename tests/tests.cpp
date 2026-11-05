@@ -4200,6 +4200,9 @@ TEST(gpu_int8_products_match_cpu) {
 
 TEST(gpu_fused_attention_matches_cpu) {
     if (!gpuAvailable()) return;
+    std::cout << "         (attention kernels: head 40 " << gpuAttentionKernel(40) << ", head 64 " << gpuAttentionKernel(64)
+              << ", head 36 " << gpuAttentionKernel(36) << ")\n";
+    CHECK(gpuAttentionKernel(36) == "scalar" && gpuAttentionKernel(512).empty());
     setSeed(91);
     const std::size_t saved = gpuMinWork();
     setGpuMinWork(1);
@@ -4207,7 +4210,8 @@ TEST(gpu_fused_attention_matches_cpu) {
     // Self- and cross-attention shapes of the UNet (head size 40 / 80 / 160), a ragged key count,
     // a 64-wide head, and a 512-wide one (VAE) that stays on the CPU.
     for (const Case& c : {Case{300, 300, 320, 8, true}, Case{257, 77, 640, 8, true}, Case{100, 33, 320, 2, true},
-                          Case{70, 129, 320, 5, true}, Case{64, 64, 512, 1, false}}) {
+                          Case{70, 129, 320, 5, true}, Case{13, 5, 288, 8, true}, Case{1, 1, 80, 2, true},
+                          Case{64, 64, 512, 1, false}}) {
         const Matrix q = Matrix::uniform(c.N, c.C, -2, 2), k = Matrix::uniform(c.M, c.C, -2, 2), v = Matrix::uniform(c.M, c.C, -1, 1);
         setDevice(Device::CPU);
         const Matrix cpu = multiHeadAttention(q, k, v, c.heads);

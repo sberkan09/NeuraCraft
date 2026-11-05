@@ -26,6 +26,7 @@ add_library(neuracraft_lib STATIC
     src/Conv.cpp
     src/Data.cpp
     src/Dense.cpp
+    src/Depth.cpp
     src/Diffusion.cpp
     src/Image.cpp
     src/Interpolate.cpp

@@ -300,6 +300,7 @@ tokenizer.json files with other pre-tokenizers (e.g. Metaspace).
 | Outpaint zoom | `video DIR outpaint` | SD 1.5 inpainting | |
 | Text / image / video to video | `video DIR t2v` (`--init`, `--init-dir`, `--prompt-at`) | SD 1.5 + AnimateDiff-Lightning or AnimateLCM | `download_animatediff.sh` |
 | Style / speed adapters | `--lora file[:scale]`, `--sampler lcm` | kohya / PEFT LoRA files | |
+| Depth map / 3D photo | `depth`, `parallax`, `--depth-model` | Depth Anything V2 Small | `download_depth_anything.sh` |
 | Upscale x4 | `upscale`, `video --upscale` | Real-ESRGAN compact | `download_upscaler.sh` |
 | Smoother motion | `interpolate`, `video --interpolate` | RIFE v4 | `download_rife.sh` |
 | Output | `.png` `.jpg` / `.gif` `.png` (APNG) `.mov` | | |
@@ -602,6 +603,35 @@ edges as ControlNet input (right): the motion and outline follow the
 source, the light and colours follow the prompt (16 frames at 384 x 384,
 3 steps with ControlNet on every frame: 17 minutes on the 2-core machine).
 
+### Depth: Depth Anything V2, 3D photos, depth ControlNet
+
+```
+$ scripts/download_depth_anything.sh data/depth-anything-v2-small      # ~100 MB
+$ ./build_and_run.sh depth data/depth-anything-v2-small cabin.png depth.png
+$ ./build_and_run.sh parallax data/depth-anything-v2-small cabin.png cabin3d.gif --frames 48
+$ scripts/download_controlnet.sh data/controlnet-depth depth
+$ ./build_and_run.sh txt2img data/animatediff "a bronze statue of an old fisherman with a hat, museum lighting, photo" out.png \
+      --controlnet data/controlnet-depth --control fisherman.png --depth-model data/depth-anything-v2-small \
+      --steps 4 --sampler lcm --lora data/loras/lcm-lora-sdv1-5.safetensors
+```
+
+<p><img src="docs/images/depth_map.jpg" width="256"> <img src="docs/images/depth_parallax.gif" width="256"></p>
+<p><img src="docs/images/depth_controlnet.jpg" width="600"></p>
+
+`DepthEstimator` runs Depth Anything V2 (transformers
+`DepthAnythingForDepthEstimation`): a DINOv2 ViT backbone (patch embedding,
+position embeddings resized bicubically for other input sizes, 12 layers
+with layer scale), a DPT neck (reassemble to four scales with 1x1 convs,
+transposed / strided convs, then fusion with pre-activation residual units
+and bilinear upsampling) and a three-conv head. `scripts/depth_reference.py`
+(NumPy) agrees within 7e-6. A 518-pixel depth map takes 3.5 s on the 2-core
+machine. `parallaxAnimation()` turns a picture and its depth into a "3D
+photo": near pixels sway and grow more than far ones (forward splatting with
+a depth test, holes filled from the farther side); the 48-frame loop above
+took 7 s including the depth map. `--depth-model` turns control pictures into
+depth maps for the depth ControlNet (`control_v11f1p_sd15_depth`), here
+redrawing the LCM fisherman as a bronze statue (4 LCM steps, 111 s).
+
 ### Upscaling: Real-ESRGAN
 
 ```
@@ -755,6 +785,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Image models | `Image.h`, `Diffusion.h` | `GroupNorm`, `SiLU`, `Upsample2D`, `Pad2D`, `ResnetBlock2D`, `SpatialSelfAttention`, PNG (read / write) and PPM files, `resizeImage` / `fitImage`, `loadVae()`, `loadTinyVae()` (TAESD), `loadClipTextEncoder()`, `ClipTokenizer`, `loadUNet()`, `multiHeadAttention()`, `EulerScheduler`, `textToImage()` / `textToLatent()` / `decodeLatent()` / `imageToImage()`, `StableDiffusion` (models kept in memory; `inpaint()`), `morphAnimation()`, `zoomAnimation()`, `outpaintZoom()`, `textToVideo()` (AnimateDiff motion modules: `loadMotionModules()`, `forwardFrames()`, windows, prompt travel, image / video to video), ControlNet (`controlEmbedding()`, `control()`), `cannyEdges()`, `transformImage()`, `EulerScheduler::lcm` |
 | Upscaling | `Upscale.h` | `Upscaler`: Real-ESRGAN compact (x2 / x4), tiled without seams |
 | Interpolation | `Interpolate.h` | `FrameInterpolator`: RIFE v4 IFNet (middle frames, 2^n x frame rate) |
+| Depth | `Depth.h` | `DepthEstimator` (Depth Anything V2), `parallaxAnimation()` (3D photo) |
 | LoRA | `Lora.h` | `LoraMerger`: kohya / A1111 and PEFT LoRA files merged into the UNet and text encoder while they load |
 | Files | `Image.h` | PNG (own inflate and deflate), animated PNG, JPEG (baseline encoder), animated GIF (median-cut palette, LZW), QuickTime Motion-JPEG `.mov`, PPM |
 | Pretrained | `Pretrained.h`, `SafeTensors.h`, `Json.h` | `loadGPT2()` (Hugging Face GPT-2 checkpoints), `loadLlama()` (Llama 3.x / TinyLlama / Llama 2 / Mistral, int8 or float32, sharded), `Gpt2Tokenizer` (byte-level BPE, identical ids), `LlamaTokenizer` (`tokenizer.json`: SentencePiece style and Llama 3 byte-level), safetensors reader (F32/F16/BF16) and writer, small JSON parser |
@@ -828,7 +859,8 @@ with them; per-frame prompts; windows; image and video to video), LoRA merging
 against the formula (kohya and PEFT names), the LCM scheduler's timesteps and
 step, inpainting (pixels outside the mask kept exactly) and the outpaint zoom,
 the Real-ESRGAN upscaler (zero head = nearest upscale, tiling exact), RIFE
-(zero heads = even blend, frame counts),
+(zero heads = even blend, frame counts), Depth Anything (native and
+interpolated position grids) and the parallax animation (first frame exact),
 ControlNet (zero convolutions change nothing, scale 0 equals no ControlNet)
 and canny edges. CI runs
 the tests, demos and benchmarks on Ubuntu and macOS (Apple silicon, both Metal

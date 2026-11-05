@@ -3517,6 +3517,108 @@ TEST(rife_frame_interpolation) {
     std::filesystem::remove(file);
 }
 
+TEST(depth_anything_and_parallax) {
+    // A tiny Depth Anything: hidden 8, 2 heads, 4 layers, 4 x 4 position grid.
+    const std::string dir = tempPath("depth_tiny");
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir + "/config.json")
+        << R"({"backbone_config":{"hidden_size":8,"num_attention_heads":2,"num_hidden_layers":4,"patch_size":14,)"
+        << R"("out_indices":[1,2,3,4]},"fusion_hidden_size":8,"head_hidden_size":4,"neck_hidden_sizes":[4,4,4,4],)"
+        << R"("patch_size":14,"reassemble_factors":[4,2,1,0.5],"reassemble_hidden_size":8})";
+    std::vector<std::pair<std::string, std::vector<std::size_t>>> t;
+    const std::string b = "backbone.";
+    t.push_back({b + "embeddings.cls_token", {1, 1, 8}});
+    t.push_back({b + "embeddings.patch_embeddings.projection.weight", {8, 3, 14, 14}});
+    t.push_back({b + "embeddings.patch_embeddings.projection.bias", {8}});
+    t.push_back({b + "embeddings.position_embeddings", {1, 17, 8}});
+    for (int i = 0; i < 4; ++i) {
+        const std::string p = b + "encoder.layer." + std::to_string(i) + ".";
+        for (const char* n : {"norm1", "norm2"}) {
+            t.push_back({p + n + ".weight", {8}});
+            t.push_back({p + n + ".bias", {8}});
+        }
+        t.push_back({p + "layer_scale1.lambda1", {8}});
+        t.push_back({p + "layer_scale2.lambda1", {8}});
+        for (const char* n : {"attention.attention.query", "attention.attention.key", "attention.attention.value", "attention.output.dense"}) {
+            t.push_back({p + n + ".weight", {8, 8}});
+            t.push_back({p + n + ".bias", {8}});
+        }
+        t.push_back({p + "mlp.fc1.weight", {32, 8}});
+        t.push_back({p + "mlp.fc1.bias", {32}});
+        t.push_back({p + "mlp.fc2.weight", {8, 32}});
+        t.push_back({p + "mlp.fc2.bias", {8}});
+    }
+    t.push_back({b + "layernorm.weight", {8}});
+    t.push_back({b + "layernorm.bias", {8}});
+    const std::size_t resize[4][3] = {{4, 4, 1}, {4, 4, 1}, {0, 0, 0}, {4, 4, 1}};
+    for (int i = 0; i < 4; ++i) {
+        const std::string p = "neck.reassemble_stage.layers." + std::to_string(i) + ".";
+        t.push_back({p + "projection.weight", {4, 8, 1, 1}});
+        t.push_back({p + "projection.bias", {4}});
+        if (i == 0) t.push_back({p + "resize.weight", {4, 4, 4, 4}});
+        if (i == 1) t.push_back({p + "resize.weight", {4, 4, 2, 2}});
+        if (i == 3) t.push_back({p + "resize.weight", {4, 4, 3, 3}});
+        if (i != 2) t.push_back({p + "resize.bias", {4}});
+        t.push_back({"neck.convs." + std::to_string(i) + ".weight", {8, 4, 3, 3}});
+        const std::string q = "neck.fusion_stage.layers." + std::to_string(i) + ".";
+        t.push_back({q + "projection.weight", {8, 8, 1, 1}});
+        t.push_back({q + "projection.bias", {8}});
+        for (const char* r : {"residual_layer1.", "residual_layer2."})
+            for (const char* c : {"convolution1", "convolution2"}) {
+                t.push_back({q + r + c + ".weight", {8, 8, 3, 3}});
+                t.push_back({q + r + c + ".bias", {8}});
+            }
+    }
+    (void)resize;
+    t.push_back({"head.conv1.weight", {4, 8, 3, 3}});
+    t.push_back({"head.conv1.bias", {4}});
+    t.push_back({"head.conv2.weight", {4, 4, 3, 3}});
+    t.push_back({"head.conv2.bias", {4}});
+    t.push_back({"head.conv3.weight", {1, 4, 1, 1}});
+    t.push_back({"head.conv3.bias", {1}});
+    std::mt19937 rng(9);
+    saveShaped(dir + "/model.safetensors", t, [&](const std::string& name, std::size_t) {
+        if (name.find("norm") != std::string::npos && name.find(".weight") != std::string::npos) return 1.0f;
+        if (name == "head.conv3.bias") return 0.5f;  // keep the ReLU output above zero somewhere
+        return (static_cast<float>(rng() % 2001) / 1000.0f - 1.0f) * 0.3f;
+    });
+    DepthEstimator de(dir);
+    // Native grid (4 x 4 patches) and an interpolated one (3 x 5).
+    std::vector<float> x(3 * 56 * 56);
+    for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::sin(0.01f * static_cast<float>(i));
+    const auto d = de.forward(x, 56, 56);
+    CHECK(d.size() == 56 * 56);
+    float mx = 0;
+    for (float v : d) {
+        CHECK(v >= 0.0f);
+        mx = std::max(mx, v);
+    }
+    CHECK(mx > 0.0f);
+    std::vector<float> y(3 * 42 * 70, 0.1f);
+    CHECK(de.forward(y, 42, 70).size() == 42 * 70);
+    CHECK_THROWS(de.forward(y, 40, 70), std::invalid_argument);
+    Image img;
+    img.width = 50;
+    img.height = 30;
+    for (std::size_t i = 0; i < 50 * 30 * 3; ++i) img.pixels.push_back(static_cast<std::uint8_t>(i * 17 % 256));
+    const auto e = de.estimate(img, 28);
+    CHECK(e.size() == 50 * 30);
+    const Image di = de.depthImage(img, 28);
+    CHECK(di.width == 50 && di.height == 30 && di.channels == 3);
+
+    // Parallax: the first frame of a loop is the picture itself; later frames move near pixels.
+    std::vector<float> depth(50 * 30);
+    for (std::size_t yy = 0; yy < 30; ++yy)
+        for (std::size_t xx = 0; xx < 50; ++xx) depth[yy * 50 + xx] = xx > 20 && xx < 30 ? 1.0f : 0.0f;  // a near stripe
+    ParallaxOptions po;
+    po.frames = 8;
+    po.amplitude = 0.1f;
+    const auto frames = parallaxAnimation(img, depth, po);
+    CHECK(frames.size() == 8 && frames[0].pixels == img.pixels && frames[2].pixels != img.pixels);
+    CHECK_THROWS(parallaxAnimation(img, std::vector<float>(10), po), std::invalid_argument);
+    std::filesystem::remove_all(dir);
+}
+
 // ---- Training robustness ------------------------------------------------------------------
 
 TEST(cosine_schedule_and_gradient_clipping) {

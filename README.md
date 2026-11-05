@@ -827,7 +827,9 @@ Two GPU paths are specific to the image models:
   with an online softmax), so the tokens × tokens score matrix — 64 MB per head
   for a 512×512 image — is never written. Head sizes that are multiples of 4 up
   to 160 (every SD 1.5 / AnimateDiff head) use it; others (the VAE's single
-  512-wide head) keep the GEMM + CPU-softmax path.
+  512-wide head) keep the GEMM + CPU-softmax path. On M1 and later, head sizes
+  divisible by 8 use a simdgroup-matrix version (34.1 against 37.8 ms on the
+  M4 for 4096 tokens; `NEURACRAFT_METAL_ATTENTION=scalar` picks the other).
 
 `bench` times both (an int8 4096-pixel × 1280 layer and 4096-token attention,
 CPU vs GPU). On the M4 the fused attention took 37.6 ms against the CPU's

@@ -995,6 +995,7 @@ int runBench(bool quick) {
     };
     timeAttention("CPU", Device::CPU);
     if (gpuAvailable()) {
+        setGpuAttentionKernel("scalar");
         timeAttention("GPU", Device::GPU);
         setGpuAttentionKernel("simdgroup");
         if (gpuAttentionKernel(40) == "simdgroup") timeAttention("GPU", Device::GPU);

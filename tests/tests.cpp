@@ -3079,6 +3079,27 @@ TEST(animatediff_motion_modules_and_text_to_video) {
     std::copy(latents.data() + n, latents.data() + 2 * n, first.data());
     const Matrix one = plain.forward(first, 500.0f, ctx);
     for (std::size_t k = 0; k < n; ++k) CHECK_NEAR(alone(1, k), one(0, k), 1e-5);
+    // Motion modules whose output projection is zero add nothing, so the batched spatial path
+    // (frames stacked through resnets, transformers and convolutions) must equal per-frame forward().
+    {
+        auto silent = tinyMotionWeights({8, 16}, 1);
+        for (auto& [name, m] : silent)
+            if (name.find("proj_out") != std::string::npos) m = Matrix(m.rows(), m.cols());
+        const std::string quiet = dir + "/motion_quiet.safetensors";
+        saveAll(quiet, silent);
+        UNet2DCondition still = loadUNet(dir, 8, 8);
+        loadMotionModules(still, quiet);
+        const Matrix batched = still.forwardFrames(latents, 500.0f, ctx);
+        float worst = 0;
+        for (std::size_t f = 0; f < F; ++f) {
+            Matrix lat(1, n);
+            std::copy(latents.data() + f * n, latents.data() + (f + 1) * n, lat.data());
+            const Matrix single = plain.forward(lat, 500.0f, ctx);
+            for (std::size_t k = 0; k < n; ++k) worst = std::max(worst, std::fabs(batched(f, k) - single(0, k)));
+        }
+        CHECK(worst < 1e-4f);
+        std::filesystem::remove(quiet);
+    }
     // With them, every frame sees the others: changing frame 0 changes frame 3.
     const Matrix mixed = unet.forwardFrames(latents, 500.0f, ctx);
     CHECK(mixed.rows() == F && mixed.cols() == n);
@@ -3748,6 +3769,36 @@ TEST(ip_adapter_image_prompts) {
     for (const std::string& d : {dir, tok, enc}) std::filesystem::remove_all(d);
 }
 
+TEST(vector_exp_erf_and_softmax_match_std) {
+    std::vector<float> x;
+    for (double v = -30; v <= 30; v += 0.00731) x.push_back(static_cast<float>(v));
+    for (float v : {-1000.0f, -105.0f, -87.0f, 0.0f, 88.0f, 89.5f, -std::numeric_limits<float>::infinity(),
+                    std::numeric_limits<float>::infinity()})
+        x.push_back(v);
+    std::vector<float> e(x.size()), r(x.size());
+    expArray(x.data(), e.data(), x.size());
+    erfArray(x.data(), r.data(), x.size());
+    double expWorst = 0, erfWorst = 0;
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        const double ref = std::exp(static_cast<double>(x[i]));
+        if (ref > 1e-37 && ref < 1e38) expWorst = std::max(expWorst, std::fabs(e[i] - ref) / ref);
+        if (std::isfinite(x[i])) erfWorst = std::max(erfWorst, std::fabs(r[i] - std::erf(static_cast<double>(x[i]))));
+    }
+    CHECK(expWorst < 2.5e-7 && erfWorst < 4e-7);
+    const std::size_t n = x.size();
+    CHECK(e[n - 8] == 0.0f && e[n - 7] == 0.0f && e[n - 2] == 0.0f);  // exp(-1000), exp(-105), exp(-inf)
+    CHECK(std::isinf(e[n - 3]) && std::isinf(e[n - 1]));                  // exp(89.5), exp(inf)
+    CHECK(r[n - 2] == -1.0f && r[n - 1] == 1.0f && r[n - 5] == 0.0f);
+    // softmaxRow: sums to one, matches the direct formula, -inf entries get exactly zero.
+    std::vector<float> row{1.0f, 2.0f, -std::numeric_limits<float>::infinity(), 0.5f, 3.0f};
+    softmaxRow(row.data(), row.size(), 0.5f);
+    double z = 0;
+    for (float v : {1.0f, 2.0f, 0.5f, 3.0f}) z += std::exp(0.5 * v);
+    CHECK_NEAR(row[1], std::exp(1.0) / z, 1e-6);
+    CHECK(row[2] == 0.0f);
+    CHECK_NEAR(row[0] + row[1] + row[3] + row[4], 1.0, 1e-6);
+}
+
 TEST(model_cache_loads_once_and_releases) {
     CHECK(!modelCaching());
     int loads = 0;
@@ -4150,6 +4201,12 @@ TEST(gpu_fused_attention_matches_cpu) {
         setDevice(Device::CPU);
         CHECK(gpu.approxEquals(cpu, 1e-4f));
         if (c.gpu) CHECK(direct.approxEquals(cpu, 1e-4f));
+        // Hybrid: CPU device, attention alone on the GPU.
+        setGpuAttention(true);
+        Matrix hybrid(c.N, c.C);
+        CHECK(gpuAttention(q, k, v, c.heads, hybrid) == c.gpu);
+        CHECK(multiHeadAttention(q, k, v, c.heads).approxEquals(cpu, 1e-4f));
+        setGpuAttention(false);
     }
     setGpuMinWork(saved);
 }

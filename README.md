@@ -830,7 +830,17 @@ Two GPU paths are specific to the image models:
   512-wide head) keep the GEMM + CPU-softmax path.
 
 `bench` times both (an int8 4096-pixel × 1280 layer and 4096-token attention,
-CPU vs GPU). Add `--profile` to any command to see where the time went — self
+CPU vs GPU). On the M4 the fused attention took 37.6 ms against the CPU's
+77.6 ms while the GEMMs were 4× faster on Accelerate, so `--gpu-attention`
+runs just the attention on the GPU and keeps everything else on the CPU.
+
+On the CPU side, AnimateDiff's spatial layers take the frames in batches
+(several frames at the low resolutions, about 2M values per batch), so int8
+layers there use the GEMM path and read their weights once per batch instead
+of once per frame; softmax, GELU and SiLU use vectorized `exp` / `erf`
+(`VectorMath.h`, within 2 ulp / 4e-7); fp16 weights are read and converted on
+every core. Float32 results are unchanged (87 dB PSNR against v1.11); a 4-frame
+256 × 256 float32 clip went from 24.8 to 18.9 s per step on the 2-core machine. Add `--profile` to any command to see where the time went — self
 time per GEMM device, int8 kernel, convolution im2col, attention, norms and
 loading:
 

@@ -1,6 +1,7 @@
 #include "Backend.h"
 #include "Profile.h"
 #include "ModelCache.h"
+#include "VectorMath.h"
 #include "Dense.h"
 #include "Diffusion.h"
 #include "Json.h"
@@ -34,7 +35,14 @@ bool exists(const std::string& path) { return static_cast<bool>(std::ifstream(pa
 void siluInPlace(Matrix& m) {
     float* x = m.data();
     parallelFor(0, m.size(), 1 << 15, [&](std::size_t i0, std::size_t i1) {
-        for (std::size_t i = i0; i < i1; ++i) x[i] = x[i] / (1.0f + std::exp(-x[i]));
+        // silu(x) = x / (1 + exp(-x)), exp through expArray in blocks.
+        float e[256];
+        for (std::size_t b = i0; b < i1; b += 256) {
+            const std::size_t n = std::min<std::size_t>(256, i1 - b);
+            for (std::size_t k = 0; k < n; ++k) e[k] = -x[b + k];
+            expArray(e, e, n);
+            for (std::size_t k = 0; k < n; ++k) x[b + k] /= 1.0f + e[k];
+        }
     });
 }
 
@@ -47,11 +55,40 @@ void addInPlace(Matrix& a, const Matrix& b) {
     });
 }
 
-// (C x HW) channel-major row <-> (HW x C) token rows.
-Matrix toTokens(const Matrix& x, std::size_t C, std::size_t HW) { return Matrix(C, HW, std::vector<float>(x.data(), x.data() + C * HW)).transpose(); }
-Matrix fromTokens(const Matrix& t) {
-    const Matrix chw = t.transpose();
-    return Matrix(1, chw.size(), std::vector<float>(chw.data(), chw.data() + chw.size()));
+// B images of (C x HW) channel-major rows <-> (B*HW x C) token rows, image after image.
+Matrix toTokens(const Matrix& x, std::size_t C, std::size_t HW) {
+    const std::size_t B = x.rows();
+    Matrix t(B * HW, C);
+    parallelFor(0, B * HW, 64, [&](std::size_t r0, std::size_t r1) {
+        for (std::size_t r = r0; r < r1; ++r) {
+            const float* src = x.data() + (r / HW) * x.cols() + r % HW;
+            float* dst = t.data() + r * C;
+            for (std::size_t c = 0; c < C; ++c) dst[c] = src[c * HW];
+        }
+    });
+    return t;
+}
+Matrix fromTokens(const Matrix& t, std::size_t HW) {
+    const std::size_t C = t.cols(), B = t.rows() / HW;
+    Matrix x(B, C * HW);
+    parallelFor(0, B * C, 8, [&](std::size_t i0, std::size_t i1) {
+        for (std::size_t i = i0; i < i1; ++i) {
+            const std::size_t b = i / C, c = i % C;
+            float* dst = x.data() + b * x.cols() + c * HW;
+            const float* src = t.data() + b * HW * C + c;
+            for (std::size_t p = 0; p < HW; ++p) dst[p] = src[p * C];
+        }
+    });
+    return x;
+}
+// Rows r0 .. r0 + n - 1 of m as a matrix, and back.
+Matrix rowBlock(const Matrix& m, std::size_t r0, std::size_t n) {
+    Matrix out(n, m.cols());
+    std::copy(m.data() + r0 * m.cols(), m.data() + (r0 + n) * m.cols(), out.data());
+    return out;
+}
+void setRowBlock(Matrix& m, std::size_t r0, const Matrix& block) {
+    std::copy(block.data(), block.data() + block.size(), m.data() + r0 * m.cols());
 }
 } // namespace
 
@@ -72,15 +109,7 @@ Matrix multiHeadAttention(const Matrix& q, const Matrix& k, const Matrix& v, std
             // scores = Q_h K_h^T (rows x M)
             gemm(false, true, rows, M, dh, q.data() + q0 * C + h * dh, C, k.data() + h * dh, C, scores.data(), M, false);
             parallelFor(0, rows, 4, [&](std::size_t r0, std::size_t r1) {
-                for (std::size_t r = r0; r < r1; ++r) {
-                    float* s = scores.data() + r * M;
-                    float m = -std::numeric_limits<float>::infinity();
-                    for (std::size_t j = 0; j < M; ++j) m = std::max(m, s[j] *= scale);
-                    float sum = 0.0f;
-                    for (std::size_t j = 0; j < M; ++j) sum += s[j] = std::exp(s[j] - m);
-                    const float inv = 1.0f / sum;
-                    for (std::size_t j = 0; j < M; ++j) s[j] *= inv;
-                }
+                for (std::size_t r = r0; r < r1; ++r) softmaxRow(scores.data() + r * M, M, scale);
             });
             // out[q0.., h] = scores V_h
             gemm(false, false, rows, dh, M, scores.data(), M, v.data() + h * dh, C, out.data() + q0 * C + h * dh, C, false);
@@ -169,12 +198,12 @@ struct TimeResnet {
         Matrix h = n1.forward(x, false);
         siluInPlace(h);
         h = c1.forward(h, false);
-        const Matrix t = temb.forward(tembAct, false);
+        const Matrix t = temb.forward(tembAct, false);  // the same for every image of the batch
         const std::size_t HW = in.height * in.width;
-        parallelFor(0, out, 8, [&](std::size_t c0, std::size_t c1_) {
-            for (std::size_t c = c0; c < c1_; ++c) {
-                float* plane = h.data() + c * HW;
-                const float add = t(0, c);
+        parallelFor(0, h.rows() * out, 8, [&](std::size_t i0, std::size_t i1) {
+            for (std::size_t i = i0; i < i1; ++i) {
+                float* plane = h.data() + (i / out) * h.cols() + (i % out) * HW;
+                const float add = t(0, i % out);
                 for (std::size_t p = 0; p < HW; ++p) plane[p] += add;
             }
         });
@@ -227,16 +256,38 @@ struct CrossTransformer {
         w.linear(ff1, b + ".ff.net.0.proj");
         w.linear(ff2, b + ".ff.net.2");
     }
-    Matrix forward(const Matrix& x, const Matrix& context) {
+    Matrix forward(const Matrix& x, const Matrix& context) { return forward(x, std::vector<const Matrix*>{&context}); }
+    // x: B images (rows), each attending to its own context (contexts.size() == B) or all to one. The
+    // linear layers see all B * HW tokens at once; attention stays within each image.
+    Matrix forward(const Matrix& x, const std::vector<const Matrix*>& contexts) {
         NC_PROFILE("unet transformer (norms)");
-        const std::size_t C = shape.channels, HW = shape.height * shape.width;
-        Matrix h = projIn.forward(toTokens(norm.forward(x, false), C, HW), false);  // HW x C
+        const std::size_t C = shape.channels, HW = shape.height * shape.width, B = x.rows();
+        if (contexts.size() != 1 && contexts.size() != B) throw std::invalid_argument("CrossTransformer: one context per image, or one");
+        Matrix h = projIn.forward(toTokens(norm.forward(x, false), C, HW), false);  // B*HW x C
         Matrix a = ln1.forward(h, false);
-        addInPlace(h, o1.forward(multiHeadAttention(q1.forward(a, false), k1.forward(a, false), v1.forward(a, false), heads), false));
+        {
+            const Matrix q = q1.forward(a, false), k = k1.forward(a, false), v = v1.forward(a, false);
+            if (B == 1) {
+                addInPlace(h, o1.forward(multiHeadAttention(q, k, v, heads), false));
+            } else {
+                Matrix att(B * HW, C);
+                for (std::size_t b = 0; b < B; ++b)
+                    setRowBlock(att, b * HW, multiHeadAttention(rowBlock(q, b * HW, HW), rowBlock(k, b * HW, HW), rowBlock(v, b * HW, HW), heads));
+                addInPlace(h, o1.forward(att, false));
+            }
+        }
         a = ln2.forward(h, false);
         {
             const Matrix q = q2.forward(a, false);
-            Matrix att = multiHeadAttention(q, k2.forward(context, false), v2.forward(context, false), heads);
+            Matrix att;
+            if (contexts.size() == 1) {  // every query row attends to the same keys: one call for the batch
+                att = multiHeadAttention(q, k2.forward(*contexts[0], false), v2.forward(*contexts[0], false), heads);
+            } else {
+                att = Matrix(B * HW, C);
+                for (std::size_t b = 0; b < B; ++b)
+                    setRowBlock(att, b * HW, multiHeadAttention(rowBlock(q, b * HW, HW), k2.forward(*contexts[b], false),
+                                                                v2.forward(*contexts[b], false), heads));
+            }
             if (kIp && ipTokens && ipScale != 0.0f) {
                 const Matrix ip = multiHeadAttention(q, kIp->forward(*ipTokens, false), vIp->forward(*ipTokens, false), heads);
                 for (std::size_t k = 0; k < att.size(); ++k) att.data()[k] += ipScale * ip.data()[k];
@@ -244,20 +295,20 @@ struct CrossTransformer {
             addInPlace(h, o2.forward(att, false));
         }
         a = ln3.forward(h, false);
-        const Matrix g = ff1.forward(a, false);  // HW x 8C: [hidden | gate]
-        Matrix geglu(HW, 4 * C);
-        parallelFor(0, HW, 16, [&](std::size_t r0, std::size_t r1) {
+        const Matrix g = ff1.forward(a, false);  // B*HW x 8C: [hidden | gate]
+        Matrix geglu(B * HW, 4 * C);
+        parallelFor(0, B * HW, 16, [&](std::size_t r0, std::size_t r1) {
             for (std::size_t r = r0; r < r1; ++r) {
                 const float* row = g.data() + r * 8 * C;
                 float* o = geglu.data() + r * 4 * C;
-                for (std::size_t j = 0; j < 4 * C; ++j) {
-                    const float gate = row[4 * C + j];
-                    o[j] = row[j] * 0.5f * gate * (1.0f + std::erf(gate * 0.70710678118654752f));
-                }
+                const float* gate = row + 4 * C;
+                for (std::size_t j = 0; j < 4 * C; ++j) o[j] = gate[j] * 0.70710678118654752f;
+                erfArray(o, o, 4 * C);  // GELU(gate) = gate * (1 + erf(gate / sqrt 2)) / 2
+                for (std::size_t j = 0; j < 4 * C; ++j) o[j] = row[j] * 0.5f * gate[j] * (1.0f + o[j]);
             }
         });
         addInPlace(h, ff2.forward(geglu, false));
-        Matrix out = fromTokens(projOut.forward(h, false));
+        Matrix out = fromTokens(projOut.forward(h, false), HW);
         addInPlace(out, x);
         return out;
     }
@@ -407,10 +458,10 @@ struct TemporalTransformer {
                 for (std::size_t r = r0; r < r1; ++r) {
                     const float* row = g.data() + r * 8 * C;
                     float* o = geglu.data() + r * 4 * C;
-                    for (std::size_t j = 0; j < 4 * C; ++j) {
-                        const float gate = row[4 * C + j];
-                        o[j] = row[j] * 0.5f * gate * (1.0f + std::erf(gate * 0.70710678118654752f));
-                    }
+                    const float* gate = row + 4 * C;
+                    for (std::size_t j = 0; j < 4 * C; ++j) o[j] = gate[j] * 0.70710678118654752f;
+                    erfArray(o, o, 4 * C);  // GELU(gate) = gate * (1 + erf(gate / sqrt 2)) / 2
+                    for (std::size_t j = 0; j < 4 * C; ++j) o[j] = row[j] * 0.5f * gate[j] * (1.0f + o[j]);
                 }
             });
             addInPlace(h, ff2.forward(geglu, false));
@@ -440,10 +491,14 @@ struct UpBlock {
     std::unique_ptr<Conv2D> upConv;
 };
 
+// Row by row (one image per row): [a's channels | b's channels].
 Matrix concatChannels(const Matrix& a, const Matrix& b) {
-    Matrix out(1, a.size() + b.size());
-    std::copy(a.data(), a.data() + a.size(), out.data());
-    std::copy(b.data(), b.data() + b.size(), out.data() + a.size());
+    if (a.rows() != b.rows()) throw std::logic_error("concatChannels: batch sizes differ");
+    Matrix out(a.rows(), a.cols() + b.cols());
+    for (std::size_t r = 0; r < a.rows(); ++r) {
+        std::copy(a.data() + r * a.cols(), a.data() + (r + 1) * a.cols(), out.data() + r * out.cols());
+        std::copy(b.data() + r * b.cols(), b.data() + (r + 1) * b.cols(), out.data() + r * out.cols() + a.cols());
+    }
     return out;
 }
 } // namespace
@@ -534,18 +589,38 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
     temb = m.t2->forward(temb, false);
     siluInPlace(temb);
 
+    // Spatial layers take the frames in batches of about 2M values (several frames at the low
+    // resolutions), so their products have enough rows for the GEMM path and weights are read
+    // once per batch instead of once per frame.
     std::vector<Matrix> h(F);
-    for (std::size_t f = 0; f < F; ++f) {
-        Matrix one(1, m.latent.size());
-        std::copy(latents.data() + f * one.size(), latents.data() + (f + 1) * one.size(), one.data());
-        h[f] = m.convIn->forward(one, false);
+    auto batches = [&](std::size_t cols, auto&& fn) {  // fn(first frame, count)
+        const std::size_t g = std::max<std::size_t>(1, std::min(F, (std::size_t(1) << 21) / std::max<std::size_t>(1, cols)));
+        for (std::size_t f0 = 0; f0 < F; f0 += g) fn(f0, std::min(g, F - f0));
+    };
+    auto stack = [&](const std::vector<Matrix>& xs, std::size_t f0, std::size_t n) {
+        Matrix b(n, xs[f0].cols());
+        for (std::size_t i = 0; i < n; ++i) setRowBlock(b, i, xs[f0 + i]);
+        return b;
+    };
+    auto unstack = [&](const Matrix& y, std::size_t f0, std::size_t n) {
+        for (std::size_t i = 0; i < n; ++i) h[f0 + i] = rowBlock(y, i, 1);
+    };
+    auto each = [&](auto&& fn) {
+        batches(h[0].cols(), [&](std::size_t f0, std::size_t n) { unstack(fn(stack(h, f0, n)), f0, n); });
+    };
+    {
+        const Matrix all(F, m.latent.size(), FloatVector(latents.data(), latents.data() + F * m.latent.size()));
+        batches(all.cols(), [&](std::size_t f0, std::size_t n) { unstack(m.convIn->forward(rowBlock(all, f0, n), false), f0, n); });
     }
     std::vector<std::vector<Matrix>> skips{h};
-    auto each = [&](auto&& fn) {
-        for (Matrix& x : h) x = fn(x);
-    };
     auto attend = [&](CrossTransformer& a) {
-        for (std::size_t f = 0; f < F; ++f) h[f] = a.forward(h[f], ctx(f));
+        batches(h[0].cols(), [&](std::size_t f0, std::size_t n) {
+            std::vector<const Matrix*> c;
+            if (contexts.size() == 1) c.push_back(&contexts[0]);
+            else
+                for (std::size_t i = 0; i < n; ++i) c.push_back(&ctx(f0 + i));
+            unstack(a.forward(stack(h, f0, n), c), f0, n);
+        });
     };
     for (auto& d : m.downs) {
         for (std::size_t j = 0; j < d.resnets.size(); ++j) {
@@ -573,19 +648,22 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
     for (auto& u : m.ups) {
         for (std::size_t j = 0; j < u.resnets.size(); ++j) {
             std::vector<Matrix>& s = skips.back();
-            for (std::size_t f = 0; f < F; ++f) h[f] = u.resnets[j]->forward(concatChannels(h[f], s[f]), temb);
+            batches(h[0].cols() + s[0].cols(), [&](std::size_t f0, std::size_t n) {
+                unstack(u.resnets[j]->forward(concatChannels(stack(h, f0, n), stack(s, f0, n)), temb), f0, n);
+            });
             skips.pop_back();
             if (!u.attentions.empty()) attend(*u.attentions[j]);
             u.motions[j]->forward(h);
         }
         if (u.upsample) each([&](const Matrix& x) { return u.upConv->forward(u.upsample->forward(x, false), false); });
     }
-    for (std::size_t f = 0; f < F; ++f) {
-        Matrix x = m.normOut->forward(h[f], false);
+    batches(h[0].cols(), [&](std::size_t f0, std::size_t n) {
+        Matrix x = m.normOut->forward(stack(h, f0, n), false);
         siluInPlace(x);
         x = m.convOut->forward(x, false);
-        std::copy(x.data(), x.data() + x.size(), out.data() + f * x.size());
-    }
+        if (x.cols() != out.cols()) throw std::logic_error("forwardFrames: output size");
+        std::copy(x.data(), x.data() + x.size(), out.data() + f0 * out.cols());
+    });
     return out;
 }
 

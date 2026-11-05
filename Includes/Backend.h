@@ -49,6 +49,12 @@ void matmul(const Matrix& a, bool transA, const Matrix& b, bool transB, Matrix& 
 // untouched) when the GPU is not active, the head size is not supported (a
 // multiple of 4 up to 160) or the work is below gpuMinWork().
 bool gpuAttention(const Matrix& q, const Matrix& k, const Matrix& v, std::size_t heads, Matrix& out);
+// Fused attention on the GPU while everything else stays on the active device
+// (`--gpu-attention`): on Apple silicon the CPU's Accelerate GEMMs beat the
+// Metal GEMM, but the fused attention kernel beats the CPU's GEMM + softmax.
+// No effect without a GPU.
+void setGpuAttention(bool enabled);
+bool gpuAttentionEnabled();
 
 // Vectorized dot product of two float arrays.
 float dot(const float* a, const float* b, std::size_t n);

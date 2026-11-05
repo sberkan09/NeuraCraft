@@ -26,7 +26,7 @@
 //                              Stable Diffusion VAE round trip (scripts/download_sd_turbo.sh)
 //   NeuraCraft bench [--quick] matrix-multiply throughput of each backend
 //
-// Global options: --gpu (Metal on Apple silicon), --threads N, --profile
+// Global options: --gpu (Metal on Apple silicon), --gpu-attention, --threads N, --profile
 
 #include "NeuraCraft.h"
 
@@ -1043,6 +1043,7 @@ void usage() {
               << "options:\n"
               << "  --gpu          run large matrix products on the GPU (Metal)\n"
               << "  --threads N    number of CPU threads (default: all cores)\n"
+              << "  --gpu-attention  fused attention on the GPU, everything else on the CPU (best on Apple silicon)\n"
               << "  --profile      print where the time went (GEMMs, int8, convolutions, attention, ...)\n";
 }
 
@@ -1070,6 +1071,9 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--gpu") {
             wantGpu = true;
+        } else if (a == "--gpu-attention") {
+            setGpuAttention(true);
+            if (!gpuAttentionEnabled()) std::cerr << "warning: no GPU available, --gpu-attention ignored\n";
         } else if (a == "--profile") {
             setProfiling(true);
         } else if (a == "--threads") {
@@ -1085,7 +1089,7 @@ int main(int argc, char** argv) {
     if (wantGpu && !setDevice(Device::GPU)) {
         std::cerr << "warning: no GPU available in this build/machine, using the CPU\n";
     }
-    std::cout << "device: " << deviceDescription() << '\n';
+    std::cout << "device: " << deviceDescription() << (gpuAttentionEnabled() && currentDevice() != Device::GPU ? " + GPU attention" : "") << '\n';
 
     const std::string cmd = args.empty() ? "all" : args[0];
     // --profile: where the time went, printed however the command ends.

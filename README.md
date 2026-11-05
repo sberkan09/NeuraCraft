@@ -793,7 +793,7 @@ fused-attention kernels):
 
 GPU and CPU pictures were identical, and int8 against float32 was 33.9 dB
 PSNR. On Apple silicon, **stay on the CPU** (the default): Accelerate runs on
-the AMX units at about 1 TFLOPS even for small products, while the Metal path
+the AMX units at about 1–2 TFLOPS, while the Metal path
 does one synchronous GPU round trip per product with the norms, softmax and
 im2col on the CPU in between. The GPU only wins once a whole UNet pass stays
 on the GPU, which is the direction of the Metal work.
@@ -831,8 +831,11 @@ Two GPU paths are specific to the image models:
 
 `bench` times both (an int8 4096-pixel × 1280 layer and 4096-token attention,
 CPU vs GPU). On the M4 the fused attention took 37.6 ms against the CPU's
-77.6 ms while the GEMMs were 4× faster on Accelerate, so `--gpu-attention`
-runs just the attention on the GPU and keeps everything else on the CPU.
+77.6 ms while the GEMMs were 4× faster on Accelerate, so the command-line
+tool runs just the attention on the GPU and everything else on the CPU
+whenever there is a GPU (`--cpu-attention` keeps it on the CPU; in the
+library, `setGpuAttention(true)`). On the M4 that took a 16-frame 512 × 512
+AnimateDiff-Lightning clip from 21.6 to 18.6 s per step (99 → 89 s in all).
 
 On the CPU side, AnimateDiff's spatial layers take the frames in batches
 (several frames at the low resolutions, about 2M values per batch), so int8

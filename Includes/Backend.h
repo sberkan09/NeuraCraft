@@ -43,6 +43,13 @@ void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
 // matrices (Matrix::pageBacked) are mapped in place instead of copied.
 void matmul(const Matrix& a, bool transA, const Matrix& b, bool transB, Matrix& c);
 
+// Multi-head attention on the GPU: out = softmax(Q_h K_h^T / sqrt(dh)) V_h for
+// each head h (dh = C / heads), fused so the score matrix is never stored.
+// Q is N x C, K and V are M x C; out must be N x C. Returns false (out
+// untouched) when the GPU is not active, the head size is not supported (a
+// multiple of 4 up to 160) or the work is below gpuMinWork().
+bool gpuAttention(const Matrix& q, const Matrix& k, const Matrix& v, std::size_t heads, Matrix& out);
+
 // Vectorized dot product of two float arrays.
 float dot(const float* a, const float* b, std::size_t n);
 

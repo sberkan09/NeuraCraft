@@ -4077,6 +4077,30 @@ TEST(gpu_int8_products_match_cpu) {
     setGpuMinWork(saved);
 }
 
+TEST(gpu_fused_attention_matches_cpu) {
+    if (!gpuAvailable()) return;
+    setSeed(91);
+    const std::size_t saved = gpuMinWork();
+    setGpuMinWork(1);
+    struct Case { std::size_t N, M, C, heads; bool gpu; };
+    // Self- and cross-attention shapes of the UNet (head size 40 / 80 / 160), a ragged key count,
+    // a 64-wide head, and a 512-wide one (VAE) that stays on the CPU.
+    for (const Case& c : {Case{300, 300, 320, 8, true}, Case{257, 77, 640, 8, true}, Case{100, 33, 320, 2, true},
+                          Case{70, 129, 320, 5, true}, Case{64, 64, 512, 1, false}}) {
+        const Matrix q = Matrix::uniform(c.N, c.C, -2, 2), k = Matrix::uniform(c.M, c.C, -2, 2), v = Matrix::uniform(c.M, c.C, -1, 1);
+        setDevice(Device::CPU);
+        const Matrix cpu = multiHeadAttention(q, k, v, c.heads);
+        setDevice(Device::GPU);
+        Matrix direct(c.N, c.C);
+        CHECK(gpuAttention(q, k, v, c.heads, direct) == c.gpu);
+        const Matrix gpu = multiHeadAttention(q, k, v, c.heads);
+        setDevice(Device::CPU);
+        CHECK(gpu.approxEquals(cpu, 1e-4f));
+        if (c.gpu) CHECK(direct.approxEquals(cpu, 1e-4f));
+    }
+    setGpuMinWork(saved);
+}
+
 TEST(matrix_products_independent_of_thread_count) {
     setSeed(13);
     const Matrix a = Matrix::uniform(97, 150, -1, 1), b = Matrix::uniform(150, 61, -1, 1);

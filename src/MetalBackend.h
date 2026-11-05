@@ -30,6 +30,13 @@ void gemmQ8(bool quantLeft, std::size_t M, std::size_t N, std::size_t K,
             std::size_t groupsPerRow, std::size_t group, const float* x, std::size_t ldx, std::size_t xMapBytes,
             float* C, std::size_t ldc, std::size_t cMapBytes);
 
+// out (N x C) = softmax(Q K^T / sqrt(C / heads)) V for each head (columns
+// h*dh .. h*dh+dh-1); Q is N x C, K and V are M x C, all dense row-major.
+bool attentionSupported(std::size_t headSize);
+void attention(std::size_t N, std::size_t M, std::size_t C, std::size_t heads, const float* q, std::size_t qMapBytes,
+               const float* k, std::size_t kMapBytes, const float* v, std::size_t vMapBytes, float* out,
+               std::size_t outMapBytes);
+
 } // namespace metal
 } // namespace nc
 

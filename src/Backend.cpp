@@ -259,6 +259,22 @@ void gemmBlocked(bool transA, bool transB, std::size_t M, std::size_t N, std::si
 
 float dot(const float* a, const float* b, std::size_t n) { return dotProduct(a, b, n); }
 
+bool gpuAttention(const Matrix& q, const Matrix& k, const Matrix& v, std::size_t heads, Matrix& out) {
+#ifdef NEURACRAFT_HAS_METAL
+    const std::size_t N = q.rows(), M = k.rows(), C = q.cols();
+    if (currentDevice() != Device::GPU || heads == 0 || C % heads != 0 || M == 0 || N == 0) return false;
+    if (k.cols() != C || v.cols() != C || v.rows() != M || out.rows() != N || out.cols() != C) return false;
+    if (2 * N * M * C < gpuMinWork() || !metal::attentionSupported(C / heads)) return false;
+    NC_PROFILE("attention gpu");
+    auto map = [](const Matrix& m) { return m.pageBacked() ? m.storageBytes() : std::size_t(0); };
+    metal::attention(N, M, C, heads, q.data(), map(q), k.data(), map(k), v.data(), map(v), out.data(), map(out));
+    return true;
+#else
+    (void)q; (void)k; (void)v; (void)heads; (void)out;
+    return false;
+#endif
+}
+
 bool gpuAvailable() {
 #ifdef NEURACRAFT_HAS_METAL
     return metal::available();

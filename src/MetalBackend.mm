@@ -6,10 +6,12 @@
 
 #include "MetalBackend.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -321,6 +323,84 @@ kernel void gemm_q8_simd(device const char* Q [[buffer(0)]],
 }
 )METAL";
 
+// Fused multi-head attention, flash-attention style: per head, blocks of 32
+// query rows stream the keys and values through threadgroup memory 16 at a
+// time with an online softmax, so the (queries x keys) score matrix never
+// exists. Four threads share a query row, each holding a quarter of its head
+// dimensions; DQ (= head size / 4) is a function constant so loops unroll.
+const char* const kAttentionSource = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct AttnParams { uint N; uint M; uint C; uint dh; float scale; };
+constant uint DQ [[function_constant(0)]];
+
+#define BR 32
+#define BC 16
+#define DMAX 160
+#define DPT 40
+
+kernel void attention_flash(device const float* Q [[buffer(0)]],
+                            device const float* K [[buffer(1)]],
+                            device const float* V [[buffer(2)]],
+                            device float* O [[buffer(3)]],
+                            constant AttnParams& p [[buffer(4)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
+                            uint tidx [[thread_index_in_threadgroup]]) {
+    threadgroup float Ks[BC * DMAX];
+    threadgroup float Vs[BC * DMAX];
+    const uint base = tg.y * p.dh;
+    const uint row = tg.x * BR + tidx / 4;
+    const uint e0 = (tidx % 4) * DQ;
+    const bool live = row < p.N;
+
+    float q[DPT], o[DPT];
+    for (uint e = 0; e < DQ; ++e) {
+        q[e] = live ? Q[ulong(row) * p.C + base + e0 + e] * p.scale : 0.0f;
+        o[e] = 0.0f;
+    }
+    float m = -1e30f, l = 0.0f;  // finite: Metal compiles with fast math
+
+    for (uint j0 = 0; j0 < p.M; j0 += BC) {
+        const uint nk = min(uint(BC), p.M - j0);
+        for (uint t = tidx; t < BC * p.dh; t += 128) {
+            const uint j = t / p.dh, e = t % p.dh;
+            const bool in = j < nk;
+            Ks[j * DMAX + e] = in ? K[ulong(j0 + j) * p.C + base + e] : 0.0f;
+            Vs[j * DMAX + e] = in ? V[ulong(j0 + j) * p.C + base + e] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float s[BC];
+        float mt = m;
+        for (uint j = 0; j < BC; ++j) {
+            float d = 0.0f;
+            for (uint e = 0; e < DQ; ++e) d = fma(q[e], Ks[j * DMAX + e0 + e], d);
+            d += simd_shuffle_xor(d, ushort(1));
+            d += simd_shuffle_xor(d, ushort(2));
+            s[j] = j < nk ? d : -1e30f;
+            mt = max(mt, s[j]);
+        }
+        const float corr = exp(m - mt);
+        l *= corr;
+        for (uint e = 0; e < DQ; ++e) o[e] *= corr;
+        for (uint j = 0; j < BC; ++j) {
+            if (j >= nk) break;
+            const float pj = exp(s[j] - mt);
+            l += pj;
+            for (uint e = 0; e < DQ; ++e) o[e] = fma(pj, Vs[j * DMAX + e0 + e], o[e]);
+        }
+        m = mt;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (live) {
+        const float inv = 1.0f / l;
+        for (uint e = 0; e < DQ; ++e) O[ulong(row) * p.C + base + e0 + e] = o[e] * inv;
+    }
+}
+)METAL";
+
 struct GemmParams {
     std::uint32_t M, N, K, lda, ldb, ldc, transA, transB, accumulate;
 };
@@ -335,6 +415,9 @@ struct Context {
     std::string name;
     std::string error;
     std::string q8Error;
+    id<MTLLibrary> attentionLib = nil;  // attention_flash, specialized per head size
+    std::map<unsigned, id<MTLComputePipelineState>> attention;
+    std::mutex attentionMutex;
     bool ok = false;
 };
 
@@ -433,6 +516,34 @@ id<MTLBuffer> inputBuffer(Context& ctx, const void* p, std::size_t bytes, std::s
 struct Q8Params {
     std::uint32_t M, N, K, ldx, ldc, gpr, group, quantLeft;
 };
+
+struct AttnParams {
+    std::uint32_t N, M, C, dh;
+    float scale;
+};
+
+// The attention pipeline for one head size (built on first use), or nil.
+id<MTLComputePipelineState> attentionPipeline(Context& ctx, unsigned dh) {
+    std::lock_guard<std::mutex> lock(ctx.attentionMutex);
+    auto it = ctx.attention.find(dh);
+    if (it != ctx.attention.end()) return it->second;
+    id<MTLComputePipelineState> pipe = nil;
+    @autoreleasepool {
+        NSError* err = nil;
+        if (ctx.attentionLib == nil)
+            ctx.attentionLib = [ctx.device newLibraryWithSource:[NSString stringWithUTF8String:kAttentionSource] options:nil error:&err];
+        if (ctx.attentionLib != nil) {
+            MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
+            const std::uint32_t dq = dh / 4;
+            [values setConstantValue:&dq type:MTLDataTypeUInt atIndex:0];
+            id<MTLFunction> fn = [ctx.attentionLib newFunctionWithName:@"attention_flash" constantValues:values error:&err];
+            if (fn) pipe = [ctx.device newComputePipelineStateWithFunction:fn error:&err];
+            if (pipe != nil && [pipe maxTotalThreadsPerThreadgroup] < 128) pipe = nil;
+        }
+    }
+    ctx.attention[dh] = pipe;
+    return pipe;
+}
 
 } // namespace
 
@@ -592,6 +703,64 @@ void gemmQ8(bool quantLeft, std::size_t M, std::size_t N, std::size_t K,
         }
     }
     if (!failure.empty()) throw std::runtime_error("Metal gemmQ8: " + failure);
+}
+
+bool attentionSupported(std::size_t headSize) {
+    Context& ctx = context();
+    return ctx.ok && headSize > 0 && headSize % 4 == 0 && headSize <= 160 && attentionPipeline(ctx, static_cast<unsigned>(headSize)) != nil;
+}
+
+void attention(std::size_t N, std::size_t M, std::size_t C, std::size_t heads, const float* q, std::size_t qMapBytes,
+               const float* k, std::size_t kMapBytes, const float* v, std::size_t vMapBytes, float* out,
+               std::size_t outMapBytes) {
+    Context& ctx = context();
+    if (!ctx.ok) throw std::runtime_error("Metal unavailable: " + ctx.error);
+    if (heads == 0 || C % heads != 0) throw std::invalid_argument("Metal attention: heads must divide the width");
+    const std::size_t dh = C / heads;
+    id<MTLComputePipelineState> pipe = attentionSupported(dh) ? attentionPipeline(ctx, static_cast<unsigned>(dh)) : nil;
+    if (pipe == nil) throw std::runtime_error("Metal attention: head size " + std::to_string(dh) + " not supported");
+    if (N == 0) return;
+    if (M == 0) throw std::invalid_argument("Metal attention: no keys");
+
+    AttnParams params{to32(N), to32(M), to32(C), to32(dh), 1.0f / std::sqrt(static_cast<float>(dh))};
+    const std::size_t qBytes = N * C * sizeof(float), kvBytes = M * C * sizeof(float);
+    std::string failure;
+    @autoreleasepool {
+        id<MTLBuffer> bufQ = inputBuffer(ctx, q, qBytes, qMapBytes);
+        id<MTLBuffer> bufK = inputBuffer(ctx, k, kvBytes, kMapBytes);
+        id<MTLBuffer> bufV = inputBuffer(ctx, v, kvBytes, vMapBytes);
+        id<MTLBuffer> bufO = nil;
+        bool inPlace = false;
+        if (outMapBytes >= qBytes && outMapBytes > 0) {
+            bufO = [ctx.device newBufferWithBytesNoCopy:out length:outMapBytes options:MTLResourceStorageModeShared deallocator:nil];
+            inPlace = bufO != nil;
+        }
+        if (!inPlace) bufO = [ctx.device newBufferWithLength:qBytes options:MTLResourceStorageModeShared];
+        if (bufQ == nil || bufK == nil || bufV == nil || bufO == nil) {
+            failure = "could not allocate GPU buffers";
+        } else {
+            id<MTLCommandBuffer> cb = [ctx.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pipe];
+            [enc setBuffer:bufQ offset:0 atIndex:0];
+            [enc setBuffer:bufK offset:0 atIndex:1];
+            [enc setBuffer:bufV offset:0 atIndex:2];
+            [enc setBuffer:bufO offset:0 atIndex:3];
+            [enc setBytes:&params length:sizeof(params) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((N + 31) / 32, heads, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb status] == MTLCommandBufferStatusError) {
+                NSError* err = [cb error];
+                failure = std::string("command buffer failed: ") +
+                          (err ? [[err localizedDescription] UTF8String] : "unknown error");
+            } else if (!inPlace) {
+                std::memcpy(out, [bufO contents], qBytes);
+            }
+        }
+    }
+    if (!failure.empty()) throw std::runtime_error("Metal attention: " + failure);
 }
 
 } // namespace metal

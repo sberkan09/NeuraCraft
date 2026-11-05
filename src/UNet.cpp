@@ -62,6 +62,7 @@ Matrix multiHeadAttention(const Matrix& q, const Matrix& k, const Matrix& v, std
     const std::size_t dh = C / heads;
     const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
     Matrix out(N, C);
+    if (gpuAttention(q, k, v, heads, out)) return out;
     const std::size_t chunk = std::max<std::size_t>(1, std::min(N, (std::size_t(1) << 22) / std::max<std::size_t>(1, M)));
     std::vector<float> scores(chunk * M);
     for (std::size_t h = 0; h < heads; ++h)

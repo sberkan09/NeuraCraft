@@ -139,6 +139,7 @@ TextToImageOptions imageOptions(const Step& s) {
         o.preview = s.progress->previewCallback();
     }
     o.tinyVae = s.path("tiny_vae");
+    o.vae = s.path("vae");
     const std::string model = s.path("model");
     if (o.tinyVae.empty() && std::filesystem::exists(model + "/taesd/config.json")) o.tinyVae = model + "/taesd";
     if (s.has("controlnet")) {
@@ -169,6 +170,7 @@ std::set<std::string> modelsUsed(const Step& s) {
         std::string tiny = s.path("tiny_vae");
         if (tiny.empty() && std::filesystem::exists(model + "/taesd/config.json")) tiny = model + "/taesd";
         if (!tiny.empty()) out.insert(modelTag(tiny, w, h));
+        if (s.has("vae")) out.insert(modelTag(s.path("vae"), w, h));
         if (s.has("controlnet")) out.insert(modelTag(s.path("controlnet"), w, h));
         if (s.has("ip_adapter")) {
             const std::string ip = s.path("ip_adapter");
@@ -493,6 +495,7 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
             o.progress = io.progress;
             o.preview = io.preview;
             o.tinyVae = io.tinyVae;
+            o.vae = io.vae;
             o.int8 = io.int8;
             o.loras = io.loras;
             o.sampler = io.sampler;

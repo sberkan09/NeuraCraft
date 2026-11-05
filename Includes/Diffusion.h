@@ -194,6 +194,7 @@ struct TextToImageOptions {
     float guidance = 0.0f;                  // classifier-free guidance scale; <= 1 = off (SD-Turbo)
     std::string negativePrompt;             // used with guidance > 1
     std::string tinyVae;                    // TAESD directory: decode with it instead of the full VAE
+    std::string vae;                        // another VAE (a diffusers VAE folder, a model, or a VAE .safetensors); "" = the model's
     bool int8 = true;                       // int8 UNet and text encoder weights (false: float32)
     std::string sampler = "euler";          // "euler", or "lcm" for LCM models / LCM-LoRA (4 to 8 steps, guidance 1)
     float strength = 0.5f;                  // image to image: how much of the schedule runs (0 keeps the input)
@@ -377,6 +378,7 @@ struct TextToVideoOptions {
     std::string negativePrompt;
     std::string motion;                     // motion adapter file; empty: the one .safetensors in DIR/motion
     std::string tinyVae;                    // TAESD directory: decode with it instead of the full VAE
+    std::string vae;                        // another VAE (a diffusers VAE folder, a model, or a VAE .safetensors); "" = the model's
     bool int8 = true;
     // Lightning's schedule: Euler, linear betas, trailing timesteps. "config"
     // uses DIR/scheduler/scheduler_config.json instead (other motion modules).

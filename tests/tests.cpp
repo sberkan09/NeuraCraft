@@ -1,5 +1,6 @@
 // NeuraCraft unit tests. Dependency-free: a tiny TEST/CHECK harness below.
 #include "NeuraCraft.h"
+#include "Checkpoint.h"
 
 #include <algorithm>
 #include <atomic>
@@ -2928,6 +2929,195 @@ std::string writeTinyStableDiffusion(const std::string& name, std::string& tok) 
     std::filesystem::create_directories(dir + "/scheduler");
     std::ofstream(dir + "/scheduler/scheduler_config.json") << R"({"beta_schedule":"scaled_linear","timestep_spacing":"trailing"})";
     return dir;
+}
+
+namespace {
+// diffusers name -> original single-file name (the inverse of Checkpoint.cpp's renames), to build test checkpoints.
+std::string ldmResnet(const std::string& r) {
+    const std::vector<std::pair<std::string, std::string>> map = {{"norm1.", "in_layers.0."}, {"conv1.", "in_layers.2."},
+        {"time_emb_proj.", "emb_layers.1."}, {"norm2.", "out_layers.0."}, {"conv2.", "out_layers.3."}, {"conv_shortcut.", "skip_connection."}};
+    for (const auto& [a, b] : map)
+        if (r.rfind(a, 0) == 0) return b + r.substr(a.size());
+    return r;
+}
+// "<prefix>N.<rest>" -> N and rest
+bool splitIndex(const std::string& s, const std::string& prefix, std::size_t& n, std::string& rest) {
+    if (s.rfind(prefix, 0) != 0) return false;
+    const std::size_t dot = s.find('.', prefix.size());
+    n = std::stoul(s.substr(prefix.size(), dot - prefix.size()));
+    rest = s.substr(dot + 1);
+    return true;
+}
+std::string ldmUnetName(const std::string& n, std::size_t L, const std::vector<bool>& upAttention) {
+    std::size_t b, j;
+    std::string r, r2;
+    const std::string P = "model.diffusion_model.";
+    if (n.rfind("time_embedding.linear_1.", 0) == 0) return P + "time_embed.0." + n.substr(24);
+    if (n.rfind("time_embedding.linear_2.", 0) == 0) return P + "time_embed.2." + n.substr(24);
+    if (n.rfind("conv_in.", 0) == 0) return P + "input_blocks.0.0." + n.substr(8);
+    if (n.rfind("conv_norm_out.", 0) == 0) return P + "out.0." + n.substr(14);
+    if (n.rfind("conv_out.", 0) == 0) return P + "out.2." + n.substr(9);
+    if (splitIndex(n, "down_blocks.", b, r)) {
+        if (splitIndex(r, "resnets.", j, r2)) return P + "input_blocks." + std::to_string(1 + b * (L + 1) + j) + ".0." + ldmResnet(r2);
+        if (splitIndex(r, "attentions.", j, r2)) return P + "input_blocks." + std::to_string(1 + b * (L + 1) + j) + ".1." + r2;
+        if (r.rfind("downsamplers.0.conv.", 0) == 0) return P + "input_blocks." + std::to_string(1 + b * (L + 1) + L) + ".0.op." + r.substr(20);
+    }
+    if (n.rfind("mid_block.", 0) == 0) {
+        const std::string m = n.substr(10);
+        if (splitIndex(m, "resnets.", j, r2)) return P + "middle_block." + std::to_string(2 * j) + "." + ldmResnet(r2);
+        if (splitIndex(m, "attentions.", j, r2)) return P + "middle_block.1." + r2;
+    }
+    if (splitIndex(n, "up_blocks.", b, r)) {
+        if (splitIndex(r, "resnets.", j, r2)) return P + "output_blocks." + std::to_string(b * (L + 1) + j) + ".0." + ldmResnet(r2);
+        if (splitIndex(r, "attentions.", j, r2)) return P + "output_blocks." + std::to_string(b * (L + 1) + j) + ".1." + r2;
+        if (r.rfind("upsamplers.0.conv.", 0) == 0)
+            return P + "output_blocks." + std::to_string(b * (L + 1) + L) + (upAttention[b] ? ".2.conv." : ".1.conv.") + r.substr(18);
+    }
+    throw std::runtime_error("ldmUnetName: " + n);
+}
+std::string ldmVaeName(const std::string& n, std::size_t levels) {
+    const std::string P = "first_stage_model.";
+    auto res = [](std::string r) { return r.rfind("conv_shortcut.", 0) == 0 ? "nin_shortcut." + r.substr(14) : r; };
+    for (const std::string half : {"encoder.", "decoder."}) {
+        if (n.rfind(half, 0) != 0) continue;
+        const std::string r = n.substr(half.size());
+        std::size_t b, j;
+        std::string r1, r2;
+        if (r.rfind("conv_norm_out.", 0) == 0) return P + half + "norm_out." + r.substr(14);
+        if (r.rfind("mid_block.resnets.0.", 0) == 0) return P + half + "mid.block_1." + res(r.substr(20));
+        if (r.rfind("mid_block.resnets.1.", 0) == 0) return P + half + "mid.block_2." + res(r.substr(20));
+        if (r.rfind("mid_block.attentions.0.", 0) == 0) {
+            const std::string a = r.substr(23);
+            const std::vector<std::pair<std::string, std::string>> map = {{"group_norm.", "norm."}, {"to_q.", "q."}, {"to_k.", "k."}, {"to_v.", "v."}, {"to_out.0.", "proj_out."}};
+            for (const auto& [x, y] : map)
+                if (a.rfind(x, 0) == 0) return P + half + "mid.attn_1." + y + a.substr(x.size());
+        }
+        if (splitIndex(r, "down_blocks.", b, r1)) {
+            if (splitIndex(r1, "resnets.", j, r2)) return P + half + "down." + std::to_string(b) + ".block." + std::to_string(j) + "." + res(r2);
+            if (r1.rfind("downsamplers.0.conv.", 0) == 0) return P + half + "down." + std::to_string(b) + ".downsample.conv." + r1.substr(20);
+        }
+        if (splitIndex(r, "up_blocks.", b, r1)) {
+            const std::string u = std::to_string(levels - 1 - b);
+            if (splitIndex(r1, "resnets.", j, r2)) return P + half + "up." + u + ".block." + std::to_string(j) + "." + res(r2);
+            if (r1.rfind("upsamplers.0.conv.", 0) == 0) return P + half + "up." + u + ".upsample.conv." + r1.substr(18);
+        }
+        return P + n;  // conv_in, conv_out
+    }
+    return P + n;  // quant_conv, post_quant_conv
+}
+
+std::map<std::string, Matrix> loadAllTensors(const std::string& file) {
+    std::map<std::string, Matrix> out;
+    const SafeTensors st(file);
+    for (const std::string& n : st.names()) out[n] = st.load(n);
+    return out;
+}
+} // namespace
+
+TEST(single_file_checkpoints_load_like_diffusers_folders) {
+    std::string tok;
+    const std::string dir = writeTinyStableDiffusion("sd_single", tok);
+    const std::string ckdir = tempPath("sd_single_ck");
+    std::filesystem::create_directories(ckdir + "/tokenizer");
+    for (const char* f : {"vocab.json", "merges.txt"})
+        std::filesystem::copy_file(dir + "/tokenizer/" + f, ckdir + "/tokenizer/" + f, std::filesystem::copy_options::overwrite_existing);
+    // The same weights in the original layout: SD 1.x text encoder naming first.
+    std::map<std::string, Matrix> all;
+    for (auto& [n, m] : loadAllTensors(dir + "/unet/diffusion_pytorch_model.safetensors")) all[ldmUnetName(n, 1, {false, true})] = m;
+    for (auto& [n, m] : loadAllTensors(dir + "/vae/diffusion_pytorch_model.safetensors")) all[ldmVaeName(n, 4)] = m;
+    const auto text = loadAllTensors(dir + "/text_encoder/model.safetensors");
+    for (const auto& [n, m] : text) all["cond_stage_model.transformer." + n] = m;
+    const std::string file = ckdir + "/tiny.safetensors";
+    saveAll(file, all);
+    CHECK(isSingleFileCheckpoint(file) && !isSingleFileCheckpoint(dir + "/unet/diffusion_pytorch_model.safetensors"));
+    const CheckpointInfo info = inspectCheckpoint(file);
+    CHECK(info.family == "sd1" && info.inChannels == 4 && info.contextDim == 6 && info.hasVae && info.hasTextEncoder);
+    // Every renamed tensor is the diffusers one, and the derived configs match what the tiny model needs.
+    {
+        const SafeTensors unet(file + "#unet");
+        CHECK(unet.names().size() == loadAllTensors(dir + "/unet/diffusion_pytorch_model.safetensors").size());
+        CHECK(unet.load("up_blocks.0.upsamplers.0.conv.weight").values() ==
+              SafeTensors(dir + "/unet/diffusion_pytorch_model.safetensors").load("up_blocks.0.upsamplers.0.conv.weight").values());
+        const ModelComponent c = modelComponent(file, "unet", "test");
+        CHECK(c.config.at("layers_per_block").number == 1 && c.config.at("block_out_channels").array.size() == 2);
+        CHECK(c.config.at("down_block_types").array[0].string == "CrossAttnDownBlock2D" && c.config.at("up_block_types").array[0].string == "UpBlock2D");
+        CHECK(SafeTensors(file + "#vae").names().size() == loadAllTensors(dir + "/vae/diffusion_pytorch_model.safetensors").size());
+        CHECK(modelComponent(file, "vae", "test").config.at("block_out_channels").array.size() == 4);
+    }
+    // The tiny model's unusual sizes (2 heads, 4 groups, GELU) and its scheduler and padding go in the sidecar.
+    std::ofstream(ckdir + "/tiny.json") << R"({"unet": {"attention_head_dim": [2, 2], "norm_num_groups": 4},
+        "vae": {"norm_num_groups": 4}, "text_encoder": {"num_attention_heads": 2, "hidden_act": "gelu"},
+        "scheduler": {"beta_schedule": "scaled_linear", "timestep_spacing": "trailing"}, "tokenizer": {"pad_token": "!"}})";
+    CHECK(tokenizerDirectory(file) == ckdir + "/tokenizer" && padsWithExclamation(file) && !schedulerConfig(file).empty());
+    TextToImageOptions o;
+    o.width = 64;
+    o.height = 64;
+    o.steps = 2;
+    o.seed = 5;
+    const Image fromFolder = textToImage(dir, "hello he", o);
+    CHECK(textToImage(file, "hello he", o).pixels == fromFolder.pixels);
+    // SD 2.x layout: OpenCLIP names with fused q/k/v and one layer more (SD 2 uses the penultimate one).
+    {
+        std::map<std::string, Matrix> two;
+        for (const auto& [n, m] : all)
+            if (n.rfind("cond_stage_model.", 0) != 0) two[n] = m;
+        const std::string P = "cond_stage_model.model.", L = "text_model.encoder.layers.0.";
+        two[P + "token_embedding.weight"] = text.at("text_model.embeddings.token_embedding.weight");
+        two[P + "positional_embedding"] = text.at("text_model.embeddings.position_embedding.weight");
+        two[P + "ln_final.weight"] = text.at("text_model.final_layer_norm.weight");
+        two[P + "ln_final.bias"] = text.at("text_model.final_layer_norm.bias");
+        for (int layer = 0; layer < 2; ++layer) {
+            const std::string R = P + "transformer.resblocks." + std::to_string(layer) + ".";
+            auto src = [&](const std::string& n) { return layer == 0 ? text.at(L + n) : Matrix::uniform(1, text.at(L + n).size(), -0.3f, 0.3f); };
+            Matrix w(1, 0), b(1, 0);
+            std::vector<float> wv, bv;
+            for (const char* k : {"q_proj", "k_proj", "v_proj"}) {
+                const Matrix a = src(std::string("self_attn.") + k + ".weight"), c = src(std::string("self_attn.") + k + ".bias");
+                wv.insert(wv.end(), a.values().begin(), a.values().end());
+                bv.insert(bv.end(), c.values().begin(), c.values().end());
+            }
+            two[R + "attn.in_proj_weight"] = Matrix(1, wv.size(), std::move(wv));
+            two[R + "attn.in_proj_bias"] = Matrix(1, bv.size(), std::move(bv));
+            const std::vector<std::pair<std::string, std::string>> map = {{"ln_1.", "layer_norm1."}, {"ln_2.", "layer_norm2."},
+                {"attn.out_proj.", "self_attn.out_proj."}, {"mlp.c_fc.", "mlp.fc1."}, {"mlp.c_proj.", "mlp.fc2."}};
+            for (const auto& [to, from] : map)
+                for (const char* wb : {"weight", "bias"}) two[R + to + wb] = src(from + wb);
+        }
+        const std::string file2 = ckdir + "/tiny2.safetensors";
+        saveAll(file2, two);
+        std::filesystem::copy_file(ckdir + "/tiny.json", ckdir + "/tiny2.json", std::filesystem::copy_options::overwrite_existing);
+        CHECK(inspectCheckpoint(file2).family == "sd2");
+        CHECK(modelComponent(file2, "text_encoder", "test").config.at("num_hidden_layers").number == 1);
+        CHECK(textToImage(file2, "hello he", o).pixels == fromFolder.pixels);
+    }
+    // Another VAE: a diffusers VAE folder, or a VAE file of its own in the original layout (no prefix).
+    {
+        std::map<std::string, Matrix> vae;
+        for (const auto& [n, m] : all)
+            if (n.rfind("first_stage_model.", 0) == 0) vae[n.substr(18)] = m;
+        saveAll(ckdir + "/myvae.safetensors", vae);
+        std::ofstream(ckdir + "/myvae.json") << R"({"vae": {"norm_num_groups": 4}})";
+        TextToImageOptions v = o;
+        v.vae = ckdir + "/myvae.safetensors";
+        CHECK(textToImage(file, "hello he", v).pixels == fromFolder.pixels);
+        v.vae = dir + "/vae";
+        CHECK(textToImage(file, "hello he", v).pixels == fromFolder.pixels);
+        const auto models = findModels(ckdir);
+        std::map<std::string, std::string> kinds;
+        for (const ModelInfo& m : models) kinds[std::filesystem::path(m.path).filename().string()] = m.kind;
+        CHECK(kinds["tiny.safetensors"] == "sd" && kinds["tiny2.safetensors"] == "sd" && kinds["myvae.safetensors"] == "vae");
+    }
+    // Not a checkpoint, or one without a VAE, says so.
+    CHECK_THROWS(inspectCheckpoint(dir + "/vae/diffusion_pytorch_model.safetensors"), std::runtime_error);
+    {
+        std::map<std::string, Matrix> noVae;
+        for (const auto& [n, m] : all)
+            if (n.rfind("first_stage_model.", 0) != 0) noVae[n] = m;
+        saveAll(ckdir + "/novae.safetensors", noVae);
+        CHECK_THROWS(modelComponent(ckdir + "/novae.safetensors", "vae", "test"), std::runtime_error);
+    }
+    std::filesystem::remove_all(ckdir);
+    std::filesystem::remove_all(dir);
 }
 
 TEST(text_to_image_pipeline_runs_end_to_end) {

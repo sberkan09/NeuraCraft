@@ -1319,7 +1319,8 @@ int main(int argc, char** argv) {
                     saveJpeg(output, img, 92);
                 else savePng(output, img);
             } catch (const std::exception& e) {
-                std::cerr << e.what() << "\ndownload SD-Turbo with: scripts/download_sd_turbo.sh " << args[1] << '\n';
+                std::cerr << e.what() << '\n';
+                if (!std::filesystem::is_regular_file(args[1])) std::cerr << "download SD-Turbo with: scripts/download_sd_turbo.sh " << args[1] << '\n';
                 return 2;
             }
             std::cout << "wrote " << output << " (" << o.width << "x" << o.height << ", " << o.steps << " step" << (o.steps == 1 ? "" : "s")
@@ -1498,7 +1499,8 @@ int main(int argc, char** argv) {
                     video = zoomAnimation(sd, prompts, zo, start.empty() ? nullptr : &first);
                 }
             } catch (const std::exception& e) {
-                std::cerr << e.what() << "\ndownload SD-Turbo with: scripts/download_sd_turbo.sh " << args[1] << '\n';
+                std::cerr << e.what() << '\n';
+                if (!std::filesystem::is_regular_file(args[1])) std::cerr << "download SD-Turbo with: scripts/download_sd_turbo.sh " << args[1] << '\n';
                 return 2;
             }
             if (!interpolateModel.empty()) {  // RIFE: 2^passes - 1 frames between each pair, same duration

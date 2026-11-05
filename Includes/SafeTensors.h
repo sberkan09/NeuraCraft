@@ -22,7 +22,19 @@ public:
         std::size_t elements() const;
     };
 
+    // "file.safetensors#unet" (or #vae, #text_encoder) opens one component of a single-file Stable
+    // Diffusion checkpoint with its tensors renamed to diffusers names (Checkpoint.h).
     explicit SafeTensors(const std::string& path);
+
+    // A view of the same file under other names: each entry is a new name for an existing tensor,
+    // or for elements [first, first + count) of it in storage order (count 0: all of it; a slice of
+    // whole rows keeps the trailing dimensions). Nothing is read.
+    struct Rename {
+        std::string name, source;
+        std::size_t first = 0, count = 0;
+    };
+    SafeTensors renamed(const std::vector<Rename>& entries) const;
+    const std::string& path() const { return path_; }
 
     bool has(const std::string& name) const { return tensors_.count(name) != 0; }
     const Tensor& info(const std::string& name) const;
@@ -34,6 +46,7 @@ public:
     Matrix load(const std::string& name) const;
 
 private:
+    SafeTensors() = default;
     std::string path_;
     std::size_t dataStart_ = 0;
     std::size_t fileSize_ = 0;

@@ -961,6 +961,37 @@ int runBench(bool quick) {
     };
     timeInt8("CPU", Device::CPU);
     if (gpuAvailable()) timeInt8("GPU", Device::GPU);
+
+    // UNet self-attention at the 64x64 latent's top level: 4096 tokens, 320 wide, 8 heads.
+    const std::size_t tokens = quick ? 512 : 4096;
+    std::cout << "\nattention, " << tokens << " tokens x 320, 8 heads:\n";
+    const Matrix aq = Matrix::uniform(tokens, 320, -1, 1), ak = Matrix::uniform(tokens, 320, -1, 1),
+                 av = Matrix::uniform(tokens, 320, -1, 1);
+    Matrix attnRef;
+    auto timeAttention = [&](const char* label, Device device) {
+        const Device savedDevice = currentDevice();
+        setDevice(device);
+        Matrix y = multiHeadAttention(aq, ak, av, 8);
+        int reps = 0;
+        const auto start = std::chrono::steady_clock::now();
+        double elapsed = 0.0;
+        do {
+            y = multiHeadAttention(aq, ak, av, 8);
+            ++reps;
+            elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        } while (elapsed < (quick ? 0.2 : 1.0));
+        Matrix probe(tokens, 320);
+        const bool fused = gpuAttention(aq, ak, av, 8, probe);
+        setDevice(savedDevice);
+        if (attnRef.empty()) attnRef = y;
+        const bool ok = y.approxEquals(attnRef, 1e-3f);
+        mismatches += !ok;
+        std::cout << std::setw(22) << label << std::fixed << std::setprecision(2) << std::setw(9) << 1e3 * elapsed / reps << " ms"
+                  << (device == Device::GPU ? (fused ? "  (fused kernel)" : "  (GEMMs + CPU softmax)") : "")
+                  << (ok ? "" : "  (disagrees with the CPU!)") << std::defaultfloat << '\n';
+    };
+    timeAttention("CPU", Device::CPU);
+    if (gpuAvailable()) timeAttention("GPU", Device::GPU);
     return mismatches == 0 ? 0 : 1;
 }
 

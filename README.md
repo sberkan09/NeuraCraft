@@ -778,6 +778,36 @@ e.g. 150 → 212 GFLOPS at n = 1024. Accelerate is very strong on Apple silicon;
 `./build_and_run.sh bench` to see which backend wins on your machine. Setting
 `NEURACRAFT_METAL_KERNEL=tiled` or `=simdgroup` overrides the Metal kernel choice.
 
+Two GPU paths are specific to the image models:
+
+- **Int8 layers** (the default for Stable Diffusion, AnimateDiff, ControlNet, …)
+  multiply on the GPU straight from their int8 weights: the shader
+  dequantizes each tile (with its group scales) while loading it, so the
+  weights cross memory as int8 and are not expanded to float on the CPU for
+  every call. Dense layers and convolutions both use it (`gpuInt8Available()`).
+- **Attention** runs as one fused kernel per call (flash-attention style:
+  queries in blocks of 32, keys and values streamed through threadgroup memory
+  with an online softmax), so the tokens × tokens score matrix — 64 MB per head
+  for a 512×512 image — is never written. Head sizes that are multiples of 4 up
+  to 160 (every SD 1.5 / AnimateDiff head) use it; others (the VAE's single
+  512-wide head) keep the GEMM + CPU-softmax path.
+
+`bench` times both (an int8 4096-pixel × 1280 layer and 4096-token attention,
+CPU vs GPU). Add `--profile` to any command to see where the time went — self
+time per GEMM device, int8 kernel, convolution im2col, attention, norms and
+loading:
+
+```
+$ ./bin/NeuraCraft txt2img data/sd-turbo "a red fox in snow" fox.png --steps 1 --size 256 --profile
+profile (self time; 24.53 s profiled):
+  gemm cpu                        10.415 s   42.5 %      1838 calls
+  load: quantize                   4.953 s   20.2 %       375 calls
+  load: read tensors               4.891 s   19.9 %      1198 calls
+  int8 gemm cpu                    2.130 s    8.7 %       242 calls
+  conv (im2col, bias)              0.783 s    3.2 %       102 calls
+  ...
+```
+
 Measured matrix-multiply throughput (GFLOPS, square n×n):
 
 | n | old loop (v1.0) | blocked, 2-core x86, portable | blocked, same CPU, `-march=native` |
@@ -855,7 +885,7 @@ target_link_libraries(my_app PRIVATE neuracraft_lib)
 | Optimizers | `Optimizer.h` | `SGD` (momentum, weight decay), `Adam` (optional decoupled weight decay), state save/load, `CosineSchedule` (warmup + cosine), `clipGradientNorm` |
 | Network | `Network.h` | `add<Layer>(...)`, `fit` (mini-batches, shuffling, validation, accuracy, LR schedule, gradient clipping, step limits, callbacks), `predict`, `evaluate`, `accuracy`, `summary`, `save` / `load`, `saveCheckpoint` / `loadCheckpoint` (exact resume) |
 | Data | `Data.h` | One-hot / argmax, train/test split, standardization, CSV load/save, MNIST IDX loader, XOR / spiral / sine generators |
-| Backends | `Backend.h`, `Parallel.h` | `gemm()` / `matmul()` dispatch, CPU / Accelerate / Metal (zero-copy on unified memory), `setDevice`, `setThreadCount`, `parallelFor` |
+| Backends | `Backend.h`, `Parallel.h`, `Profile.h` | `gemm()` / `matmul()` dispatch, CPU / Accelerate / Metal (zero-copy on unified memory, int8 weights and fused attention on the GPU), `setDevice`, `setThreadCount`, `parallelFor`, `NC_PROFILE` scopes |
 | Random | `Random.h` | `setSeed()` makes initialization, shuffling and dropout reproducible |
 
 Conventions: a batch is a `(samples × features)` matrix, one sample per row.

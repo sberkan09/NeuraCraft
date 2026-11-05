@@ -3385,6 +3385,50 @@ TEST(controlnet_and_canny_edges) {
     std::filesystem::remove_all(tok);
 }
 
+TEST(upscaler_compact_esrgan) {
+    // A tiny SRVGGNetCompact (x2): conv 3->4, PReLU, conv 4->4, PReLU, conv 4->12.
+    const std::string file = tempPath("esr.safetensors");
+    auto write = [&](bool zeroLast) {
+        std::map<std::string, Matrix> w;
+        w["body.0.weight"] = Matrix::uniform(1, 4 * 3 * 9, -0.3f, 0.3f);
+        w["body.0.bias"] = Matrix::uniform(1, 4, -0.1f, 0.1f);
+        w["body.1.weight"] = Matrix::uniform(1, 4, 0.1f, 0.3f);
+        w["body.2.weight"] = Matrix::uniform(1, 4 * 4 * 9, -0.3f, 0.3f);
+        w["body.2.bias"] = Matrix::uniform(1, 4, -0.1f, 0.1f);
+        w["body.3.weight"] = Matrix::uniform(1, 4, 0.1f, 0.3f);
+        w["body.4.weight"] = zeroLast ? Matrix(1, 12 * 4 * 9) : Matrix::uniform(1, 12 * 4 * 9, -0.3f, 0.3f);
+        w["body.4.bias"] = zeroLast ? Matrix(1, 12) : Matrix::uniform(1, 12, -0.05f, 0.05f);
+        saveAll(file, w);
+    };
+    Image img;
+    img.width = 21;
+    img.height = 13;
+    for (std::size_t i = 0; i < 21 * 13 * 3; ++i) img.pixels.push_back(static_cast<std::uint8_t>(i * 37 % 256));
+    // With a zero last layer the output is the nearest-neighbour upscale of the input.
+    write(true);
+    const Upscaler zero(file);
+    CHECK(zero.scale() == 2);
+    const Image near = zero.upscale(img);
+    CHECK(near.width == 42 && near.height == 26);
+    bool same = true;
+    for (std::size_t y = 0; y < 26; ++y)
+        for (std::size_t x = 0; x < 42; ++x)
+            for (std::size_t c = 0; c < 3; ++c)
+                if (near.pixels[(y * 42 + x) * 3 + c] != img.pixels[((y / 2) * 21 + x / 2) * 3 + c]) same = false;
+    CHECK(same);
+    // Tiles overlap by the receptive field, so tiled and whole outputs are identical.
+    write(false);
+    const Upscaler up(file);
+    const Image whole = up.upscale(img, 0);
+    CHECK(whole.pixels != near.pixels);
+    CHECK(up.upscale(img, 5).pixels == whole.pixels);
+    std::map<std::string, Matrix> bad;
+    bad["body.0.weight"] = Matrix::uniform(1, 4 * 3, -1, 1);
+    saveAll(file, bad);
+    CHECK_THROWS(Upscaler(file), std::exception);
+    std::filesystem::remove(file);
+}
+
 // ---- Training robustness ------------------------------------------------------------------
 
 TEST(cosine_schedule_and_gradient_clipping) {

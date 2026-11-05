@@ -23,6 +23,7 @@
 #include "SafeTensors.h"
 #include "Text.h"
 #include "Transformer.h"
+#include "Upscale.h"
 
 #define NEURACRAFT_VERSION "1.11.0"
 

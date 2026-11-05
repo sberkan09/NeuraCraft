@@ -3748,6 +3748,32 @@ TEST(ip_adapter_image_prompts) {
     for (const std::string& d : {dir, tok, enc}) std::filesystem::remove_all(d);
 }
 
+TEST(model_cache_loads_once_and_releases) {
+    CHECK(!modelCaching());
+    int loads = 0;
+    auto load = [&] {
+        ++loads;
+        return std::make_shared<int>(7);
+    };
+    // Off: every call loads.
+    cachedModel<int>("k", "t", load);
+    cachedModel<int>("k", "t", load);
+    CHECK(loads == 2 && modelCacheEntries() == 0);
+    {
+        ModelCacheScope scope;
+        const auto a = cachedModel<int>("k", "data/x@64x64", load);
+        const auto b = cachedModel<int>("k", "data/x@64x64", load);
+        cachedModel<int>("other", "data/y", load);
+        CHECK(loads == 4 && a == b && modelCacheEntries() == 2);
+        releaseModelsExcept({"data/y"});
+        CHECK(modelCacheEntries() == 1 && *a == 7);  // a caller's copy outlives the entry
+        cachedModel<int>("k", "data/x@64x64", load);
+        CHECK(loads == 5);
+    }
+    CHECK(!modelCaching() && modelCacheEntries() == 0);
+    CHECK(modelTag("data/sd/../sd/") == "data/sd" && modelTag("data/sd", 512, 768) == "data/sd@512x768");
+}
+
 TEST(json_workflows) {
     std::string tok;
     const std::string dir = writeTinyStableDiffusion("sd_workflow", tok);
@@ -3772,12 +3798,39 @@ TEST(json_workflows) {
         {"op": "save", "in": "frames", "path": "frames/"}
     ]})";
     std::vector<std::string> log;
-    const auto clips = runWorkflow(json, work, [&](const std::string& l) { log.push_back(l); });
+    std::vector<std::size_t> cached;  // models held after each step
+    const auto clips = runWorkflow(json, work, [&](const std::string& l) {
+        log.push_back(l);
+        cached.push_back(modelCacheEntries());
+    });
     CHECK(log.size() == 10 && log[4].rfind("step 5 txt2img", 0) == 0);
+    // The text encoder, UNet and VAE stay loaded from txt2img to img2img (which adds the VAE encoder), then go.
+    CHECK(cached[3] == 0 && cached[4] >= 3 && cached[5] == 0 && cached[9] == 0);
+    CHECK(!modelCaching() && modelCacheEntries() == 0);
+    // Same pictures without the cache.
+    std::string uncached = json;
+    uncached.replace(uncached.find("{\"steps\""), 1, "{\"cache\": false, ");
+    const auto again = runWorkflow(uncached, work);
+    CHECK(again.at("gen").front().pixels == clips.at("gen").front().pixels);
+    CHECK(again.at("gen2").front().pixels == clips.at("gen2").front().pixels);
     CHECK(clips.at("frames").size() == 2 && clips.at("square").front().width == 64 && clips.at("edges").front().height == 64);
     CHECK(clips.at("clip").size() == 3 && clips.at("gen").front().width == 64);
     CHECK(std::filesystem::exists(work + "/clip.gif") && std::filesystem::exists(work + "/gen.jpg"));
     CHECK(std::filesystem::exists(work + "/frames/frame_0001.png"));
+    // blend: a skip connection from an earlier step's clip, with a mask and a broadcast single frame.
+    const auto mixed = runWorkflow(R"({"steps": [
+        {"op": "load", "path": "in/a.png", "out": "a"},
+        {"op": "crop", "in": "a", "width": 20, "height": 30, "out": "small"},
+        {"op": "load", "dir": "in", "out": "two"},
+        {"op": "blend", "in": ["two", "small"], "weight": 1.0, "out": "all_b"},
+        {"op": "blend", "in": ["a", "a"], "mode": "difference", "weight": 1.0, "out": "zero"},
+        {"op": "blend", "in": ["a", "zero"], "mask": "zero", "out": "same"}]})", work);
+    CHECK(mixed.at("all_b").size() == 2 && mixed.at("all_b")[1].width == 40);
+    CHECK(mixed.at("all_b")[0].pixels == resizeImage(mixed.at("small")[0], 40, 30).pixels);
+    for (std::uint8_t p : mixed.at("zero")[0].pixels) CHECK(p == 0);
+    CHECK(mixed.at("same")[0].pixels == a.pixels);
+    CHECK_THROWS(runWorkflow(R"({"steps": [{"op": "load", "path": "in/a.png", "out": "a"},
+        {"op": "blend", "in": ["a", "a"], "mode": "burn"}]})", work), std::invalid_argument);
     CHECK_THROWS(runWorkflow(R"({"steps": [{"op": "fly"}]})", work), std::invalid_argument);
     CHECK_THROWS(runWorkflow(R"({"steps": [{"op": "save", "in": "missing", "path": "x.png"}]})", work), std::invalid_argument);
     CHECK_THROWS(runWorkflow(R"({"nothing": 1})", work), std::invalid_argument);

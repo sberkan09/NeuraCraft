@@ -712,8 +712,28 @@ a picture can feed a video, a video can be interpolated, upscaled and saved
 in several formats. Operations: `load`, `save`, `resize`, `crop`, `concat`,
 `txt2img`, `img2img`, `inpaint`, `t2v` (AnimateDiff, with `init`,
 `controlnet`, `ip_adapter`, `prompt_at`), `morph`, `zoom`, `outpaint`,
-`canny`, `depth`, `parallax`, `upscale`, `interpolate`; their fields follow
-the command-line options. `docs/workflows/lighthouse_3d.json` draws a
+`canny`, `depth`, `parallax`, `upscale`, `interpolate`, `blend`; their fields
+follow the command-line options.
+
+Steps are not limited to the previous step's output: any step can read any
+clip made before it, so a workflow is a graph (run in the listed order) and
+`fox_video.json` feeds the first picture to the video step twice, as its start
+and as its image prompt. `blend` joins two branches frame by frame
+(`mix`, `add`, `multiply`, `difference`, with a `weight` and an optional
+`mask` clip), e.g. a skip connection that mixes some of the original picture
+back into a redrawn one:
+
+```json
+{"op": "img2img", "in": "photo", "prompt": "oil painting", "strength": 0.6, "out": "painted"},
+{"op": "blend", "in": ["painted", "photo"], "weight": 0.3, "out": "result"}
+```
+
+Models are cached between steps: each one is loaded by the first step that
+needs it and released after the last one, so three `txt2img` steps with the
+same model and size load it once (on the 2-core machine 59 s → 32 s, the
+later steps 19.5 s → 6 s each). `"cache": false` at the top level turns this
+off; `ModelCacheScope` / `setModelCaching` (`ModelCache.h`) do the same for
+your own code. `docs/workflows/lighthouse_3d.json` draws a
 picture with LCM-LoRA, estimates its depth and renders a 3D photo (80 s in
 all on the 2-core machine):
 

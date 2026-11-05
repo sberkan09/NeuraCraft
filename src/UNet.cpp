@@ -1,5 +1,6 @@
 #include "Backend.h"
 #include "Profile.h"
+#include "ModelCache.h"
 #include "Dense.h"
 #include "Diffusion.h"
 #include "Json.h"
@@ -1084,11 +1085,58 @@ void checkSize(const TextToImageOptions& o) {
         throw std::invalid_argument("textToImage: width and height must be multiples of 64");
 }
 
+// ---- Models, through the model cache (ModelCache.h) when it is on ----
+std::string loraKey(const std::vector<Lora>& loras) {
+    std::string k;
+    for (const Lora& l : loras) k += "|lora=" + modelTag(l.file) + ":" + std::to_string(l.scale);
+    return k;
+}
+
+std::shared_ptr<ClipTextEncoder> textEncoder(const std::string& dir, bool int8, const std::vector<Lora>& loras) {
+    return cachedModel<ClipTextEncoder>("clip|" + modelTag(dir) + (int8 ? "|int8" : "") + loraKey(loras), modelTag(dir),
+                                        [&] { return std::make_shared<ClipTextEncoder>(loadClipTextEncoder(dir, int8, loras)); });
+}
+
+// The denoising UNet for width x height pictures, with motion modules and / or an IP-Adapter merged in.
+std::shared_ptr<UNet2DCondition> unetModel(const std::string& dir, std::size_t width, std::size_t height, bool int8,
+                                           const std::vector<Lora>& loras, const std::string& ipAdapter = "",
+                                           const std::string& motion = "") {
+    const std::string key = "unet|" + modelTag(dir, width, height) + (int8 ? "|int8" : "") + loraKey(loras) +
+                            (ipAdapter.empty() ? "" : "|ip=" + modelTag(ipAdapter)) + (motion.empty() ? "" : "|motion=" + modelTag(motion));
+    return cachedModel<UNet2DCondition>(key, modelTag(dir, width, height), [&] {
+        auto unet = std::make_shared<UNet2DCondition>(loadUNet(dir, width / 8, height / 8, int8, loras));
+        if (!motion.empty()) loadMotionModules(*unet, motion, int8);
+        if (!ipAdapter.empty()) loadIpAdapter(*unet, ipAdapter, int8);
+        return unet;
+    });
+}
+
+std::shared_ptr<UNet2DCondition> controlNetModel(const std::string& dir, std::size_t width, std::size_t height, bool int8) {
+    return cachedModel<UNet2DCondition>("controlnet|" + modelTag(dir, width, height) + (int8 ? "|int8" : ""), modelTag(dir, width, height), [&] {
+        auto net = std::make_shared<UNet2DCondition>(loadUNet(dir, width / 8, height / 8, int8));
+        if (!net->isControlNet()) throw std::runtime_error(dir + " is not a ControlNetModel");
+        return net;
+    });
+}
+
+std::shared_ptr<Vae> vaeModel(const std::string& dir, std::size_t width, std::size_t height, bool encoder, bool decoder) {
+    const std::string key = "vae|" + modelTag(dir, width, height) + (encoder ? "|enc" : "") + (decoder ? "|dec" : "");
+    return cachedModel<Vae>(key, modelTag(dir, width, height),
+                            [&] { return std::make_shared<Vae>(loadVae(dir, width, height, encoder, decoder)); });
+}
+
+std::shared_ptr<TinyVae> tinyVaeModel(const std::string& dir, std::size_t width, std::size_t height, bool encoder, bool decoder) {
+    const std::string key = "taesd|" + modelTag(dir, width, height) + (encoder ? "|enc" : "") + (decoder ? "|dec" : "");
+    return cachedModel<TinyVae>(key, modelTag(dir, width, height),
+                                [&] { return std::make_shared<TinyVae>(loadTinyVae(dir, width, height, encoder, decoder)); });
+}
+
 // CLIP hidden states of the prompt (and of the negative prompt when guided).
 std::pair<Matrix, Matrix> encodePrompts(const std::string& dir, const std::string& prompt, const TextToImageOptions& o) {
     const auto t = PipelineClock::now();
     const ClipTokenizer tok = ClipTokenizer::fromDirectory(dir + "/tokenizer");
-    ClipTextEncoder enc = loadClipTextEncoder(dir, o.int8, o.loras);
+    const std::shared_ptr<ClipTextEncoder> encHold = textEncoder(dir, o.int8, o.loras);
+    ClipTextEncoder& enc = *encHold;
     // SD 2 / Turbo pad with "!" (id 0); SD 1.x pads with <|endoftext|>.
     int pad = tok.endOfText();
     if (std::ifstream(dir + "/tokenizer/tokenizer_config.json")) {
@@ -1110,11 +1158,14 @@ std::pair<Matrix, Matrix> imagePromptTokens(const std::string& adapter, const st
     const std::string dir = encoderDir.empty() ? std::filesystem::path(adapter).parent_path().append("image_encoder").string() : encoderDir;
     Matrix embedding;
     {
-        ClipImageEncoder enc(dir);  // freed before the UNet loads
-        embedding = enc.embed(picture);
+        // Freed before the UNet loads, unless the model cache keeps it.
+        auto enc = cachedModel<ClipImageEncoder>("clipvision|" + modelTag(dir), modelTag(dir),
+                                                 [&] { return std::make_shared<ClipImageEncoder>(dir); });
+        embedding = enc->embed(picture);
     }
-    const IpAdapter ip(adapter);
-    std::pair<Matrix, Matrix> tokens{ip.tokens(embedding), ip.tokens(Matrix(1, embedding.cols()))};
+    const auto ip = cachedModel<IpAdapter>("ipadapter|" + modelTag(adapter), modelTag(adapter),
+                                           [&] { return std::make_shared<IpAdapter>(adapter); });
+    std::pair<Matrix, Matrix> tokens{ip->tokens(embedding), ip->tokens(Matrix(1, embedding.cols()))};
     reportStage(o, "image prompt", t);
     return tokens;
 }
@@ -1132,22 +1183,21 @@ void denoise(const std::string& dir, const std::pair<Matrix, Matrix>& context, c
     std::pair<Matrix, Matrix> ipTokens;
     if (!o.ipAdapter.empty()) ipTokens = imagePromptTokens(o.ipAdapter, o.imageEncoder, o.imagePrompt, o);
     auto t = PipelineClock::now();
-    UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8, o.loras);
-    if (!o.ipAdapter.empty()) loadIpAdapter(unet, o.ipAdapter, o.int8);
+    const std::shared_ptr<UNet2DCondition> unetHold = unetModel(dir, o.width, o.height, o.int8, o.loras, o.ipAdapter);
+    UNet2DCondition& unet = *unetHold;
     reportStage(o, "load unet", t);
-    UNet2DCondition controlNet;
+    std::shared_ptr<UNet2DCondition> controlNetPtr;
     Matrix embedding;
     if (!o.controlNet.empty()) {
         t = PipelineClock::now();
-        controlNet = loadUNet(o.controlNet, o.width / 8, o.height / 8, o.int8);
-        if (!controlNet.isControlNet()) throw std::runtime_error(o.controlNet + " is not a ControlNetModel");
         if (o.controlImage.pixels.empty()) throw std::invalid_argument("ControlNet: no control image");
-        embedding = controlNet.controlEmbedding(imageToTensor(fitImage(toRgb(o.controlImage), o.width, o.height), 0.0f, 1.0f));
+        controlNetPtr = controlNetModel(o.controlNet, o.width, o.height, o.int8);
+        embedding = controlNetPtr->controlEmbedding(imageToTensor(fitImage(toRgb(o.controlImage), o.width, o.height), 0.0f, 1.0f));
         reportStage(o, "load controlnet", t);
     }
     auto predict = [&](const Matrix& in, float timestep, const Matrix& ctx) {
         if (embedding.empty()) return unet.forward(in, timestep, ctx);
-        const ControlResiduals r = controlNet.control(in, timestep, ctx, embedding, o.controlScale);
+        const ControlResiduals r = controlNetPtr->control(in, timestep, ctx, embedding, o.controlScale);
         return unet.forward(in, timestep, ctx, &r);
     };
     if (latent.empty()) {  // text to image: a Gaussian latent at the first sigma
@@ -1188,8 +1238,8 @@ Image imageToImage(const std::string& dir, const Image& input, const std::string
     Matrix latent;
     {
         const auto t = PipelineClock::now();
-        if (!o.tinyVae.empty()) latent = loadTinyVae(o.tinyVae, o.width, o.height, true, false).encode(imageToTensor(fitted));
-        else latent = loadVae(dir, o.width, o.height, true, false).encode(imageToTensor(fitted));
+        if (!o.tinyVae.empty()) latent = tinyVaeModel(o.tinyVae, o.width, o.height, true, false)->encode(imageToTensor(fitted));
+        else latent = vaeModel(dir, o.width, o.height, true, false)->encode(imageToTensor(fitted));
         reportStage(o, o.tinyVae.empty() ? "vae encode" : "taesd encode", t);
     }
     // As diffusers: the last steps * strength steps of the schedule run, starting from the
@@ -1213,13 +1263,13 @@ Image decodeLatent(const std::string& dir, const Matrix& latent, const TextToIma
     Matrix img;
     ImageShape shape;
     if (!o.tinyVae.empty()) {
-        TinyVae vae = loadTinyVae(o.tinyVae, o.width, o.height, false, true);
-        img = vae.decode(latent);
-        shape = vae.image;
+        const auto vae = tinyVaeModel(o.tinyVae, o.width, o.height, false, true);
+        img = vae->decode(latent);
+        shape = vae->image;
     } else {
-        Vae vae = loadVae(dir, o.width, o.height, false, true);
-        img = vae.decode(latent);
-        shape = vae.image;
+        const auto vae = vaeModel(dir, o.width, o.height, false, true);
+        img = vae->decode(latent);
+        shape = vae->image;
     }
     if (o.progress) o.progress(o.tinyVae.empty() ? "vae decode" : "taesd decode",
                                std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count());
@@ -1269,7 +1319,8 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
     {
         auto te = PipelineClock::now();
         const ClipTokenizer tok = ClipTokenizer::fromDirectory(dir + "/tokenizer");
-        ClipTextEncoder enc = loadClipTextEncoder(dir, o.int8, o.loras);
+        const std::shared_ptr<ClipTextEncoder> encHold = textEncoder(dir, o.int8, o.loras);
+    ClipTextEncoder& enc = *encHold;
         int pad = tok.endOfText();
         if (std::ifstream(dir + "/tokenizer/tokenizer_config.json")) {
             const json::Value c = json::parse(readFile(dir + "/tokenizer/tokenizer_config.json"));
@@ -1303,20 +1354,18 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
         reportStage(o, "text encoder", te);
     }
     auto t = PipelineClock::now();
-    UNet2DCondition unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8, o.loras);
-    loadMotionModules(unet, motion, o.int8);
-    if (!v.ipAdapter.empty()) loadIpAdapter(unet, v.ipAdapter, o.int8);
+    std::shared_ptr<UNet2DCondition> unetHold = unetModel(dir, o.width, o.height, o.int8, o.loras, v.ipAdapter, motion);
+    UNet2DCondition& unet = *unetHold;
     reportStage(o, "load unet + motion", t);
-    UNet2DCondition controlNet;
+    std::shared_ptr<UNet2DCondition> controlHold;
     std::vector<Matrix> embeddings;  // one, or one per frame
     if (!v.controlNet.empty()) {
         t = PipelineClock::now();
         if (v.controlImages.size() != 1 && v.controlImages.size() != v.frames)
             throw std::invalid_argument("textToVideo: give one control image or one per frame");
-        controlNet = loadUNet(v.controlNet, o.width / 8, o.height / 8, o.int8);
-        if (!controlNet.isControlNet()) throw std::runtime_error(v.controlNet + " is not a ControlNetModel");
+        controlHold = controlNetModel(v.controlNet, o.width, o.height, o.int8);
         for (const Image& c : v.controlImages)
-            embeddings.push_back(controlNet.controlEmbedding(imageToTensor(fitImage(toRgb(c), o.width, o.height), 0.0f, 1.0f)));
+            embeddings.push_back(controlHold->controlEmbedding(imageToTensor(fitImage(toRgb(c), o.width, o.height), 0.0f, 1.0f)));
         reportStage(o, "load controlnet", t);
     }
     const EulerScheduler sched =
@@ -1335,10 +1384,10 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
         first = v.steps - run;
         const float sigma = static_cast<float>(sched.sigmas[first]);
         const auto te = PipelineClock::now();
-        std::unique_ptr<TinyVae> tiny;
-        std::unique_ptr<Vae> vae;
-        if (!o.tinyVae.empty()) tiny = std::make_unique<TinyVae>(loadTinyVae(o.tinyVae, o.width, o.height, true, false));
-        else vae = std::make_unique<Vae>(loadVae(dir, o.width, o.height, true, false));
+        std::shared_ptr<TinyVae> tiny;
+        std::shared_ptr<Vae> vae;
+        if (!o.tinyVae.empty()) tiny = tinyVaeModel(o.tinyVae, o.width, o.height, true, false);
+        else vae = vaeModel(dir, o.width, o.height, true, false);
         Matrix z;
         for (std::size_t f = 0; f < F; ++f) {
             if (f < v.init.size()) {
@@ -1367,7 +1416,7 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
         for (std::size_t f = 0; f < in.rows(); ++f) {
             Matrix one(1, n);
             std::copy(in.data() + f * n, in.data() + (f + 1) * n, one.data());
-            res.push_back(controlNet.control(one, timestep, ctx[ctx.size() == 1 ? 0 : f], embeddings[embeddings.size() == 1 ? 0 : s + f],
+            res.push_back(controlHold->control(one, timestep, ctx[ctx.size() == 1 ? 0 : f], embeddings[embeddings.size() == 1 ? 0 : s + f],
                                              v.controlScale));
         }
         return unet.forwardFrames(in, timestep, ctx, &res);
@@ -1411,13 +1460,13 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
         sched.step(i, eps, latents);
         reportStage(o, "step " + std::to_string(i + 1) + "/" + std::to_string(sched.timesteps.size()), t);
     }
-    unet = UNet2DCondition();  // free the UNet (and ControlNet) before decoding
-    controlNet = UNet2DCondition();
+    unetHold.reset();  // free the UNet (and ControlNet) before decoding, unless cached
+    controlHold.reset();
     t = PipelineClock::now();
-    std::unique_ptr<TinyVae> tiny;
-    std::unique_ptr<Vae> vae;
-    if (!o.tinyVae.empty()) tiny = std::make_unique<TinyVae>(loadTinyVae(o.tinyVae, o.width, o.height, false, true));
-    else vae = std::make_unique<Vae>(loadVae(dir, o.width, o.height, false, true));
+    std::shared_ptr<TinyVae> tiny;
+    std::shared_ptr<Vae> vae;
+    if (!o.tinyVae.empty()) tiny = tinyVaeModel(o.tinyVae, o.width, o.height, false, true);
+    else vae = vaeModel(dir, o.width, o.height, false, true);
     std::vector<Image> frames;
     for (std::size_t f = 0; f < F; ++f) {
         Matrix one(1, n);
@@ -1435,11 +1484,11 @@ struct StableDiffusion::Impl {
     std::string dir;
     TextToImageOptions options;
     std::unique_ptr<ClipTokenizer> tokenizer;
-    ClipTextEncoder clip;
+    std::shared_ptr<ClipTextEncoder> clip;  // shared with the model cache when it is on
     int pad = 0;
-    UNet2DCondition unet;
-    std::unique_ptr<TinyVae> tiny;
-    std::unique_ptr<Vae> vae;
+    std::shared_ptr<UNet2DCondition> unet;
+    std::shared_ptr<TinyVae> tiny;
+    std::shared_ptr<Vae> vae;
     bool encoder = false;
     std::pair<Matrix, Matrix> ipTokens;  // image prompt and "no picture" tokens (IP-Adapter)
 };
@@ -1452,7 +1501,7 @@ StableDiffusion::StableDiffusion(const std::string& dir, const TextToImageOption
     m.encoder = withEncoder;
     auto t = PipelineClock::now();
     m.tokenizer = std::make_unique<ClipTokenizer>(ClipTokenizer::fromDirectory(dir + "/tokenizer"));
-    m.clip = loadClipTextEncoder(dir, o.int8, o.loras);
+    m.clip = textEncoder(dir, o.int8, o.loras);
     m.pad = m.tokenizer->endOfText();
     if (std::ifstream(dir + "/tokenizer/tokenizer_config.json")) {
         const json::Value c = json::parse(readFile(dir + "/tokenizer/tokenizer_config.json"));
@@ -1461,12 +1510,11 @@ StableDiffusion::StableDiffusion(const std::string& dir, const TextToImageOption
     reportStage(o, "load text encoder", t);
     if (!o.ipAdapter.empty()) m.ipTokens = imagePromptTokens(o.ipAdapter, o.imageEncoder, o.imagePrompt, o);
     t = PipelineClock::now();
-    m.unet = loadUNet(dir, o.width / 8, o.height / 8, o.int8, o.loras);
-    if (!o.ipAdapter.empty()) loadIpAdapter(m.unet, o.ipAdapter, o.int8);
+    m.unet = unetModel(dir, o.width, o.height, o.int8, o.loras, o.ipAdapter);
     reportStage(o, "load unet", t);
     t = PipelineClock::now();
-    if (!o.tinyVae.empty()) m.tiny = std::make_unique<TinyVae>(loadTinyVae(o.tinyVae, o.width, o.height, withEncoder, true));
-    else m.vae = std::make_unique<Vae>(loadVae(dir, o.width, o.height, withEncoder, true));
+    if (!o.tinyVae.empty()) m.tiny = tinyVaeModel(o.tinyVae, o.width, o.height, withEncoder, true);
+    else m.vae = vaeModel(dir, o.width, o.height, withEncoder, true);
     reportStage(o, "load autoencoder", t);
 }
 
@@ -1479,17 +1527,17 @@ const TextToImageOptions& StableDiffusion::impl_options() const { return impl_->
 std::size_t StableDiffusion::height() const { return impl_->options.height; }
 
 Matrix StableDiffusion::encodePrompt(const std::string& prompt) {
-    return impl_->clip.encode(impl_->tokenizer->encodeForModel(prompt, impl_->clip.length, impl_->pad));
+    return impl_->clip->encode(impl_->tokenizer->encodeForModel(prompt, impl_->clip->length, impl_->pad));
 }
 
 Matrix StableDiffusion::noise(unsigned seed) const {
     setSeed(seed);
-    const ImageShape s = impl_->unet.latentShape();
-    return Matrix::normal(1, impl_->unet.outputChannels() * s.height * s.width, 0.0f, 1.0f);
+    const ImageShape s = impl_->unet->latentShape();
+    return Matrix::normal(1, impl_->unet->outputChannels() * s.height * s.width, 0.0f, 1.0f);
 }
 
 bool StableDiffusion::isInpainting() const {
-    return impl_->unet.latentShape().channels == 2 * impl_->unet.outputChannels() + 1;
+    return impl_->unet->latentShape().channels == 2 * impl_->unet->outputChannels() + 1;
 }
 
 Image StableDiffusion::inpaint(const Image& input, const Image& mask, const std::string& prompt, unsigned seed, std::size_t steps,
@@ -1497,7 +1545,7 @@ Image StableDiffusion::inpaint(const Image& input, const Image& mask, const std:
     if (!isInpainting()) throw std::logic_error("StableDiffusion::inpaint: the UNet is not an inpainting model (9 input channels)");
     if (!impl_->encoder) throw std::logic_error("StableDiffusion: loaded without an image encoder");
     if (strength <= 0.0f || strength > 1.0f) throw std::invalid_argument("StableDiffusion::inpaint: strength must be in (0, 1]");
-    const std::size_t W = width(), H = height(), w = W / 8, h = H / 8, C = impl_->unet.outputChannels();
+    const std::size_t W = width(), H = height(), w = W / 8, h = H / 8, C = impl_->unet->outputChannels();
     const Image image = fitImage(toRgb(input), W, H);
     Image m = fitImage(toRgb(mask), W, H);
     std::vector<float> keep(W * H);  // 1 where the input stays
@@ -1533,11 +1581,11 @@ Image StableDiffusion::inpaint(const Image& input, const Image& mask, const std:
         for (std::size_t k = 0; k < C * plane; ++k) in.data()[k] = latent.data()[k] * scale;
         std::copy(latentMask.begin(), latentMask.end(), in.data() + C * plane);
         std::copy(maskedLatent.data(), maskedLatent.data() + C * plane, in.data() + (C + 1) * plane);
-        if (impl_->unet.hasImagePrompt()) impl_->unet.setImagePrompt(impl_->ipTokens.first, impl_->options.ipScale);
-        Matrix eps = impl_->unet.forward(in, static_cast<float>(sched.timesteps[i]), context);
+        if (impl_->unet->hasImagePrompt()) impl_->unet->setImagePrompt(impl_->ipTokens.first, impl_->options.ipScale);
+        Matrix eps = impl_->unet->forward(in, static_cast<float>(sched.timesteps[i]), context);
         if (guidance > 1.0f) {
-            if (impl_->unet.hasImagePrompt()) impl_->unet.setImagePrompt(impl_->ipTokens.second, impl_->options.ipScale);
-            const Matrix un = impl_->unet.forward(in, static_cast<float>(sched.timesteps[i]), negative);
+            if (impl_->unet->hasImagePrompt()) impl_->unet->setImagePrompt(impl_->ipTokens.second, impl_->options.ipScale);
+            const Matrix un = impl_->unet->forward(in, static_cast<float>(sched.timesteps[i]), negative);
             for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = un.data()[k] + guidance * (eps.data()[k] - un.data()[k]);
         }
         sched.step(i, eps, latent);
@@ -1582,7 +1630,7 @@ void StableDiffusion::denoise(Matrix& latent, const Matrix& context, const Euler
         Matrix in = latent;
         const float scale = static_cast<float>(sched.inputScale(i));
         for (float& v : in.values()) v *= scale;
-        UNet2DCondition& unet = impl_->unet;
+        UNet2DCondition& unet = *impl_->unet;
         if (unet.hasImagePrompt()) unet.setImagePrompt(impl_->ipTokens.first, impl_->options.ipScale);
         Matrix eps = unet.forward(in, static_cast<float>(sched.timesteps[i]), context);
         if (guidance > 1.0f) {

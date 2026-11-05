@@ -17,6 +17,7 @@
 #include "Lora.h"
 #include "Loss.h"
 #include "Matrix.h"
+#include "ModelCache.h"
 #include "Network.h"
 #include "Optimizer.h"
 #include "Parallel.h"

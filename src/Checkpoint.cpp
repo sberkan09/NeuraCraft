@@ -21,6 +21,7 @@ using json::makeObject;
 using json::makeString;
 
 const std::string kUnet = "model.diffusion_model.";
+const std::string kControl = "control_model.";                 // a ControlNet (lllyasviel's control_v11*, ...)
 const std::string kVae = "first_stage_model.";
 const std::string kClip = "cond_stage_model.transformer.";     // OpenAI CLIP (SD 1.x)
 const std::string kOpenClip = "cond_stage_model.model.";       // OpenCLIP (SD 2.x)
@@ -61,22 +62,30 @@ bool anyWithPrefix(const std::vector<std::string>& names, const std::string& pre
 
 // ---- UNet ----
 
+// The denoiser's prefix: the UNet of a checkpoint, or a ControlNet file's control model.
+std::string unetPrefix(const SafeTensors& st) {
+    if (st.has(kUnet + "input_blocks.0.0.weight")) return kUnet;
+    if (st.has(kControl + "input_blocks.0.0.weight")) return kControl;
+    return kUnet;
+}
+
 struct UnetLayout {
     std::size_t levels = 0, layers = 0;  // resolution levels, resnets per down block
 };
 
-UnetLayout unetLayout(const std::vector<std::string>& names) {
+UnetLayout unetLayout(const std::vector<std::string>& names, const std::string& kUnet) {
     UnetLayout l;
     const int inputs = maxIndex(names, kUnet + "input_blocks.") + 1;  // 1 + levels * layers + (levels - 1)
-    const int outputs = maxIndex(names, kUnet + "output_blocks.") + 1;  // levels * (layers + 1)
-    if (inputs <= 1 || outputs <= 0) throw std::runtime_error("checkpoint: no UNet blocks");
+    const int outputs = maxIndex(names, kUnet + "output_blocks.") + 1;  // levels * (layers + 1); none in a ControlNet
+    const bool control = kUnet == kControl;
+    if (inputs <= 1 || (outputs <= 0 && !control)) throw std::runtime_error("checkpoint: no UNet blocks");
     // inputs = levels * (layers + 1), outputs = levels * (layers + 1): levels from the downsamplers.
     std::size_t down = 0;
     for (int i = 1; i < inputs; ++i)
         if (anyWithPrefix(names, kUnet + "input_blocks." + std::to_string(i) + ".0.op.")) ++down;
     l.levels = down + 1;
     l.layers = static_cast<std::size_t>(inputs) / l.levels - 1;
-    if (l.levels * (l.layers + 1) != static_cast<std::size_t>(inputs) || static_cast<std::size_t>(outputs) != l.levels * (l.layers + 1))
+    if (l.levels * (l.layers + 1) != static_cast<std::size_t>(inputs) || (!control && static_cast<std::size_t>(outputs) != l.levels * (l.layers + 1)))
         throw std::runtime_error("checkpoint: unexpected UNet block layout");
     return l;
 }
@@ -92,7 +101,8 @@ std::string resnetPart(const std::string& rest) {
 
 std::vector<SafeTensors::Rename> unetRenames(const SafeTensors& st) {
     const std::vector<std::string> names = st.names();
-    const UnetLayout l = unetLayout(names);
+    const std::string kUnet = unetPrefix(st);
+    const UnetLayout l = unetLayout(names, kUnet);
     std::vector<SafeTensors::Rename> out;
     auto add = [&](const std::string& to, const std::string& from) { out.push_back({to, from}); };
     // "<block>.<k>.<rest>" -> index k and rest
@@ -151,6 +161,23 @@ std::vector<SafeTensors::Rename> unetRenames(const SafeTensors& st) {
                 to = p + "attentions." + std::to_string(j) + "." + inner;
             }
         }
+        else if (startsWith(key, "input_hint_block.")) {
+            // conv, SiLU, conv, SiLU, ...: convs 0, 2, ..., 12 then the zero conv 14 -> conv_in, blocks.0-5, conv_out.
+            std::size_t k;
+            std::string inner;
+            if (split(key.substr(17), k, inner) && k % 2 == 0) {
+                const std::size_t last = static_cast<std::size_t>(maxIndex(names, kUnet + "input_hint_block."));
+                to = k == 0 ? "controlnet_cond_embedding.conv_in." + inner
+                     : k == last ? "controlnet_cond_embedding.conv_out." + inner
+                                 : "controlnet_cond_embedding.blocks." + std::to_string(k / 2 - 1) + "." + inner;
+            }
+        } else if (startsWith(key, "zero_convs.")) {
+            std::size_t k;
+            std::string inner;
+            if (split(key.substr(11), k, inner) && startsWith(inner, "0.")) to = "controlnet_down_blocks." + std::to_string(k) + "." + inner.substr(2);
+        } else if (startsWith(key, "middle_block_out.0.")) {
+            to = "controlnet_mid_block." + key.substr(19);
+        }
         if (!to.empty()) add(to, n);
     }
     return out;
@@ -158,7 +185,9 @@ std::vector<SafeTensors::Rename> unetRenames(const SafeTensors& st) {
 
 json::Value unetConfig(const SafeTensors& st, const CheckpointInfo& info) {
     const std::vector<std::string> names = st.names();
-    const UnetLayout l = unetLayout(names);
+    const std::string kUnet = unetPrefix(st);
+    const bool control = kUnet == kControl;
+    const UnetLayout l = unetLayout(names, kUnet);
     std::vector<json::Value> channels, down, up, heads;
     for (std::size_t b = 0; b < l.levels; ++b) {
         const std::string first = kUnet + "input_blocks." + std::to_string(1 + b * (l.layers + 1)) + ".";
@@ -169,19 +198,18 @@ json::Value unetConfig(const SafeTensors& st, const CheckpointInfo& info) {
         // diffusers' attention_head_dim is the number of heads: 8 for SD 1.x, 64-channel heads for SD 2.x.
         heads.push_back(makeNumber(info.family == "sd1" ? 8.0 : static_cast<double>(std::max<std::size_t>(1, ch / 64))));
     }
-    for (std::size_t b = 0; b < l.levels; ++b) {
+    for (std::size_t b = 0; b < l.levels && !control; ++b) {
         const bool attn = anyWithPrefix(names, kUnet + "output_blocks." + std::to_string(b * (l.layers + 1)) + ".1.proj_in.");
         up.push_back(makeString(attn ? "CrossAttnUpBlock2D" : "UpBlock2D"));
     }
     const std::string projIn = kUnet + "input_blocks.1.1.proj_in.weight";
     const bool linearProj = st.has(projIn) && st.info(projIn).shape.size() == 2;
-    return makeObject({{"_class_name", makeString("UNet2DConditionModel")},
+    json::Value config = makeObject({{"_class_name", makeString(control ? "ControlNetModel" : "UNet2DConditionModel")},
                        {"in_channels", makeNumber(static_cast<double>(info.inChannels))},
-                       {"out_channels", makeNumber(static_cast<double>(count(st, kUnet + "out.2.bias")))},
+                       {"out_channels", makeNumber(control ? 4.0 : static_cast<double>(count(st, kUnet + "out.2.bias")))},
                        {"block_out_channels", makeArray(channels)},
                        {"layers_per_block", makeNumber(static_cast<double>(l.layers))},
                        {"down_block_types", makeArray(down)},
-                       {"up_block_types", makeArray(up)},
                        {"attention_head_dim", makeArray(heads)},
                        {"cross_attention_dim", makeNumber(static_cast<double>(info.contextDim))},
                        {"use_linear_projection", makeBool(linearProj)},
@@ -189,6 +217,18 @@ json::Value unetConfig(const SafeTensors& st, const CheckpointInfo& info) {
                        {"norm_eps", makeNumber(1e-5)},
                        {"flip_sin_to_cos", makeBool(true)},
                        {"freq_shift", makeNumber(0)}});
+    if (control) {
+        // The hint convs: conv_in, then pairs (same size, stride 2) up to the last before the zero conv.
+        const int last = maxIndex(names, kUnet + "input_hint_block.");
+        std::vector<json::Value> cc;
+        for (int k = 0; k < last; k += 4) cc.push_back(makeNumber(static_cast<double>(count(st, kUnet + "input_hint_block." + std::to_string(k) + ".bias"))));
+        config.object.emplace_back("conditioning_embedding_out_channels", makeArray(cc));
+        config.object.emplace_back("conditioning_channels",
+                                   makeNumber(static_cast<double>(count(st, kUnet + "input_hint_block.0.weight") / (count(st, kUnet + "input_hint_block.0.bias") * 9))));
+    } else {
+        config.object.emplace_back("up_block_types", makeArray(up));
+    }
+    return config;
 }
 
 // ---- VAE ----
@@ -387,9 +427,11 @@ bool isSingleFileCheckpoint(const std::string& path) {
 CheckpointInfo inspectCheckpoint(const std::string& path) {
     const SafeTensors st(path);
     const std::vector<std::string> names = st.names();
+    const std::string kUnet = unetPrefix(st);
     if (!st.has(kUnet + "input_blocks.0.0.weight"))
         throw std::runtime_error(path + ": not a Stable Diffusion checkpoint (no " + kUnet + "input_blocks.0.0.weight)");
     CheckpointInfo info;
+    info.controlNet = kUnet == kControl;
     info.inChannels = count(st, kUnet + "input_blocks.0.0.weight") / (count(st, kUnet + "input_blocks.0.0.bias") * 9);
     for (const std::string& n : names) {
         const std::size_t at = n.find(".attn2.to_k.weight");
@@ -403,7 +445,8 @@ CheckpointInfo inspectCheckpoint(const std::string& path) {
     info.hasVae = st.has(kVae + "encoder.conv_in.weight");
     const bool openAi = anyWithPrefix(names, kClip), openClip = anyWithPrefix(names, kOpenClip);
     info.hasTextEncoder = openAi || openClip;
-    if (anyWithPrefix(names, "conditioner.embedders.") || info.contextDim == 2048) info.family = "sdxl";
+    if (const json::Value extra = sidecar(path); extra.find("family") && extra.at("family").isString()) info.family = extra.at("family").string;
+    else if (anyWithPrefix(names, "conditioner.embedders.") || info.contextDim == 2048) info.family = "sdxl";
     else if (openClip || (!openAi && info.contextDim == 1024)) info.family = "sd2";
     else if (openAi || info.contextDim == 768) info.family = "sd1";
     else info.family = "unknown";

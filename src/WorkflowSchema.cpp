@@ -243,6 +243,10 @@ std::string fileKind(const std::filesystem::path& file) {
             if (info.family != "sd1" && info.family != "sd2") return "";  // SDXL and others are not supported yet
             return info.inChannels == 9 ? "sd-inpaint" : "sd";
         }
+        if (st.has("control_model.input_blocks.0.0.weight")) {  // a ControlNet in the original layout
+            const std::string family = inspectCheckpoint(file.string()).family;
+            return family == "sd1" || family == "sd2" ? "controlnet" : "";
+        }
         if (st.has("encoder.conv_in.weight") && st.has("decoder.conv_out.weight") && st.has("post_quant_conv.weight")) return "vae";
         bool motion = false, lora = false, ip = false, esrgan = false, rife = false;
         for (const std::string& n : st.names()) {

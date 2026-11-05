@@ -4220,7 +4220,13 @@ TEST(gpu_fused_attention_matches_cpu) {
         CHECK(gpuAttention(q, k, v, c.heads, direct) == c.gpu);
         const Matrix gpu = multiHeadAttention(q, k, v, c.heads);
         setDevice(Device::CPU);
-        CHECK(gpu.approxEquals(cpu, 1e-4f));
+        // Without the fused kernel the GPU path is GEMMs on the GPU + CPU softmax: a looser bound
+        // (512-wide dot products accumulate in a different order).
+        const float tol = c.gpu ? 1e-4f : 1e-3f;
+        float worst = 0;
+        for (std::size_t i = 0; i < cpu.size(); ++i) worst = std::max(worst, std::fabs(gpu.data()[i] - cpu.data()[i]));
+        if (worst > tol) std::cout << "         attention " << c.N << "x" << c.M << "x" << c.C << "/" << c.heads << ": max diff " << worst << "\n";
+        CHECK(worst <= tol);
         if (c.gpu) CHECK(direct.approxEquals(cpu, 1e-4f));
         // Hybrid: CPU device, attention alone on the GPU.
         setGpuAttention(true);

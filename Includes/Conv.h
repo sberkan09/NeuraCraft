@@ -23,6 +23,12 @@ struct ImageShape {
 // whole im2col matrix for backward; inference works in strips of output rows
 // (bounded memory, output written in place in channel-major order), and 1x1
 // convolutions are a single GEMM on the image itself.
+// Stride-1 convolutions as k*k shifted GEMMs on a padded copy of the image
+// instead of im2col (off by default; NEURACRAFT_SHIFTED_CONV=1 turns it on;
+// `bench` compares both).
+void setShiftedConvolutions(bool enabled);
+bool shiftedConvolutions();
+
 class Conv2D : public Layer {
 public:
     Conv2D(ImageShape input, std::size_t outChannels, std::size_t kernelSize,
@@ -52,6 +58,8 @@ private:
     // Strip convolution with weights either (patch x out) (outByPatch = false) or (out x patch).
     // weights == nullptr: products come from quantized_ (multiplyLeft, the GPU int8 kernel).
     Matrix stripConvolution(const Matrix& input, const float* weights, bool outByPatch) const;
+    // Stride-1 convolutions without im2col: k*k GEMMs on shifted views of a padded copy of the image.
+    Matrix shiftedConvolution(const Matrix& input, const float* weights, bool outByPatch) const;
     Matrix forwardQuantized(const Matrix& input) const;
     QuantizedWeights quantized_;
 

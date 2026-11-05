@@ -106,6 +106,7 @@ public:
 
     // Broadcasting helpers for (1 x cols) row vectors.
     Matrix addRowVector(const Matrix& row) const;
+    Matrix& addRowVectorInPlace(const Matrix& row);  // multi-threaded, no copy
     Matrix sumRows() const;   // column sums -> (1 x cols)
     Matrix sumCols() const;   // row sums    -> (rows x 1)
 

@@ -838,8 +838,12 @@ On the CPU side, AnimateDiff's spatial layers take the frames in batches
 (several frames at the low resolutions, about 2M values per batch), so int8
 layers there use the GEMM path and read their weights once per batch instead
 of once per frame; softmax, GELU and SiLU use vectorized `exp` / `erf`
-(`VectorMath.h`, within 2 ulp / 4e-7); fp16 weights are read and converted on
-every core. Float32 results are unchanged (87 dB PSNR against v1.11); a 4-frame
+(`VectorMath.h`, within 2 ulp / 4e-7); layer and group norms sum in vectorized
+float lanes and skip the training-only copies; dense layers add their bias in
+place; fp16 weights are read and converted on every core. Stride-1
+convolutions can also run as k × k shifted GEMMs on a padded copy of the image
+instead of im2col (`NEURACRAFT_SHIFTED_CONV=1`; `bench` compares both, off by
+default until it is measured faster on Accelerate). Float32 results are unchanged (87 dB PSNR against v1.11); a 4-frame
 256 × 256 float32 clip went from 24.8 to 18.9 s per step on the 2-core machine. Add `--profile` to any command to see where the time went — self
 time per GEMM device, int8 kernel, convolution im2col, attention, norms and
 loading:

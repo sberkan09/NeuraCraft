@@ -252,6 +252,21 @@ Matrix Matrix::addRowVector(const Matrix& row) const {
     return result;
 }
 
+Matrix& Matrix::addRowVectorInPlace(const Matrix& row) {
+    if (row.rows_ != 1 || row.cols_ != cols_) {
+        throw std::invalid_argument("Matrix addRowVectorInPlace: expected (1x" + std::to_string(cols_) +
+                                    ") got " + shapeOf(row.rows_, row.cols_));
+    }
+    const float* r = row.data_.data();
+    parallelFor(0, rows_, std::max<std::size_t>(1, 16384 / std::max<std::size_t>(1, cols_)), [&](std::size_t i0, std::size_t i1) {
+        for (std::size_t i = i0; i < i1; ++i) {
+            float* d = data_.data() + i * cols_;
+            for (std::size_t j = 0; j < cols_; ++j) d[j] += r[j];
+        }
+    });
+    return *this;
+}
+
 Matrix Matrix::sumRows() const {
     Matrix result(1, cols_);
     for (std::size_t i = 0; i < rows_; ++i)

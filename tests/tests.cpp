@@ -2431,6 +2431,23 @@ void writeTinyTaesd(const std::string& dir, bool zeroButOutputBias) {
 }
 } // namespace
 
+TEST(shifted_convolutions_match_im2col) {
+    setSeed(55);
+    struct Case { ImageShape in; std::size_t out, k, pad; };
+    for (const Case& c : {Case{{5, 17, 13}, 7, 3, 1}, Case{{3, 20, 20}, 4, 3, 0}, Case{{4, 18, 21}, 6, 5, 2}, Case{{16, 20, 20}, 8, 3, 1}})
+        for (bool int8 : {false, true}) {
+            Conv2D conv(c.in, c.out, c.k, 1, c.pad);
+            conv.bias() = Matrix::uniform(1, c.out, -1, 1);
+            if (int8) conv.quantize();
+            const Matrix x = Matrix::uniform(2, c.in.size(), -1, 1);
+            setShiftedConvolutions(false);
+            const Matrix ref = conv.forward(x, false);
+            setShiftedConvolutions(true);
+            const Matrix fast = conv.forward(x, false);
+            CHECK(fast.approxEquals(ref, 1e-4f));
+        }
+}
+
 TEST(int8_convolutions_and_large_products) {
     setSeed(100);
     // Small maps use the integer kernel, large ones expand weights for the float GEMM; both stay close

@@ -57,6 +57,7 @@ void addInPlace(Matrix& a, const Matrix& b) {
 
 // B images of (C x HW) channel-major rows <-> (B*HW x C) token rows, image after image.
 Matrix toTokens(const Matrix& x, std::size_t C, std::size_t HW) {
+    NC_PROFILE("token transposes");
     const std::size_t B = x.rows();
     Matrix t(B * HW, C);
     parallelFor(0, B * HW, 64, [&](std::size_t r0, std::size_t r1) {
@@ -69,6 +70,7 @@ Matrix toTokens(const Matrix& x, std::size_t C, std::size_t HW) {
     return t;
 }
 Matrix fromTokens(const Matrix& t, std::size_t HW) {
+    NC_PROFILE("token transposes");
     const std::size_t C = t.cols(), B = t.rows() / HW;
     Matrix x(B, C * HW);
     parallelFor(0, B * C, 8, [&](std::size_t i0, std::size_t i1) {
@@ -297,6 +299,8 @@ struct CrossTransformer {
         a = ln3.forward(h, false);
         const Matrix g = ff1.forward(a, false);  // B*HW x 8C: [hidden | gate]
         Matrix geglu(B * HW, 4 * C);
+        {
+        NC_PROFILE("geglu");
         parallelFor(0, B * HW, 16, [&](std::size_t r0, std::size_t r1) {
             for (std::size_t r = r0; r < r1; ++r) {
                 const float* row = g.data() + r * 8 * C;
@@ -307,6 +311,7 @@ struct CrossTransformer {
                 for (std::size_t j = 0; j < 4 * C; ++j) o[j] = row[j] * 0.5f * gate[j] * (1.0f + o[j]);
             }
         });
+        }
         addInPlace(h, ff2.forward(geglu, false));
         Matrix out = fromTokens(projOut.forward(h, false), HW);
         addInPlace(out, x);

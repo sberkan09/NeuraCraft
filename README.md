@@ -736,6 +736,24 @@ Studio UI builds its forms from), and `NeuraCraft models` lists the models it
 recognises under `data/` (Stable Diffusion, ControlNet, motion modules, LoRA,
 TAESD, IP-Adapter, CLIP vision, Depth Anything, Real-ESRGAN, RIFE).
 
+`NeuraCraft serve` starts the engine behind NeuraCraft Studio: a small local
+HTTP server (its own, no dependencies) that queues workflows, runs them one at
+a time and streams their progress as server-sent events — job state, step
+progress with a fraction, a live half-size TAESD preview after every denoising
+step, each step's output (frames served as JPEG) — and can cancel a job between
+steps. It listens on 127.0.0.1:8188, answers browsers only from
+`http://localhost` origins and takes changes only as `application/json`, so
+other web pages cannot drive it. The endpoints are listed in `Server.h`:
+
+```
+$ ./bin/NeuraCraft serve --data data
+$ curl -s -X POST -H 'Content-Type: application/json' -d @docs/workflows/lighthouse_3d.json localhost:8188/api/run
+{"job":1}
+$ curl -sN localhost:8188/api/events
+event: progress
+data: {"job":1,"step":1,"steps":4,"op":"txt2img","stage":"step 2/4","fraction":0.5}
+```
+
 Models are cached between steps: each one is loaded by the first step that
 needs it and released after the last one, so three `txt2img` steps with the
 same model and size load it once (on the 2-core machine 59 s → 32 s, the

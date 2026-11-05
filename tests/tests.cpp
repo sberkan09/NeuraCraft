@@ -17,7 +17,15 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 using namespace nc;
 
@@ -3884,6 +3892,136 @@ TEST(workflow_schema_checks_and_lists_models) {
     CHECK(json::parse(modelsJson(models)).array.size() == models.size());
     std::filesystem::remove_all(dir);
 }
+
+#ifndef _WIN32
+namespace {
+// One HTTP/1.1 request to 127.0.0.1:port; returns the status line's code and the body (and the raw head).
+struct HttpReply {
+    int status = 0;
+    std::string head, body;
+};
+HttpReply http(int port, const std::string& method, const std::string& path, const std::string& body = "",
+               const std::string& extraHeaders = "Content-Type: application/json\r\n") {
+    HttpReply r;
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<std::uint16_t>(port));
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) {
+        ::close(fd);
+        return r;
+    }
+    const std::string req = method + " " + path + " HTTP/1.1\r\nHost: localhost\r\n" + extraHeaders +
+                            "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    ::send(fd, req.data(), req.size(), 0);
+    std::string data;
+    char buf[4096];
+    ssize_t n;
+    while ((n = ::recv(fd, buf, sizeof buf, 0)) > 0) data.append(buf, static_cast<std::size_t>(n));
+    ::close(fd);
+    const std::size_t end = data.find("\r\n\r\n");
+    if (end == std::string::npos) return r;
+    r.head = data.substr(0, end);
+    r.body = data.substr(end + 4);
+    r.status = std::atoi(r.head.c_str() + 9);
+    return r;
+}
+} // namespace
+
+TEST(studio_server_api) {
+    const std::string work = tempPath("studio_server");
+    std::filesystem::create_directories(work);
+    Image a;
+    a.width = 40;
+    a.height = 30;
+    for (std::size_t i = 0; i < 40 * 30 * 3; ++i) a.pixels.push_back(static_cast<std::uint8_t>(i * 7 % 256));
+    savePng(work + "/a.png", a);
+    ServerOptions o;
+    o.port = 0;
+    o.baseDir = work;
+    o.dataDir = work;
+    StudioServer server(o);
+    server.start();
+    const int port = server.port();
+    CHECK(port > 0);
+
+    // Read-only endpoints.
+    HttpReply info = http(port, "GET", "/api/info");
+    CHECK(info.status == 200 && json::parse(info.body).at("api").number == 1);
+    CHECK(json::parse(http(port, "GET", "/api/ops").body).at("ops").array.size() == workflowOps().size());
+    CHECK(json::parse(http(port, "GET", "/api/models").body).isArray());
+    CHECK(http(port, "GET", "/api/nothing").status == 404);
+    const json::Value check = json::parse(http(port, "POST", "/api/check", R"({"steps": [{"op": "fly"}]})").body);
+    CHECK(check.at("problems").array.size() == 1);
+
+    // Browser rules: JSON bodies only, local origins only; preflight answers local origins.
+    CHECK(http(port, "POST", "/api/run", "{}", "Content-Type: text/plain\r\n").status == 415);
+    CHECK(http(port, "GET", "/api/info", "", "Origin: http://example.com\r\n").status == 403);
+    const HttpReply pre = http(port, "OPTIONS", "/api/run", "", "Origin: http://localhost:5173\r\n");
+    CHECK(pre.status == 204 && pre.head.find("Access-Control-Allow-Origin: http://localhost:5173") != std::string::npos);
+
+    // A job, followed on the event stream.
+    std::string events;
+    std::atomic<bool> listening{false};
+    std::thread listener([&] {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<std::uint16_t>(port));
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) return;
+        const std::string req = "GET /api/events HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        ::send(fd, req.data(), req.size(), 0);
+        timeval tv{5, 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        char buf[4096];
+        ssize_t n;
+        while ((n = ::recv(fd, buf, sizeof buf, 0)) > 0) {
+            events.append(buf, static_cast<std::size_t>(n));
+            if (events.find(": connected") != std::string::npos) listening = true;
+            if (events.find("\"state\":\"done\"") != std::string::npos) break;
+        }
+        ::close(fd);
+    });
+    for (int i = 0; i < 500 && !listening; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(listening.load());
+    const std::string wf = R"({"steps": [{"op": "load", "path": "a.png", "out": "a"},
+        {"op": "resize", "in": "a", "width": 20, "height": 16, "out": "small"}]})";
+    const HttpReply run = http(port, "POST", "/api/run", wf);
+    CHECK(run.status == 200);
+    const int id = static_cast<int>(json::parse(run.body).at("job").number);
+    json::Value job;
+    for (int i = 0; i < 500; ++i) {
+        job = json::parse(http(port, "GET", "/api/jobs/" + std::to_string(id)).body);
+        if (job.at("state").string == "done" || job.at("state").string == "failed") break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(job.at("state").string == "done" && job.at("outputs").array.size() == 2);
+    listener.join();
+    for (const char* e : {"event: job", "event: progress", "event: output", "event: log"}) CHECK(events.find(e) != std::string::npos);
+    const HttpReply frame = http(port, "GET", "/api/jobs/" + std::to_string(id) + "/clips/small/0.jpg");
+    CHECK(frame.status == 200 && frame.head.find("image/jpeg") != std::string::npos && frame.body.size() > 100);
+    CHECK(static_cast<unsigned char>(frame.body[0]) == 0xFF && static_cast<unsigned char>(frame.body[1]) == 0xD8);
+    CHECK(http(port, "GET", "/api/jobs/" + std::to_string(id) + "/clips/small/5.jpg").status == 404);
+    CHECK(http(port, "GET", "/api/jobs/999").status == 404);
+    CHECK(json::parse(http(port, "GET", "/api/jobs").body).array.size() == 1);
+    // A workflow with problems is refused before it is queued.
+    CHECK(http(port, "POST", "/api/run", R"({"steps": [{"op": "resize"}]})").status == 400);
+    // A failing job reports its error.
+    const int bad = static_cast<int>(json::parse(http(port, "POST", "/api/run", R"({"steps": [{"op": "load", "path": "missing.png"}]})").body)
+                                         .at("job")
+                                         .number);
+    for (int i = 0; i < 500; ++i) {
+        job = json::parse(http(port, "GET", "/api/jobs/" + std::to_string(bad)).body);
+        if (job.at("state").string != "queued" && job.at("state").string != "running") break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(job.at("state").string == "failed" && !job.at("error").string.empty());
+    server.stop();
+    CHECK(http(port, "GET", "/api/info").status == 0);  // closed
+}
+#endif
 
 TEST(json_workflows) {
     std::string tok;

@@ -374,7 +374,7 @@ int Model::opset() const { return impl_->opset; }
 std::size_t Model::nodeCount() const { return impl_->nodes.size(); }
 std::map<std::string, std::size_t> Model::operatorCounts() const {
     std::map<std::string, std::size_t> c;
-    for (const Node& n : impl_->nodes) ++c[n.op];
+    for (const Node& n : impl_->nodes) ++c[n.key()];
     return c;
 }
 std::size_t Model::parameterCount() const {
@@ -451,10 +451,8 @@ Model Model::load(const std::string& path) {
     const auto& ops = operatorTable();
     for (std::size_t k = 0; k < m.nodes.size(); ++k) {
         const Node& n = m.nodes[k];
-        if (!n.domain.empty() && n.domain != "ai.onnx")
-            throw std::runtime_error("onnx: " + path + ": operator " + n.domain + "::" + n.op + " (node '" + n.name + "') is not supported");
-        if (!ops.count(n.op))
-            throw std::runtime_error("onnx: " + path + ": operator " + n.op + " (node '" + n.name + "') is not supported");
+        if (!ops.count(n.key()))
+            throw std::runtime_error("onnx: " + path + ": operator " + n.key() + " (node '" + n.name + "') is not supported");
         for (const auto& [name, a] : n.attrs)
             if (a.graph) throw std::runtime_error("onnx: " + path + ": control flow (" + n.op + " node '" + n.name + "') is not supported");
         for (const std::string& in : n.inputs)
@@ -505,14 +503,14 @@ std::map<std::string, Tensor> Model::run(const std::map<std::string, Tensor>& fe
         }
         std::vector<Tensor> outs;
         try {
-            outs = ops.at(n.op)(n, ins, m.opset);
+            outs = ops.at(n.key())(n, ins, m.opset);
         } catch (const std::exception& e) {
             throw std::runtime_error("onnx: " + n.op + " node '" + n.name + "': " + e.what());
         }
         for (std::size_t o = 0; o < n.outputs.size() && o < outs.size(); ++o)
             if (!n.outputs[o].empty()) values[n.outputs[o]] = std::make_shared<const Tensor>(std::move(outs[o]));
         if (profile) {
-            auto& sp = spent[n.op];
+            auto& sp = spent[n.key()];
             sp.first += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             ++sp.second;
         }

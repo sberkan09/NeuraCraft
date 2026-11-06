@@ -65,6 +65,16 @@ bool gpuAttentionEnabled();
 // Vectorized dot product of two float arrays.
 float dot(const float* a, const float* b, std::size_t n);
 
+// For callers that write the left operand straight in the blocked kernel's layout, saving a
+// packing pass (convolutions building their im2col rows): rows in panels of gemmPanelRows(),
+// k-major - packed[(panel * K + k) * gemmPanelRows() + i] - rows past M zero. C = A x op(B)
+// (C is M x N with row stride ldc; B is K x N, or N x K when transB). Only for the CPU blocked
+// kernel: check gemmPackedAvailable() (false with Accelerate or on the GPU) and use gemm() otherwise.
+std::size_t gemmPanelRows();
+bool gemmPackedAvailable();
+void gemmPackedA(std::size_t M, std::size_t N, std::size_t K, const float* packedA, bool transB, const float* B, std::size_t ldb, float* C,
+                 std::size_t ldc);
+
 // Direct access to each implementation (used by tests and benchmarks).
 void gemmCpu(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
              const float* A, std::size_t lda, const float* B, std::size_t ldb,

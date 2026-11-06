@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -102,15 +103,31 @@ SafeTensors::SafeTensors(const std::string& path) : path_(path) {
                 if (mv.isString()) metadata_[k] = mv.string;
             continue;
         }
+        // Every number must be a whole, non-negative count within the file (the header is untrusted).
+        auto count = [&](const json::Value& x) {
+            if (!x.isNumber() || !(x.number >= 0) || x.number > 9007199254740992.0 || x.number != std::floor(x.number))
+                throw std::runtime_error("SafeTensors: bad number in the header for " + name);
+            return static_cast<std::size_t>(x.number);
+        };
+        if (!v.isObject() || !v.find("dtype") || !v.at("dtype").isString() || !v.find("shape") || !v.at("shape").isArray() || !v.find("data_offsets"))
+            throw std::runtime_error("SafeTensors: bad entry for " + name);
         Tensor t;
         t.dtype = v.at("dtype").string;
-        for (const auto& d : v.at("shape").array) t.shape.push_back(static_cast<std::size_t>(d.number));
+        std::size_t elements = 1;
+        bool overflow = false;
+        for (const auto& d : v.at("shape").array) {
+            t.shape.push_back(count(d));
+            if (t.shape.back() && elements > std::numeric_limits<std::size_t>::max() / t.shape.back()) overflow = true;
+            elements *= t.shape.back();
+        }
         const auto& offsets = v.at("data_offsets").array;
         if (offsets.size() != 2) throw std::runtime_error("SafeTensors: bad data_offsets for " + name);
-        t.begin = static_cast<std::size_t>(offsets[0].number);
-        t.end = static_cast<std::size_t>(offsets[1].number);
+        t.begin = count(offsets[0]);
+        t.end = count(offsets[1]);
         const std::size_t size = dtypeSize(t.dtype);
-        if (t.end < t.begin || dataStart_ + t.end > fileSize_ || (size && t.end - t.begin != t.elements() * size))
+        if (overflow || (size && elements > std::numeric_limits<std::size_t>::max() / size))
+            throw std::runtime_error("SafeTensors: tensor " + name + " is too big");
+        if (t.end < t.begin || t.end > fileSize_ - dataStart_ || (size && t.end - t.begin != elements * size))
             throw std::runtime_error("SafeTensors: inconsistent size for tensor " + name);
         tensors_.emplace(name, std::move(t));
     }

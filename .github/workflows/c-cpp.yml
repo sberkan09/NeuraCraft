@@ -44,6 +44,15 @@ jobs:
     - name: Train on the GPU (falls back to CPU without one)
       run: ./bin/NeuraCraft --gpu spiral
 
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Clang's sanitizer runtimes
+      run: sudo apt-get update && sudo apt-get install -y clang-18 libclang-rt-18-dev && sudo ln -sf /usr/bin/clang++-18 /usr/local/bin/clang++
+    - name: Fuzz the file readers (30 s each)
+      run: fuzz/run.sh 30
+
   studio-ui:
     runs-on: ubuntu-latest
     defaults:

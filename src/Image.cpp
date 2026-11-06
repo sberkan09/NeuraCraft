@@ -1021,7 +1021,8 @@ Image loadPng(const std::string& path) {
     checkDecodeSize(width, height, path);
     if (interlace) throw std::runtime_error("loadPng: interlaced PNGs are not supported");
     const unsigned samples = colorType == 0 ? 1 : colorType == 2 ? 3 : colorType == 3 ? 1 : colorType == 4 ? 2 : colorType == 6 ? 4 : 0;
-    if (!samples || (depth != 8 && depth != 16 && !((colorType == 0 || colorType == 3) && depth < 8)))
+    const bool lowDepth = (colorType == 0 || colorType == 3) && (depth == 1 || depth == 2 || depth == 4);
+    if (!samples || (depth != 8 && !(depth == 16 && colorType != 3) && !lowDepth))
         throw std::runtime_error("loadPng: unsupported colour type / bit depth in " + path);
     if (idat.size() < 2 || (idat[0] & 0x0F) != 8) throw std::runtime_error("loadPng: bad zlib stream in " + path);
     const std::size_t bitsPerPixel = samples * depth, stride = (width * bitsPerPixel + 7) / 8, bpp = std::max<std::size_t>(1, bitsPerPixel / 8);

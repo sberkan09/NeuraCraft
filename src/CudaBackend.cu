@@ -14,6 +14,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace nc {
 namespace cuda {
@@ -391,19 +392,11 @@ void gemmQ8(bool quantLeft, std::size_t M, std::size_t N, std::size_t K, const s
     check(cudaStreamSynchronize(st.stream), "gemmQ8");
 }
 
-void attention(std::size_t N, std::size_t M, std::size_t C, std::size_t heads, const float* q, const float* k, const float* v, float* out) {
-    State& st = state();
-    if (!st.ok) throw std::runtime_error("cuda: no device");
-    std::lock_guard<std::recursive_mutex> lock(st.mutex);
+namespace {
+// Attention on device operands (the caller holds the lock).
+void deviceAttention(State& st, const float* dQ, const float* dK, const float* dV, float* dO, std::size_t N, std::size_t M, std::size_t C,
+                     std::size_t heads) {
     const std::size_t dh = C / heads;
-    float* dQ = st.a.get<float>(N * C);
-    float* dKV = st.b.get<float>(2 * M * C);
-    float* dK = dKV;
-    float* dV = dKV + M * C;
-    float* dO = st.c.get<float>(N * C);
-    check(cudaMemcpyAsync(dQ, q, N * C * sizeof(float), cudaMemcpyHostToDevice, st.stream), "upload q");
-    check(cudaMemcpyAsync(dK, k, M * C * sizeof(float), cudaMemcpyHostToDevice, st.stream), "upload k");
-    check(cudaMemcpyAsync(dV, v, M * C * sizeof(float), cudaMemcpyHostToDevice, st.stream), "upload v");
     // Heads in groups whose scores (N x M each) fit in about 1 GB.
     const std::size_t perHead = N * M;
     const std::size_t group = std::max<std::size_t>(1, std::min(heads, (std::size_t(1) << 28) / std::max<std::size_t>(1, perHead)));
@@ -424,9 +417,325 @@ void attention(std::size_t N, std::size_t M, std::size_t C, std::size_t heads, c
                                         static_cast<long long>(perHead), &zero, dO + h0 * dh, static_cast<int>(C), static_cast<long long>(dh), g),
               "attention values");
     }
+}
+} // namespace
+
+void attention(std::size_t N, std::size_t M, std::size_t C, std::size_t heads, const float* q, const float* k, const float* v, float* out) {
+    State& st = state();
+    if (!st.ok) throw std::runtime_error("cuda: no device");
+    std::lock_guard<std::recursive_mutex> lock(st.mutex);
+    float* dQ = st.a.get<float>(N * C);
+    float* dKV = st.b.get<float>(2 * M * C);
+    float* dK = dKV;
+    float* dV = dKV + M * C;
+    float* dO = st.c.get<float>(N * C);
+    check(cudaMemcpyAsync(dQ, q, N * C * sizeof(float), cudaMemcpyHostToDevice, st.stream), "upload q");
+    check(cudaMemcpyAsync(dK, k, M * C * sizeof(float), cudaMemcpyHostToDevice, st.stream), "upload k");
+    check(cudaMemcpyAsync(dV, v, M * C * sizeof(float), cudaMemcpyHostToDevice, st.stream), "upload v");
+    deviceAttention(st, dQ, dK, dV, dO, N, M, C, heads);
     check(cudaMemcpyAsync(out, dO, N * C * sizeof(float), cudaMemcpyDeviceToHost, st.stream), "download");
     check(cudaStreamSynchronize(st.stream), "attention");
 }
+
+// ---- device graphs ----
+
+namespace {
+thread_local std::vector<void*>* gSessionParams = nullptr;  // uploads freed when the session ends
+
+__global__ void kGroupStats(const float* x, std::size_t n, float* stats) {
+    // one block per (image, group): stats[2 * blockIdx.x] = mean, [+1] = 1 / sqrt(var + eps) set later
+    const float* p = x + blockIdx.x * n;
+    __shared__ double sh[32];
+    double sum = 0.0;
+    for (std::size_t i = threadIdx.x; i < n; i += blockDim.x) sum += p[i];
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = (blockDim.x + 31) >> 5;
+    if (lane == 0) sh[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < warps ? sh[lane] : 0.0;
+        for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        if (lane == 0) sh[0] = sum;
+    }
+    __syncthreads();
+    const double mean = sh[0] / static_cast<double>(n);
+    __syncthreads();
+    double var = 0.0;
+    for (std::size_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const double d = p[i] - mean;
+        var += d * d;
+    }
+    for (int o = 16; o; o >>= 1) var += __shfl_xor_sync(0xffffffffu, var, o);
+    if (lane == 0) sh[warp] = var;
+    __syncthreads();
+    if (warp == 0) {
+        var = lane < warps ? sh[lane] : 0.0;
+        for (int o = 16; o; o >>= 1) var += __shfl_xor_sync(0xffffffffu, var, o);
+        if (lane == 0) {
+            stats[2 * blockIdx.x] = static_cast<float>(mean);
+            stats[2 * blockIdx.x + 1] = static_cast<float>(var / static_cast<double>(n));
+        }
+    }
+}
+
+__global__ void kGroupApply(const float* x, float* y, const float* stats, const float* gamma, const float* beta, std::size_t C, std::size_t HW,
+                            std::size_t groups, float eps, int silu, std::size_t total) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i >= total) return;
+    const std::size_t c = i / HW % C, b = i / (C * HW), g = c / (C / groups);
+    const float mean = stats[2 * (b * groups + g)], inv = rsqrtf(stats[2 * (b * groups + g) + 1] + eps);
+    float v = (x[i] - mean) * inv * gamma[c] + beta[c];
+    if (silu) v = v / (1.0f + __expf(-v));
+    y[i] = v;
+}
+
+__global__ void kSilu(float* x, std::size_t n) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i < n) x[i] = x[i] / (1.0f + __expf(-x[i]));
+}
+__global__ void kAdd(float* y, const float* x, std::size_t n) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i < n) y[i] += x[i];
+}
+__global__ void kAxpy(float* y, const float* x, float a, std::size_t n) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i < n) y[i] += a * x[i];
+}
+__global__ void kFill(float* y, float v, std::size_t n) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i < n) y[i] = v;
+}
+__global__ void kAddChannels(float* x, const float* v, std::size_t C, std::size_t HW, std::size_t total) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i < total) x[i] += v[i / HW % C];
+}
+__global__ void kAddRows(float* y, const float* bias, std::size_t cols, std::size_t total) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i < total) y[i] += bias[i % cols];
+}
+__global__ void kUpsample(const float* in, float* out, std::size_t H, std::size_t W, std::size_t f, std::size_t total) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i >= total) return;
+    const std::size_t OW = W * f, OH = H * f;
+    const std::size_t x = i % OW, y = i / OW % OH, plane = i / (OW * OH);
+    out[i] = in[(plane * H + y / f) * W + x / f];
+}
+__global__ void kPad(const float* in, float* out, std::size_t H, std::size_t W, std::size_t top, std::size_t left, std::size_t OH, std::size_t OW,
+                     std::size_t total) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i >= total) return;
+    const std::size_t x = i % OW, y = i / OW % OH, plane = i / (OW * OH);
+    const long iy = static_cast<long>(y) - static_cast<long>(top), ix = static_cast<long>(x) - static_cast<long>(left);
+    out[i] = iy >= 0 && ix >= 0 && iy < static_cast<long>(H) && ix < static_cast<long>(W) ? in[(plane * H + iy) * W + ix] : 0.0f;
+}
+// Tiled transpose: in (rows x cols) -> out (cols x rows).
+__global__ void kTranspose(const float* in, float* out, std::size_t rows, std::size_t cols) {
+    __shared__ float tile[32][33];
+    const std::size_t bx = blockIdx.x * 32, by = blockIdx.y * 32;
+    for (int j = threadIdx.y; j < 32; j += 8) {
+        const std::size_t r = by + j, c = bx + threadIdx.x;
+        if (r < rows && c < cols) tile[j][threadIdx.x] = in[r * cols + c];
+    }
+    __syncthreads();
+    for (int j = threadIdx.y; j < 32; j += 8) {
+        const std::size_t r = bx + j, c = by + threadIdx.x;  // out row = in column
+        if (r < cols && c < rows) out[r * rows + c] = tile[threadIdx.x][j];
+    }
+}
+__global__ void kLayerNorm(const float* x, float* y, std::size_t C, float eps, const float* gamma, const float* beta) {
+    const float* p = x + blockIdx.x * C;
+    float* o = y + blockIdx.x * C;
+    __shared__ float sh[32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = (blockDim.x + 31) >> 5;
+    auto reduce = [&](float v) {
+        for (int k = 16; k; k >>= 1) v += __shfl_xor_sync(0xffffffffu, v, k);
+        if (lane == 0) sh[warp] = v;
+        __syncthreads();
+        if (warp == 0) {
+            v = lane < warps ? sh[lane] : 0.0f;
+            for (int k = 16; k; k >>= 1) v += __shfl_xor_sync(0xffffffffu, v, k);
+            if (lane == 0) sh[0] = v;
+        }
+        __syncthreads();
+        const float r = sh[0];
+        __syncthreads();
+        return r;
+    };
+    float s = 0.0f;
+    for (std::size_t j = threadIdx.x; j < C; j += blockDim.x) s += p[j];
+    const float mean = reduce(s) / static_cast<float>(C);
+    float v = 0.0f;
+    for (std::size_t j = threadIdx.x; j < C; j += blockDim.x) {
+        const float d = p[j] - mean;
+        v += d * d;
+    }
+    const float inv = rsqrtf(reduce(v) / static_cast<float>(C) + eps);
+    for (std::size_t j = threadIdx.x; j < C; j += blockDim.x) o[j] = (p[j] - mean) * inv * gamma[j] + beta[j];
+}
+__global__ void kGeglu(const float* g, float* out, std::size_t H, std::size_t total) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i >= total) return;
+    const std::size_t r = i / H, j = i % H;
+    const float a = g[r * 2 * H + j], gate = g[r * 2 * H + H + j];
+    out[i] = a * 0.5f * gate * (1.0f + erff(gate * 0.70710678118654752f));
+}
+
+State& ready() {
+    State& st = state();
+    if (!st.ok) throw std::runtime_error("cuda: no device");
+    return st;
+}
+// A host parameter on the device: resident when big enough, else uploaded for this session.
+const float* param(State& st, const float* host, std::size_t rows, std::size_t cols) {
+    if (const float* r = residentCopy(st, host, rows, cols, cols)) return r;
+    float* d = nullptr;
+    check(cudaMallocAsync(reinterpret_cast<void**>(&d), rows * cols * sizeof(float), st.stream), "cudaMallocAsync");
+    check(cudaMemcpyAsync(d, host, rows * cols * sizeof(float), cudaMemcpyHostToDevice, st.stream), "upload parameter");
+    if (gSessionParams) gSessionParams->push_back(d);
+    else throw std::logic_error("cuda::dev: parameters need a Session");
+    return d;
+}
+} // namespace
+
+namespace dev {
+
+Session::Session() {
+    State& st = ready();
+    st.mutex.lock();
+    static bool pooled = false;
+    if (!pooled) {
+        // Keep up to a fifth of the device's memory in the stream-ordered pool between passes, so the
+        // activations of the next pass do not go back to the driver.
+        pooled = true;
+        int device = 0;
+        cudaMemPool_t pool;
+        std::size_t freeBytes = 0, total = 0;
+        if (cudaGetDevice(&device) == cudaSuccess && cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess &&
+            cudaMemGetInfo(&freeBytes, &total) == cudaSuccess) {
+            cuuint64_t keep = total / 5;
+            cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
+        }
+        cudaGetLastError();
+    }
+    gSessionParams = new std::vector<void*>();
+}
+Session::~Session() {
+    State& st = state();
+    for (void* p : *gSessionParams) cudaFreeAsync(p, st.stream);
+    delete gSessionParams;
+    gSessionParams = nullptr;
+    cudaStreamSynchronize(st.stream);
+    st.mutex.unlock();
+}
+
+float* alloc(std::size_t floats) {
+    State& st = ready();
+    float* p = nullptr;
+    check(cudaMallocAsync(reinterpret_cast<void**>(&p), std::max<std::size_t>(1, floats) * sizeof(float), st.stream), "cudaMallocAsync");
+    return p;
+}
+void release(float* p) {
+    if (p) cudaFreeAsync(p, state().stream);
+}
+void upload(float* dst, const float* host, std::size_t n) {
+    check(cudaMemcpyAsync(dst, host, n * sizeof(float), cudaMemcpyHostToDevice, ready().stream), "upload");
+}
+void download(float* host, const float* src, std::size_t n) {
+    State& st = ready();
+    check(cudaMemcpyAsync(host, src, n * sizeof(float), cudaMemcpyDeviceToHost, st.stream), "download");
+    check(cudaStreamSynchronize(st.stream), "download");
+}
+void copy(float* dst, const float* src, std::size_t n) {
+    check(cudaMemcpyAsync(dst, src, n * sizeof(float), cudaMemcpyDeviceToDevice, ready().stream), "copy");
+}
+void fill(float* dst, float value, std::size_t n) {
+    kFill<<<blocks(n), 256, 0, ready().stream>>>(dst, value, n);
+}
+
+void conv2d(const float* in, std::size_t B, std::size_t C, std::size_t H, std::size_t W, const float* hostWeights, bool outByPatch,
+            const float* hostBias, std::size_t outC, std::size_t k, std::size_t stride, std::size_t pad, float* out) {
+    State& st = ready();
+    const std::size_t OH = (H + 2 * pad - k) / stride + 1, OW = (W + 2 * pad - k) / stride + 1, P = OH * OW, patch = C * k * k;
+    const std::size_t wRows = outByPatch ? outC : patch, wCols = outByPatch ? patch : outC;
+    // Small parameters first: fetching a resident weight may evict another, never the one fetched last.
+    const float* dBias = hostBias ? param(st, hostBias, 1, outC) : nullptr;
+    const float* dW = param(st, hostWeights, wRows, wCols);
+    const bool plain = k == 1 && stride == 1 && pad == 0;
+    const std::size_t strip = plain ? P : std::max<std::size_t>(1, std::min(P, (std::size_t(1) << 26) / std::max<std::size_t>(1, patch)));
+    float* dCols = plain ? nullptr : st.s.get<float>(patch * strip);
+    for (std::size_t b = 0; b < B; ++b) {
+        const float* img = in + b * C * H * W;
+        float* dst = out + b * outC * P;
+        for (std::size_t p0 = 0; p0 < P; p0 += strip) {
+            const std::size_t n = std::min(strip, P - p0);
+            const float* cols = img;
+            std::size_t ldCols = P;
+            if (!plain) {
+                im2col<<<blocks(patch * n), 256, 0, st.stream>>>(img, C, H, W, k, stride, pad, OW, p0, n, dCols);
+                cols = dCols;
+                ldCols = n;
+            }
+            deviceGemm(st, !outByPatch, false, outC, n, patch, dW, wCols, cols, ldCols, dst + p0, P, 0.0f);
+        }
+        if (dBias) kAddChannels<<<blocks(outC * P), 256, 0, st.stream>>>(dst, dBias, outC, P, outC * P);
+    }
+    check(cudaGetLastError(), "conv2d");
+}
+
+void groupNorm(const float* in, float* out, std::size_t B, std::size_t C, std::size_t HW, std::size_t groups, float eps, const float* hostGamma,
+               const float* hostBeta, bool silu) {
+    State& st = ready();
+    const float* g = param(st, hostGamma, 1, C);
+    const float* bt = param(st, hostBeta, 1, C);
+    float* stats = st.scales.get<float>(2 * B * groups);
+    kGroupStats<<<static_cast<unsigned>(B * groups), 512, 0, st.stream>>>(in, C / groups * HW, stats);
+    kGroupApply<<<blocks(B * C * HW), 256, 0, st.stream>>>(in, out, stats, g, bt, C, HW, groups, eps, silu ? 1 : 0, B * C * HW);
+    check(cudaGetLastError(), "group norm");
+}
+void silu(float* x, std::size_t n) { kSilu<<<blocks(n), 256, 0, ready().stream>>>(x, n); }
+void add(float* y, const float* x, std::size_t n) { kAdd<<<blocks(n), 256, 0, ready().stream>>>(y, x, n); }
+void axpy(float* y, const float* x, float a, std::size_t n) { kAxpy<<<blocks(n), 256, 0, ready().stream>>>(y, x, a, n); }
+void addChannels(float* x, const float* hostPerChannel, std::size_t B, std::size_t C, std::size_t HW) {
+    State& st = ready();
+    const float* v = param(st, hostPerChannel, 1, C);
+    kAddChannels<<<blocks(B * C * HW), 256, 0, st.stream>>>(x, v, C, HW, B * C * HW);
+}
+void upsample(const float* in, float* out, std::size_t B, std::size_t C, std::size_t H, std::size_t W, std::size_t factor) {
+    const std::size_t total = B * C * H * W * factor * factor;
+    kUpsample<<<blocks(total), 256, 0, ready().stream>>>(in, out, H, W, factor, total);
+}
+void pad(const float* in, float* out, std::size_t B, std::size_t C, std::size_t H, std::size_t W, std::size_t top, std::size_t bottom,
+         std::size_t left, std::size_t right) {
+    const std::size_t OH = H + top + bottom, OW = W + left + right, total = B * C * OH * OW;
+    kPad<<<blocks(total), 256, 0, ready().stream>>>(in, out, H, W, top, left, OH, OW, total);
+}
+void toTokens(const float* in, float* out, std::size_t C, std::size_t HW) {
+    const dim3 grid(static_cast<unsigned>((HW + 31) / 32), static_cast<unsigned>((C + 31) / 32)), block(32, 8);
+    kTranspose<<<grid, block, 0, ready().stream>>>(in, out, C, HW);
+}
+void fromTokens(const float* in, float* out, std::size_t HW, std::size_t C) {
+    const dim3 grid(static_cast<unsigned>((C + 31) / 32), static_cast<unsigned>((HW + 31) / 32)), block(32, 8);
+    kTranspose<<<grid, block, 0, ready().stream>>>(in, out, HW, C);
+}
+void linear(const float* x, std::size_t N, std::size_t in, const float* hostW, bool transW, const float* hostBias, std::size_t out, float* y) {
+    State& st = ready();
+    const float* b = hostBias ? param(st, hostBias, 1, out) : nullptr;
+    const float* w = transW ? param(st, hostW, out, in) : param(st, hostW, in, out);
+    deviceGemm(st, false, transW, N, out, in, x, in, w, transW ? in : out, y, out, 0.0f);
+    if (b) kAddRows<<<blocks(N * out), 256, 0, st.stream>>>(y, b, out, N * out);
+}
+void layerNorm(const float* x, float* y, std::size_t N, std::size_t C, float eps, const float* hostGamma, const float* hostBeta) {
+    State& st = ready();
+    const float* g = param(st, hostGamma, 1, C);
+    const float* b = param(st, hostBeta, 1, C);
+    kLayerNorm<<<static_cast<unsigned>(N), 256, 0, st.stream>>>(x, y, C, eps, g, b);
+}
+void attention(const float* q, const float* k, const float* v, float* out, std::size_t N, std::size_t M, std::size_t C, std::size_t heads) {
+    deviceAttention(ready(), q, k, v, out, N, M, C, heads);
+}
+void geglu(const float* g, float* out, std::size_t N, std::size_t H) { kGeglu<<<blocks(N * H), 256, 0, ready().stream>>>(g, out, H, N * H); }
+
+} // namespace dev
 
 } // namespace cuda
 } // namespace nc

@@ -18,15 +18,16 @@ M=/data/sd-turbo
 mkdir -p /data
 [ -s $M/unet/diffusion_pytorch_model.fp16.safetensors ] || bash scripts/download_sd_turbo.sh $M vae text_encoder unet > /tmp/dl.log 2>&1 || tail -5 /tmp/dl.log
 # (the CPU picture is made once: it is the reference)
-for dev in gpu gpu32 cpu; do
+for dev in gpu gpu32 layers cpu; do  # layers: the GPU without device graphs (layer by layer)
     [ $dev = cpu ] && [ -s /tmp/fox_cpu32.png ] && continue
     flag=""; [ $dev != cpu ] && flag=--gpu
     tf=1; [ $dev = gpu32 ] && tf=0
+    graph=1; [ $dev = layers ] && graph=0
     s=$(date +%s.%N)
     prof=""; [ $dev = gpu ] && prof=--profile
     fp=""; name=$dev
     if [ $dev = cpu ]; then fp=--fp32; name=cpu32; fi  # the GPU keeps float weights: compare with float on the CPU
-    NEURACRAFT_CUDA_TF32=$tf $NC $flag $prof txt2img $M "a red fox in the snow, photo" /tmp/fox_$name.png --steps 1 --seed 7 --size 512 $fp > /tmp/sd_$dev.log 2>&1 || tail -5 /tmp/sd_$dev.log
+    NEURACRAFT_GPU_GRAPH=$graph NEURACRAFT_CUDA_TF32=$tf $NC $flag $prof txt2img $M "a red fox in the snow, photo" /tmp/fox_$name.png --steps 1 --seed 7 --size 512 $fp > /tmp/sd_$dev.log 2>&1 || tail -5 /tmp/sd_$dev.log
     echo "$dev: $(echo "$(date +%s.%N) - $s" | bc 2>/dev/null || python3 -c "print(round($(date +%s.%N)-$s,2))") s"
     grep -iE "load unet|step [0-9]|vae decode|wrote" /tmp/sd_$dev.log | tail -4
 done
@@ -36,7 +37,7 @@ python3 - <<'PY'
 import numpy as np, base64, io
 from PIL import Image
 b = np.asarray(Image.open("/tmp/fox_cpu32.png").convert("RGB")).astype(np.float64)
-for name in ["gpu", "gpu32"]:
+for name in ["gpu", "gpu32", "layers"]:
     a = np.asarray(Image.open("/tmp/fox_%s.png" % name).convert("RGB")).astype(np.float64)
     mse = ((a - b) ** 2).mean()
     print("%s vs cpu: mean abs %.3f, PSNR %.1f dB" % (name, np.abs(a - b).mean(), 10 * np.log10(255 ** 2 / max(mse, 1e-9))))

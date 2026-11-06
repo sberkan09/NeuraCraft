@@ -48,6 +48,8 @@ public:
     Matrix& bias() { return bias_; }
 
     std::size_t kernelSize() const { return kernel_; }
+    std::size_t stride() const { return stride_; }
+    std::size_t padding() const { return padding_; }
     // Int8 weights for inference (integer products on im2col rows); backward
     // then throws and parameters() lists nothing.
     std::size_t quantize() override;

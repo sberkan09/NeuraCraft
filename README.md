@@ -565,14 +565,29 @@ depth_anything_v2_small.onnx: opset 14, 823 nodes, 24711136 parameters (loaded i
 $ ./bin/NeuraCraft onnx model.onnx out/ input_0.pb      # run on TensorProto inputs
 ```
 
-`tests/onnx/make_cases.py` writes 114 operator cases with onnxruntime's
+`tests/onnx/make_cases.py` writes 125 operator cases with onnxruntime's
 outputs, and the tests check every one. Real models match onnxruntime to about
 1e-6 (max abs): MobileNet v2, u2netp (background masks), Depth Anything v2
-small and Real-ESRGAN x4plus. On the 2-core CPU the executor takes 1-3x
-onnxruntime's time (Real-ESRGAN 128 -> 512: 14.8 s vs 4.7 s);
-`NEURACRAFT_ONNX_PROFILE=1` prints the time per operator type. Control flow
-(`If` / `Loop`), quantised operators and strings are not supported: such a
-model fails to load with the operator and node named.
+small and Real-ESRGAN x4plus.
+
+Quantised models run too: `QuantizeLinear` / `DequantizeLinear` (per tensor,
+per axis, blocked), `DynamicQuantizeLinear`, `MatMulInteger`, `ConvInteger`,
+`QLinearMatMul`, `QLinearConv`, and Microsoft's 4-bit `com.microsoft`
+`MatMulNBits` (the q4 exports of transformers.js / Optimum) and `MatMulBnb4`
+(NF4 / FP4). Integer products use the float GEMM: exact up to 2^24, within
+float rounding beyond. Depth Anything's q4 and bnb4 exports match onnxruntime
+to about 5e-6; its dynamic int8 export agrees to quantisation noise (outputs
+correlate 0.9996 on a photo, each within about 2 % of the float model); the
+fp16 exports are computed in float, so they come out slightly more precise.
+
+Speed on the 2-core CPU, against onnxruntime 1.29: Real-ESRGAN 128 -> 512
+7.5 s vs 4.4 s, Depth Anything 266 x 350 0.8 s vs 0.3 s, u2netp 0.8 s vs 0.4 s.
+Convolutions write their im2col rows straight in the GEMM kernel's packed
+layout and multiply pixels by output channels, the long side first; built with
+`NEURACRAFT_NATIVE` on an AVX-512 CPU the kernel uses a 12 x 32 tile (a 1024³
+product: 150 -> 257 GFLOPS). `NEURACRAFT_ONNX_PROFILE=1` prints the time per
+operator type. Control flow (`If` / `Loop`) and strings are not supported:
+such a model fails to load with the operator and node named.
 
 In workflows (and Studio's "ONNX modeli" task) the `onnx` step runs a picture
 model on every frame of a clip. Pre- and post-processing come from a manifest

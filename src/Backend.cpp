@@ -34,14 +34,20 @@ std::atomic<std::size_t> gGpuMinWork{std::size_t(1) << 22};  // ~4M multiply-add
 // Register tile. 6x16 fits in 16 AVX or 32 NEON registers; plain SSE (16
 // four-wide registers) does best with 4x16. Override with -DNC_GEMM_MR/NR.
 #ifndef NC_GEMM_MR
-#if defined(__AVX__) || defined(__aarch64__) || defined(_M_ARM64)
+#if defined(__AVX512F__)
+#define NC_GEMM_MR 12  // 12 x 2 sixteen-wide accumulators of the 32 AVX-512 registers
+#elif defined(__AVX__) || defined(__aarch64__) || defined(_M_ARM64)
 #define NC_GEMM_MR 6
 #else
 #define NC_GEMM_MR 4
 #endif
 #endif
 #ifndef NC_GEMM_NR
+#if defined(__AVX512F__)
+#define NC_GEMM_NR 32
+#else
 #define NC_GEMM_NR 16
+#endif
 #endif
 constexpr std::size_t MR = NC_GEMM_MR;   // rows of the register tile
 constexpr std::size_t NR = NC_GEMM_NR;   // columns of the register tile
@@ -110,7 +116,10 @@ void packB(bool trans, std::size_t N, std::size_t K, const float* B, std::size_t
 // the compiler keep acc in vector registers.
 #if defined(__GNUC__) || defined(__clang__)
 // Explicit SIMD vectors (GCC/Clang extension; SSE/AVX on x86, NEON on ARM).
-#if defined(__AVX__)
+#if defined(__AVX512F__)
+constexpr std::size_t VW = 16;
+typedef float vfloat __attribute__((vector_size(64)));
+#elif defined(__AVX__)
 constexpr std::size_t VW = 8;
 typedef float vfloat __attribute__((vector_size(32)));
 #else
@@ -213,6 +222,37 @@ void checkDims(std::size_t M, std::size_t N, std::size_t K, bool transA, bool tr
 
 } // namespace
 
+namespace {
+// C (M x N) += packed A (panels of MR rows) x packed B (panels of NR columns), both k-major over all K.
+// Threads own disjoint row panels, so results do not depend on thread count.
+void blockedCore(std::size_t M, std::size_t N, std::size_t K, const float* packedA, const float* packedB, float* C, std::size_t ldc) {
+    const std::size_t aPanels = (M + MR - 1) / MR;
+    const std::size_t bPanels = (N + NR - 1) / NR;
+    const std::size_t perPanel = MR * N * K;
+    const std::size_t grain = std::max<std::size_t>(1, (std::size_t(1) << 18) / std::max<std::size_t>(1, perPanel));
+    parallelFor(0, aPanels, grain, [&](std::size_t ap0, std::size_t ap1) {
+        float acc[MR][NR];
+        for (std::size_t k0 = 0; k0 < K; k0 += KC) {
+            const std::size_t kc = std::min(KC, K - k0);
+            for (std::size_t bp = 0; bp < bPanels; ++bp) {
+                const float* bPanel = packedB + (bp * K + k0) * NR;
+                const std::size_t c0 = bp * NR;
+                const std::size_t width = std::min(NR, N - c0);
+                for (std::size_t ap = ap0; ap < ap1; ++ap) {
+                    microKernel(kc, packedA + (ap * K + k0) * MR, bPanel, acc);
+                    const std::size_t r0 = ap * MR;
+                    const std::size_t height = std::min(MR, M - r0);
+                    for (std::size_t i = 0; i < height; ++i) {
+                        float* c = C + (r0 + i) * ldc + c0;
+                        for (std::size_t j = 0; j < width; ++j) c[j] += acc[i][j];
+                    }
+                }
+            }
+        }
+    });
+}
+} // namespace
+
 void gemmBlocked(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
                  const float* A, std::size_t lda, const float* B, std::size_t ldb,
                  float* C, std::size_t ldc, bool accumulate) {
@@ -245,30 +285,27 @@ void gemmBlocked(bool transA, bool transB, std::size_t M, std::size_t N, std::si
     std::vector<float> packedA(aPanels * MR * K), packedB(bPanels * NR * K);
     packA(transA, M, K, A, lda, packedA.data());
     packB(transB, N, K, B, ldb, packedB.data());
+    blockedCore(M, N, K, packedA.data(), packedB.data(), C, ldc);
+}
 
-    // Threads own disjoint row panels, so results do not depend on thread count.
-    const std::size_t perPanel = MR * N * K;
-    const std::size_t grain = std::max<std::size_t>(1, (std::size_t(1) << 18) / std::max<std::size_t>(1, perPanel));
-    parallelFor(0, aPanels, grain, [&](std::size_t ap0, std::size_t ap1) {
-        float acc[MR][NR];
-        for (std::size_t k0 = 0; k0 < K; k0 += KC) {
-            const std::size_t kc = std::min(KC, K - k0);
-            for (std::size_t bp = 0; bp < bPanels; ++bp) {
-                const float* bPanel = packedB.data() + (bp * K + k0) * NR;
-                const std::size_t c0 = bp * NR;
-                const std::size_t width = std::min(NR, N - c0);
-                for (std::size_t ap = ap0; ap < ap1; ++ap) {
-                    microKernel(kc, packedA.data() + (ap * K + k0) * MR, bPanel, acc);
-                    const std::size_t r0 = ap * MR;
-                    const std::size_t height = std::min(MR, M - r0);
-                    for (std::size_t i = 0; i < height; ++i) {
-                        float* c = C + (r0 + i) * ldc + c0;
-                        for (std::size_t j = 0; j < width; ++j) c[j] += acc[i][j];
-                    }
-                }
-            }
-        }
-    });
+std::size_t gemmPanelRows() { return MR; }
+
+bool gemmPackedAvailable() {
+#ifdef NEURACRAFT_HAS_ACCELERATE
+    return false;
+#else
+    return currentDevice() == Device::CPU;
+#endif
+}
+
+void gemmPackedA(std::size_t M, std::size_t N, std::size_t K, const float* packedA, bool transB, const float* B, std::size_t ldb, float* C,
+                 std::size_t ldc) {
+    if (M == 0 || N == 0) return;
+    for (std::size_t i = 0; i < M; ++i) std::fill(C + i * ldc, C + i * ldc + N, 0.0f);
+    if (K == 0) return;
+    std::vector<float> packedB(((N + NR - 1) / NR) * NR * K);
+    packB(transB, N, K, B, ldb, packedB.data());
+    blockedCore(M, N, K, packedA, packedB.data(), C, ldc);
 }
 
 float dot(const float* a, const float* b, std::size_t n) { return dotProduct(a, b, n); }

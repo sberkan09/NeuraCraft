@@ -146,6 +146,69 @@ case("tiny_net", [
     {"x": img}, inits=[("w1", f32(4, 3, 3, 3)), ("b1", f32(4)), ("s1", f32(4)), ("o1", f32(4)), ("shp", np.array([1, 4, 64], np.int64)),
                        ("wq", f32(4, 4)), ("ax", np.array([1], np.int64))], opset=18)
 
+# quantised operators
+u8 = lambda *s: rng.integers(0, 256, s).astype(np.uint8)
+i8 = lambda *s: rng.integers(-128, 128, s).astype(np.int8)
+case("dynamic_quantize", [n("DynamicQuantizeLinear", ["x"], ["y", "s", "z"])], {"x": f32(3, 7) * 3}, outputs=["y", "s", "z"],
+     out_types={"y": T.UINT8, "z": T.UINT8}, opset=13)
+case("matmul_integer", [n("MatMulInteger", ["a", "b", "az", "bz"], ["y"])], {"a": u8(3, 8)},
+     inits=[("b", i8(8, 5)), ("az", np.array(7, np.uint8)), ("bz", i8(5))], out_types={"y": T.INT32}, opset=13)
+case("conv_integer", [n("ConvInteger", ["x", "w", "xz", "wz"], ["y"], pads=[1, 1, 1, 1])], {"x": u8(1, 2, 5, 5)},
+     inits=[("w", u8(3, 2, 3, 3)), ("xz", np.array(100, np.uint8)), ("wz", np.array(128, np.uint8))], out_types={"y": T.INT32}, opset=13)
+case("quantize_dequantize_axis", [n("QuantizeLinear", ["x", "s", "z"], ["q"], axis=1), n("DequantizeLinear", ["q", "s", "z"], ["y"], axis=1)],
+     {"x": f32(2, 3, 4) * 2}, inits=[("s", np.array([0.01, 0.02, 0.05], np.float32)), ("z", np.array([0, 10, -5], np.int8))], outputs=["q", "y"],
+     out_types={"q": T.INT8}, opset=13)
+case("dequantize_scalar_u8", [n("DequantizeLinear", ["x", "s", "z"], ["y"])], {"x": u8(4, 4)},
+     inits=[("s", np.array(0.1, np.float32)), ("z", np.array(128, np.uint8))], opset=13)
+case("qlinear_matmul", [n("QLinearMatMul", ["a", "as", "az", "b", "bs", "bz", "ys", "yz"], ["y"])], {"a": u8(3, 6)},
+     inits=[("as", np.array(0.02, np.float32)), ("az", np.array(120, np.uint8)), ("b", u8(6, 4)), ("bs", np.array(0.03, np.float32)),
+            ("bz", np.array(130, np.uint8)), ("ys", np.array(0.05, np.float32)), ("yz", np.array(128, np.uint8))], out_types={"y": T.UINT8}, opset=13)
+case("qlinear_conv", [n("QLinearConv", ["x", "xs", "xz", "w", "ws", "wz", "ys", "yz", "b"], ["y"], pads=[1, 1, 1, 1])], {"x": u8(1, 2, 5, 5)},
+     inits=[("xs", np.array(0.02, np.float32)), ("xz", np.array(110, np.uint8)), ("w", i8(3, 2, 3, 3)), ("ws", np.array([0.01, 0.02, 0.015], np.float32)),
+            ("wz", np.zeros(3, np.int8)), ("ys", np.array(0.1, np.float32)), ("yz", np.array(128, np.uint8)), ("b", rng.integers(-500, 500, 3).astype(np.int32))],
+     out_types={"y": T.UINT8}, opset=13)
+def nbits_case(name, K, N, bs, with_zp, bias):
+    W = f32(K, N)
+    blocks = (K + bs - 1) // bs
+    Wp = np.zeros((blocks * bs, N), np.float32); Wp[:K] = W
+    q = np.zeros((N, blocks, bs), np.uint8); scales = np.zeros((N, blocks), np.float32); zps = np.zeros((N, blocks), np.uint8)
+    for c in range(N):
+        for b in range(blocks):
+            v = Wp[b * bs:(b + 1) * bs, c]
+            lo, hi = min(v.min(), 0), max(v.max(), 0)
+            s = (hi - lo) / 15 if hi > lo else 1.0
+            z = int(np.clip(np.round(-lo / s), 0, 15)) if with_zp else 8
+            if not with_zp: s = max(abs(lo), abs(hi)) / 7 if hi > lo else 1.0
+            scales[c, b] = s; zps[c, b] = z
+            q[c, b] = np.clip(np.round(v / s) + z, 0, 15)
+    packed = (q[:, :, 0::2] | (q[:, :, 1::2] << 4)).astype(np.uint8)
+    ins = ["a", "b", "s"] + (["z"] if with_zp else ([""] if bias else [])) + (["", "bias"] if bias else [])
+    inits = [("b", packed), ("s", scales.reshape(-1))]
+    if with_zp:
+        zb = (blocks + 1) // 2
+        zpk = np.zeros((N, zb), np.uint8)
+        for b in range(blocks): zpk[:, b // 2] |= (zps[:, b] << ((b % 2) * 4)).astype(np.uint8)
+        inits.append(("z", zpk.reshape(-1)))
+    if bias: inits.append(("bias", f32(N)))
+    node = h.make_node("MatMulNBits", ins, ["y"], domain="com.microsoft", K=K, N=N, bits=4, block_size=bs)
+    vin = [h.make_tensor_value_info("a", T.FLOAT, [2, 3, K])]
+    g = h.make_graph([node], name, vin, [h.make_tensor_value_info("y", T.FLOAT, None)], initializer=[nh.from_array(v, k) for k, v in inits])
+    m = h.make_model(g, opset_imports=[h.make_opsetid("", 17), h.make_opsetid("com.microsoft", 1)]); m.ir_version = 8
+    cases.append((name, m, {"a": f32(2, 3, K)}, ["y"]))
+nbits_case("matmul_nbits_zp", 40, 6, 16, True, False)
+nbits_case("matmul_nbits_symmetric_bias", 64, 5, 32, False, True)
+def bnb4_case(name, K, N, bs, quant_type):
+    absmax_n = (N * K + bs - 1) // bs
+    codes = rng.integers(0, 16, N * K + (N * K) % 2).astype(np.uint8)
+    packed = ((codes[0::2] << 4) | codes[1::2]).astype(np.uint8)
+    node = h.make_node("MatMulBnb4", ["a", "b", "m"], ["y"], domain="com.microsoft", K=K, N=N, block_size=bs, quant_type=quant_type)
+    g = h.make_graph([node], name, [h.make_tensor_value_info("a", T.FLOAT, [3, K])], [h.make_tensor_value_info("y", T.FLOAT, None)],
+                     initializer=[nh.from_array(packed, "b"), nh.from_array(f32(absmax_n, lo=0.1, hi=1.0), "m")])
+    m = h.make_model(g, opset_imports=[h.make_opsetid("", 17), h.make_opsetid("com.microsoft", 1)]); m.ir_version = 8
+    cases.append((name, m, {"a": f32(3, K)}, ["y"]))
+bnb4_case("matmul_bnb4_nf4", 32, 6, 64, 1)
+bnb4_case("matmul_bnb4_fp4", 16, 4, 16, 0)
+
 shutil.rmtree(OUT, ignore_errors=True)
 for name, model, inputs, outputs in cases:
     # (outputs are declared without shapes, which onnx.checker refuses; onnxruntime accepts them)

@@ -30,6 +30,9 @@ struct Node {
     std::vector<std::string> inputs, outputs;
     std::map<std::string, Attribute> attrs;
 
+    // The operator table key: "Op" in the default domain, "domain::Op" elsewhere (com.microsoft::MatMulNBits).
+    std::string key() const { return domain.empty() || domain == "ai.onnx" ? op : domain + "::" + op; }
+
     const Attribute* attr(const std::string& n) const {
         auto it = attrs.find(n);
         return it == attrs.end() ? nullptr : &it->second;

@@ -9,6 +9,8 @@
 #include "VectorMath.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -355,6 +357,94 @@ Outs convOp(const Node& n, const Ins& in, int) {
     // Output rows per pass so the column buffer (Kc x rows * OW) stays near 1 M floats: it is then
     // still in cache when the product reads it.
     const std::size_t rowsPerPass = std::max<std::size_t>(1, std::min(OH, (std::size_t(1) << 20) / std::max<std::size_t>(1, Kc * OW)));
+    // With the blocked CPU kernel: pixels as the long side of the product, their im2col rows written
+    // straight in the kernel's packed layout (no packing pass), the few output channels as columns.
+    if (!pointwise && gemmPackedAvailable()) {
+        const std::size_t R = gemmPanelRows(), P = OH * OW;
+        // Up to 4 M floats of rows per product: bigger products split better over the threads.
+        const std::size_t chunk = std::max(R, ((std::size_t(1) << 22) / std::max<std::size_t>(1, Kc)) / R * R);
+        std::vector<float> packed, tmp;
+        for (std::size_t b = 0; b < N; ++b)
+            for (std::size_t gr = 0; gr < group; ++gr) {
+                const float* x = X.f.data() + (b * C + gr * Cg) * H * Wd;
+                const float* w = W.f.data() + gr * Mg * Kc;
+                float* y = r.f.data() + (b * M + gr * Mg) * P;
+                for (std::size_t p0 = 0; p0 < P; p0 += chunk) {
+                    const std::size_t pc = std::min(chunk, P - p0), panels = (pc + R - 1) / R;
+                    packed.resize(panels * R * Kc);
+                    parallelFor(0, panels, 1, [&](std::size_t a0, std::size_t a1) {
+                        std::vector<std::int64_t> iy0(R), ix0(R);
+                        std::vector<bool> live(R);
+                        for (std::size_t pa = a0; pa < a1; ++pa) {
+                            for (std::size_t i = 0; i < R; ++i) {
+                                const std::size_t q = p0 + pa * R + i;
+                                live[i] = q < p0 + pc;
+                                iy0[i] = live[i] ? static_cast<std::int64_t>((q / OW) * g.sh) - g.padTop : 0;
+                                ix0[i] = live[i] ? static_cast<std::int64_t>((q % OW) * g.sw) - g.padLeft : 0;
+                            }
+                            float* dst = packed.data() + pa * Kc * R;
+                            const std::size_t q0 = p0 + pa * R;
+                            if (live[R - 1] && q0 / OW == (q0 + R - 1) / OW) {
+                                // The usual case: R neighbours in one output row - per (c, ki, kj) one input
+                                // row segment (a straight copy when the stride is 1 and it is inside).
+                                const std::int64_t iyBase = iy0[0], ixBase = ix0[0];
+                                const std::int64_t sw = static_cast<std::int64_t>(g.sw), Wi = static_cast<std::int64_t>(Wd);
+                                std::size_t k = 0;
+                                for (std::size_t c = 0; c < Cg; ++c) {
+                                    const float* plane = x + c * H * Wd;
+                                    for (std::size_t ki = 0; ki < g.kh; ++ki) {
+                                        const std::int64_t iy = iyBase + static_cast<std::int64_t>(ki * g.dh);
+                                        if (iy < 0 || iy >= static_cast<std::int64_t>(H)) {
+                                            std::fill(dst + k * R, dst + (k + g.kw) * R, 0.0f);
+                                            k += g.kw;
+                                            continue;
+                                        }
+                                        const float* row = plane + static_cast<std::size_t>(iy) * Wd;
+                                        for (std::size_t kj = 0; kj < g.kw; ++kj, ++k) {
+                                            float* d = dst + k * R;
+                                            const std::int64_t ixs = ixBase + static_cast<std::int64_t>(kj * g.dw);
+                                            if (sw == 1 && ixs >= 0 && ixs + static_cast<std::int64_t>(R) <= Wi) {
+                                                if (R == 12) std::memcpy(d, row + ixs, 12 * sizeof(float));  // inlined for the AVX-512 / AVX tile heights
+                                                else if (R == 6) std::memcpy(d, row + ixs, 6 * sizeof(float));
+                                                else std::memcpy(d, row + ixs, R * sizeof(float));
+                                            } else {
+                                                for (std::size_t i = 0; i < R; ++i) {
+                                                    const std::int64_t ix = ixs + static_cast<std::int64_t>(i) * sw;
+                                                    d[i] = ix >= 0 && ix < Wi ? row[ix] : 0.0f;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            std::size_t k = 0;
+                            for (std::size_t c = 0; c < Cg; ++c) {
+                                const float* plane = x + c * H * Wd;
+                                for (std::size_t ki = 0; ki < g.kh; ++ki)
+                                    for (std::size_t kj = 0; kj < g.kw; ++kj, ++k) {
+                                        float* d = dst + k * R;
+                                        for (std::size_t i = 0; i < R; ++i) {
+                                            const std::int64_t iy = iy0[i] + static_cast<std::int64_t>(ki * g.dh), ix = ix0[i] + static_cast<std::int64_t>(kj * g.dw);
+                                            d[i] = live[i] && iy >= 0 && iy < static_cast<std::int64_t>(H) && ix >= 0 && ix < static_cast<std::int64_t>(Wd)
+                                                       ? plane[static_cast<std::size_t>(iy) * Wd + static_cast<std::size_t>(ix)]
+                                                       : 0.0f;
+                                        }
+                                    }
+                            }
+                        }
+                    });
+                    tmp.resize(pc * Mg);
+                    gemmPackedA(pc, Mg, Kc, packed.data(), true, w, Kc, tmp.data(), Mg);
+                    parallelFor(0, Mg, 1, [&](std::size_t m0, std::size_t m1) {
+                        for (std::size_t m = m0; m < m1; ++m) {
+                            float* dst = y + m * P + p0;
+                            for (std::size_t p = 0; p < pc; ++p) dst[p] = tmp[p * Mg + m];
+                        }
+                    });
+                }
+            }
+    } else {
     std::vector<float> col;
     for (std::size_t b = 0; b < N; ++b) {
         for (std::size_t gr = 0; gr < group; ++gr) {
@@ -394,6 +484,7 @@ Outs convOp(const Node& n, const Ins& in, int) {
                 gemm(false, false, Mg, cols, Kc, w, Kc, col.data(), cols, y + r0 * OW, OH * OW, false);
             }
         }
+    }
     }
     if (B) {
         const std::size_t plane = OH * OW;
@@ -698,6 +789,30 @@ Outs softmaxOp(const Node& n, const Ins& in, int opset, bool log) {
     std::size_t inner = 1;
     for (std::size_t k = axis + 1; k < rank; ++k) inner *= static_cast<std::size_t>(X.shape[k]);
     const std::size_t outer = X.size() / std::max<std::size_t>(1, len * inner);
+    if (inner == 1 && len > 0) {  // the last axis: contiguous rows, vectorised
+        std::copy(X.f.begin(), X.f.end(), r.f.begin());
+        parallelFor(0, outer, std::max<std::size_t>(1, 8192 / len), [&](std::size_t o0, std::size_t o1) {
+            for (std::size_t o = o0; o < o1; ++o) {
+                float* row = r.f.data() + o * len;
+                softmaxRow(row, len);
+                if (log)
+                    for (std::size_t k = 0; k < len; ++k) row[k] = std::log(row[k]);
+            }
+        });
+        if (!log) return {r};
+        // log-softmax as x - max - log(sum exp): more accurate for tiny probabilities
+        parallelFor(0, outer, 64, [&](std::size_t o0, std::size_t o1) {
+            for (std::size_t o = o0; o < o1; ++o) {
+                const float* x = X.f.data() + o * len;
+                const float m = *std::max_element(x, x + len);
+                double sum = 0;
+                for (std::size_t k = 0; k < len; ++k) sum += std::exp(x[k] - m);
+                const float ls = static_cast<float>(std::log(sum));
+                for (std::size_t k = 0; k < len; ++k) r.f[o * len + k] = x[k] - m - ls;
+            }
+        });
+        return {r};
+    }
     parallelFor(0, outer * inner, 64, [&](std::size_t q0, std::size_t q1) {
         std::vector<float> tmp(len);
         for (std::size_t q = q0; q < q1; ++q) {
@@ -1132,6 +1247,47 @@ Outs reduceOp(const Node& n, const Ins& in, int opset, const std::string& kind) 
         kept.push_back(red[k] ? 1 : X.shape[k]);
     }
     const std::size_t outN = numel(kept);
+    // Reduced axes forming one contiguous block (the usual case: the last axis for a layer norm):
+    // outer x len x inner, summed straight from the data.
+    {
+        std::size_t first = rank, last = 0;
+        for (std::size_t k = 0; k < rank; ++k)
+            if (red[k] && X.shape[k] != 1) {
+                first = std::min(first, k);
+                last = k;
+            }
+        bool block = first < rank;
+        for (std::size_t k = first; block && k <= last; ++k) block = red[k] || X.shape[k] == 1;
+        if (block && X.kind == Tensor::Kind::Float && (kind == "sum" || kind == "mean" || kind == "max" || kind == "min" || kind == "sumsquare" || kind == "l2")) {
+            std::size_t outer = 1, len = 1, inner = 1;
+            for (std::size_t k = 0; k < first; ++k) outer *= static_cast<std::size_t>(X.shape[k]);
+            for (std::size_t k = first; k <= last; ++k) len *= static_cast<std::size_t>(X.shape[k]);
+            for (std::size_t k = last + 1; k < rank; ++k) inner *= static_cast<std::size_t>(X.shape[k]);
+            Tensor r = floatTensor(os);
+            parallelFor(0, outer, 1, [&](std::size_t o0, std::size_t o1) {
+                std::vector<double> a(inner);
+                for (std::size_t o = o0; o < o1; ++o) {
+                    const float* x = X.f.data() + o * len * inner;
+                    const bool mx = kind == "max", mn = kind == "min", sq = kind == "sumsquare" || kind == "l2";
+                    for (std::size_t i = 0; i < inner; ++i) a[i] = mx ? -std::numeric_limits<double>::infinity() : mn ? std::numeric_limits<double>::infinity() : 0.0;
+                    for (std::size_t l = 0; l < len; ++l) {
+                        const float* row = x + l * inner;
+                        if (mx) for (std::size_t i = 0; i < inner; ++i) a[i] = std::max(a[i], static_cast<double>(row[i]));
+                        else if (mn) for (std::size_t i = 0; i < inner; ++i) a[i] = std::min(a[i], static_cast<double>(row[i]));
+                        else if (sq) for (std::size_t i = 0; i < inner; ++i) a[i] += static_cast<double>(row[i]) * row[i];
+                        else for (std::size_t i = 0; i < inner; ++i) a[i] += row[i];
+                    }
+                    for (std::size_t i = 0; i < inner; ++i) {
+                        double v = a[i];
+                        if (kind == "mean") v /= static_cast<double>(len);
+                        else if (kind == "l2") v = std::sqrt(v);
+                        r.f[o * inner + i] = static_cast<float>(v);
+                    }
+                }
+            });
+            return {r};
+        }
+    }
     std::vector<double> acc(outN, kind == "max" ? -std::numeric_limits<double>::infinity() : kind == "min" ? std::numeric_limits<double>::infinity() : kind == "prod" ? 1.0 : 0.0);
     std::vector<double> mx;
     if (kind == "logsumexp") mx.assign(outN, -std::numeric_limits<double>::infinity());
@@ -1643,6 +1799,246 @@ Outs nonZeroOp(const Node&, const Ins& in, int) {
     return {r};
 }
 
+
+// ---- quantised operators ----
+// Integer products run on the float GEMM: exact while the sums stay below 2^24 in magnitude, and
+// within float rounding beyond (the results are scaled back to floats anyway).
+
+// Values of an integer tensor minus a zero point (scalar, or one per index along `axis`).
+std::vector<float> minusZeroPoint(const Tensor& x, const Tensor* zp, std::size_t axis = 0) {
+    std::vector<float> v(x.size());
+    std::vector<std::int64_t> z = zp ? asInts(*zp) : std::vector<std::int64_t>{0};
+    if (z.empty()) z = {0};
+    std::size_t inner = 1;
+    for (std::size_t k = axis + 1; k < x.shape.size(); ++k) inner *= static_cast<std::size_t>(x.shape[k]);
+    const std::size_t len = x.shape.empty() ? 1 : static_cast<std::size_t>(x.shape[axis]);
+    for (std::size_t k = 0; k < v.size(); ++k) {
+        const std::int64_t zk = z.size() == 1 ? z[0] : z[(k / inner) % len];
+        v[k] = static_cast<float>((x.kind == Tensor::Kind::Int ? x.i[k] : static_cast<std::int64_t>(x.f[k])) - zk);
+    }
+    return v;
+}
+
+// Saturating round-half-to-even into the zero point's type (uint8 by default).
+Tensor quantize(const Shape& shape, const std::vector<float>& x, const std::vector<float>& scale, const std::vector<std::int64_t>& zp, int type,
+                std::size_t axis, std::size_t blockSize = 0) {
+    Tensor r = intTensor(shape, type);
+    const std::int64_t lo = type == 3 ? -128 : type == 5 ? -32768 : type == 6 ? std::numeric_limits<std::int32_t>::min() : 0;
+    const std::int64_t hi = type == 3 ? 127 : type == 4 ? 65535 : type == 5 ? 32767 : type == 6 ? std::numeric_limits<std::int32_t>::max() : 255;
+    std::size_t inner = 1;
+    for (std::size_t k = axis + 1; k < shape.size(); ++k) inner *= static_cast<std::size_t>(shape[k]);
+    const std::size_t len = shape.empty() ? 1 : static_cast<std::size_t>(shape[axis]);
+    for (std::size_t k = 0; k < x.size(); ++k) {
+        std::size_t q = 0;
+        if (scale.size() > 1) {
+            const std::size_t a = (k / inner) % len;
+            q = blockSize ? ((k / (inner * len)) * ((len + blockSize - 1) / blockSize) + a / blockSize) * inner + k % inner : a;
+        }
+        const float s = scale[std::min(q, scale.size() - 1)];
+        const std::int64_t z = zp.empty() ? 0 : zp[std::min(q, zp.size() - 1)];
+        // In float, as onnxruntime does: x / scale rounded half to even, then the zero point.
+        const float v = std::nearbyint(x[k] / s) + static_cast<float>(z);
+        r.i[k] = static_cast<std::int64_t>(std::clamp(static_cast<double>(v), static_cast<double>(lo), static_cast<double>(hi)));
+    }
+    return r;
+}
+
+Outs dequantizeLinear(const Node& n, const Ins& in, int) {
+    const Tensor& X = need(in, 0);
+    const std::vector<float> scale = asFloats(need(in, 1));
+    const Tensor* zp = opt(in, 2);
+    const std::size_t axis = X.shape.empty() ? 0 : static_cast<std::size_t>(normAxis(n.i("axis", 1), X.shape.size()));
+    const std::size_t blockSize = static_cast<std::size_t>(n.i("block_size", 0));
+    const std::vector<std::int64_t> z = zp ? asInts(*zp) : std::vector<std::int64_t>{};
+    Tensor r = floatTensor(X.shape);
+    std::size_t inner = 1;
+    for (std::size_t k = axis + 1; k < X.shape.size(); ++k) inner *= static_cast<std::size_t>(X.shape[k]);
+    const std::size_t len = X.shape.empty() ? 1 : static_cast<std::size_t>(X.shape[axis]);
+    const std::vector<float> xv = asFloats(X);
+    for (std::size_t k = 0; k < xv.size(); ++k) {
+        std::size_t q = 0;
+        if (scale.size() > 1) {
+            const std::size_t a = (k / inner) % len;
+            q = blockSize ? ((k / (inner * len)) * ((len + blockSize - 1) / blockSize) + a / blockSize) * inner + k % inner : a;
+        }
+        const float zk = z.empty() ? 0.0f : static_cast<float>(z[std::min(q, z.size() - 1)]);
+        r.f[k] = (xv[k] - zk) * scale[std::min(q, scale.size() - 1)];
+    }
+    return {r};
+}
+
+Outs quantizeLinear(const Node& n, const Ins& in, int) {
+    const Tensor& X = need(in, 0);
+    const Tensor* zp = opt(in, 2);
+    const int type = zp ? zp->elemType : static_cast<int>(n.i("output_dtype", 2));
+    const std::size_t axis = X.shape.empty() ? 0 : static_cast<std::size_t>(normAxis(n.i("axis", 1), X.shape.size()));
+    return {quantize(X.shape, asFloats(X), asFloats(need(in, 1)), zp ? asInts(*zp) : std::vector<std::int64_t>{}, type, axis,
+                     static_cast<std::size_t>(n.i("block_size", 0)))};
+}
+
+Outs dynamicQuantizeLinear(const Node&, const Ins& in, int) {
+    const Tensor& X = need(in, 0);
+    float lo = 0.0f, hi = 0.0f;
+    for (float v : X.f) {
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+    }
+    const float scale = (hi - lo) / 255.0f;
+    const float s = scale == 0.0f ? 1.0f : scale;
+    const std::int64_t zp = static_cast<std::int64_t>(std::clamp(std::nearbyint(0.0f - lo / s), 0.0f, 255.0f));
+    Tensor y = quantize(X.shape, X.f, {s}, {zp}, 2, 0);
+    return {y, Tensor::floats({}, {scale}), Tensor::ints({}, {zp}, 2)};
+}
+
+// A float tensor of the same shape holding x - zero point (per column of B for MatMulInteger).
+Tensor shifted(const Tensor& x, const Tensor* zp, bool perLastAxis) {
+    Tensor t = floatTensor(x.shape);
+    std::vector<std::int64_t> z = zp ? asInts(*zp) : std::vector<std::int64_t>{0};
+    if (z.empty()) z = {0};
+    const std::size_t last = x.shape.empty() ? 1 : static_cast<std::size_t>(x.shape.back());
+    for (std::size_t k = 0; k < x.size(); ++k) {
+        const std::int64_t zk = z.size() == 1 ? z[0] : (perLastAxis ? z[k % last] : z[0]);
+        t.f[k] = static_cast<float>(x.i[k] - zk);
+    }
+    return t;
+}
+
+Tensor toInt32(const Tensor& f) {
+    Tensor r = intTensor(f.shape, 6);
+    for (std::size_t k = 0; k < f.f.size(); ++k) r.i[k] = static_cast<std::int64_t>(std::llround(f.f[k]));
+    return r;
+}
+
+Outs matMulInteger(const Node&, const Ins& in, int) {
+    const Tensor a = shifted(need(in, 0), opt(in, 2), false), b = shifted(need(in, 1), opt(in, 3), true);
+    return {toInt32(matMul(a, b))};
+}
+
+Outs convInteger(const Node& n, const Ins& in, int o) {
+    const Tensor& W = need(in, 1);
+    Tensor x = shifted(need(in, 0), opt(in, 2), false);
+    // w zero point: scalar or one per output channel
+    Tensor w = floatTensor(W.shape);
+    std::vector<std::int64_t> z = opt(in, 3) ? asInts(*in[3]) : std::vector<std::int64_t>{0};
+    if (z.empty()) z = {0};
+    const std::size_t per = W.size() / static_cast<std::size_t>(W.shape[0]);
+    for (std::size_t k = 0; k < W.size(); ++k) w.f[k] = static_cast<float>(W.i[k] - (z.size() == 1 ? z[0] : z[k / per]));
+    return {toInt32(convOp(n, {&x, &w}, o)[0])};
+}
+
+Outs qlinearMatMul(const Node&, const Ins& in, int) {
+    const Tensor& A = need(in, 0);
+    const Tensor& B = need(in, 3);
+    Tensor a = floatTensor(A.shape), b = floatTensor(B.shape);
+    a.f = minusZeroPoint(A, opt(in, 2), 0);
+    const float as = scalarFloat(need(in, 1));
+    for (float& v : a.f) v *= as;
+    // b: scale / zero point per tensor or per output column (the last axis)
+    const std::vector<float> bs = asFloats(need(in, 4));
+    std::vector<std::int64_t> bz = opt(in, 5) ? asInts(*in[5]) : std::vector<std::int64_t>{0};
+    const std::size_t Ncol = static_cast<std::size_t>(B.shape.back());
+    for (std::size_t k = 0; k < B.size(); ++k) {
+        const std::size_t c = k % Ncol;
+        b.f[k] = static_cast<float>(B.i[k] - bz[bz.size() == 1 ? 0 : c]) * bs[bs.size() == 1 ? 0 : c];
+    }
+    const Tensor y = matMul(a, b);
+    const Tensor* yz = opt(in, 7);
+    return {quantize(y.shape, y.f, asFloats(need(in, 6)), yz ? asInts(*yz) : std::vector<std::int64_t>{0}, yz ? yz->elemType : 2, 0)};
+}
+
+Outs qlinearConv(const Node& n, const Ins& in, int o) {
+    const Tensor& X = need(in, 0);
+    const Tensor& W = need(in, 3);
+    Tensor x = floatTensor(X.shape), w = floatTensor(W.shape);
+    x.f = minusZeroPoint(X, opt(in, 2), 0);
+    const float xs = scalarFloat(need(in, 1));
+    for (float& v : x.f) v *= xs;
+    const std::vector<float> ws = asFloats(need(in, 4));
+    std::vector<std::int64_t> wz = opt(in, 5) ? asInts(*in[5]) : std::vector<std::int64_t>{0};
+    const std::size_t per = W.size() / static_cast<std::size_t>(W.shape[0]);
+    for (std::size_t k = 0; k < W.size(); ++k) {
+        const std::size_t m = k / per;
+        w.f[k] = static_cast<float>(W.i[k] - wz[wz.size() == 1 ? 0 : m]) * ws[ws.size() == 1 ? 0 : m];
+    }
+    Tensor bias;
+    Ins cin{&x, &w};
+    if (const Tensor* B = opt(in, 8)) {  // int32 bias in units of xs * ws
+        bias = floatTensor(B->shape);
+        for (std::size_t m = 0; m < B->size(); ++m) bias.f[m] = static_cast<float>(B->i[m]) * xs * ws[ws.size() == 1 ? 0 : m];
+        cin.push_back(&bias);
+    }
+    const Tensor y = convOp(n, cin, o)[0];
+    const Tensor* yz = opt(in, 7);
+    return {quantize(y.shape, y.f, asFloats(need(in, 6)), yz ? asInts(*yz) : std::vector<std::int64_t>{0}, yz ? yz->elemType : 2, 0)};
+}
+
+// com.microsoft MatMulNBits: B packed [N][blocks][block_size * bits / 8] (low bits first), one scale
+// per (column, block), optional packed or float zero points (default 2^(bits-1)), optional g_idx
+// and bias. Y = A x W with W (K x N) dequantised.
+Outs matMulNBits(const Node& n, const Ins& in, int) {
+    const Tensor& A = need(in, 0);
+    const Tensor& B = need(in, 1);
+    const std::size_t K = static_cast<std::size_t>(n.i("K", 0)), N = static_cast<std::size_t>(n.i("N", 0));
+    const std::size_t bits = static_cast<std::size_t>(n.i("bits", 4)), bs = static_cast<std::size_t>(n.i("block_size", 32));
+    if (bits != 4 && bits != 8 && bits != 2) throw std::runtime_error("MatMulNBits: " + std::to_string(bits) + " bits");
+    const std::size_t blocks = (K + bs - 1) / bs, blob = bs * bits / 8;
+    const std::vector<float> scales = asFloats(need(in, 2));
+    const Tensor* zp = opt(in, 3);
+    const Tensor* gidx = opt(in, 4);
+    const Tensor* bias = opt(in, 5);
+    const std::vector<std::int64_t> packed = asInts(B);
+    std::vector<std::int64_t> zpPacked;
+    std::vector<float> zpFloat;
+    if (zp) {
+        if (zp->kind == Tensor::Kind::Int) zpPacked = zp->i;
+        else zpFloat = zp->f;
+    }
+    const std::vector<std::int64_t> g = gidx ? asInts(*gidx) : std::vector<std::int64_t>{};
+    const std::size_t zpBytesPerCol = (blocks * bits + 7) / 8, perByte = 8 / bits, mask = (1u << bits) - 1;
+    const float defZp = static_cast<float>(1u << (bits - 1));
+    Tensor W = floatTensor({static_cast<std::int64_t>(K), static_cast<std::int64_t>(N)});
+    parallelFor(0, N, 16, [&](std::size_t n0, std::size_t n1) {
+        for (std::size_t col = n0; col < n1; ++col)
+            for (std::size_t k = 0; k < K; ++k) {
+                const std::size_t blk = g.empty() ? k / bs : static_cast<std::size_t>(g[k]);
+                const std::size_t j = k % bs;
+                const std::size_t byte = (col * blocks + k / bs) * blob + j / perByte;
+                const std::uint32_t q = (static_cast<std::uint32_t>(packed[byte]) >> ((j % perByte) * bits)) & mask;
+                float z = defZp;
+                if (!zpPacked.empty()) z = static_cast<float>((static_cast<std::uint32_t>(zpPacked[col * zpBytesPerCol + blk / perByte]) >> ((blk % perByte) * bits)) & mask);
+                else if (!zpFloat.empty()) z = zpFloat[col * blocks + blk];
+                W.f[k * N + col] = (static_cast<float>(q) - z) * scales[col * blocks + blk];
+            }
+    });
+    Tensor y = matMul(A, W);
+    if (bias)
+        for (std::size_t k = 0; k < y.f.size(); ++k) y.f[k] += bias->f[k % N];
+    return {y};
+}
+
+// com.microsoft MatMulBnb4: bitsandbytes 4-bit (FP4 or NF4) blocks of W^T (N x K, flattened), two
+// codes per byte (high nibble first), one absmax per block.
+Outs matMulBnb4(const Node& n, const Ins& in, int) {
+    static const float nf4[16] = {-1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f, -0.28444138169288635f,
+                                  -0.18477343022823334f, -0.09105003625154495f, 0.0f, 0.07958029955625534f, 0.16093020141124725f,
+                                  0.24611230194568634f, 0.33791524171829224f, 0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f};
+    static const float fp4[16] = {0.0f, 5.208333333e-03f, 0.66666667f, 1.0f, 0.33333333f, 0.5f, 0.16666667f, 0.25f,
+                                  -0.0f, -5.208333333e-03f, -0.66666667f, -1.0f, -0.33333333f, -0.5f, -0.16666667f, -0.25f};
+    const Tensor& A = need(in, 0);
+    const std::vector<std::int64_t> packed = asInts(need(in, 1));
+    const std::vector<float> absmax = asFloats(need(in, 2));
+    const std::size_t K = static_cast<std::size_t>(n.i("K", 0)), N = static_cast<std::size_t>(n.i("N", 0)), bs = static_cast<std::size_t>(n.i("block_size", 64));
+    const float* lut = n.i("quant_type", 1) == 0 ? fp4 : nf4;
+    Tensor W = floatTensor({static_cast<std::int64_t>(K), static_cast<std::int64_t>(N)});
+    for (std::size_t e = 0; e < N * K; ++e) {
+        const std::uint32_t b = static_cast<std::uint32_t>(packed[e / 2]);
+        const std::uint32_t code = e % 2 == 0 ? (b >> 4) & 15 : b & 15;
+        const std::size_t col = e / K, k = e % K;
+        W.f[k * N + col] = lut[code] * absmax[e / bs];
+    }
+    return {matMul(A, W)};
+}
+
 std::map<std::string, OpFn> buildTable() {
     std::map<std::string, OpFn> t;
     auto add = [](float a, float b) { return a + b; };
@@ -1857,6 +2253,18 @@ std::map<std::string, OpFn> buildTable() {
     }
     t["ArgMax"] = [](const Node& n, const Ins& in, int) -> Outs { return argOp(n, in, true); };
     t["ArgMin"] = [](const Node& n, const Ins& in, int) -> Outs { return argOp(n, in, false); };
+    t["DequantizeLinear"] = dequantizeLinear;
+    t["QuantizeLinear"] = quantizeLinear;
+    t["DynamicQuantizeLinear"] = dynamicQuantizeLinear;
+    t["MatMulInteger"] = matMulInteger;
+    t["ConvInteger"] = convInteger;
+    t["QLinearMatMul"] = qlinearMatMul;
+    t["QLinearConv"] = qlinearConv;
+    // Operators of other domains are keyed "domain::Op".
+    t["com.microsoft::MatMulNBits"] = matMulNBits;
+    t["com.microsoft::MatMulBnb4"] = matMulBnb4;
+    t["com.microsoft::DequantizeLinear"] = dequantizeLinear;
+    t["com.microsoft::QuantizeLinear"] = quantizeLinear;
     return t;
 }
 

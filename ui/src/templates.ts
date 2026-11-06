@@ -270,6 +270,41 @@ export const templates: Template[] = [
     },
   },
   {
+    id: "onnx",
+    title: "ONNX modeli",
+    subtitle: "Klasördeki herhangi bir .onnx resim modeli",
+    needs: ["onnx"],
+    fields: [
+      { key: "image", label: "Resim", kind: "image", wide: true },
+      { key: "model", label: "Model", kind: "model", model: "onnx" },
+      {
+        key: "mode",
+        label: "Çıktı",
+        kind: "enum",
+        default: "auto",
+        options: [
+          { value: "auto", label: "Modelin verdiği" },
+          { value: "cut", label: "Arka planı kes (maske modeli)" },
+          { value: "mask", label: "Maske" },
+          { value: "depth", label: "Derinlik" },
+        ],
+      },
+    ],
+    build(v, _models, out) {
+      const mode = String(v.mode);
+      const step: Step = { op: "onnx", model: String(v.model), in: "picture", out: "result" };
+      if (mode === "cut") Object.assign(step, { kind: "mask", apply: true });
+      else if (mode !== "auto") step.kind = mode;
+      return {
+        steps: [
+          { op: "load", path: v.image, out: "picture" },
+          step,
+          { op: "save", in: "result", path: `${out}/${mode === "cut" ? "cutout" : "result"}.png` },
+        ],
+      };
+    },
+  },
+  {
     id: "smooth",
     title: "Akıcılaştır",
     subtitle: "RIFE ile ara kare ekle",

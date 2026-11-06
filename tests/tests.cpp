@@ -3620,6 +3620,76 @@ TEST(onnx_operators_match_onnxruntime) {
     CHECK(failed.empty());
 }
 
+TEST(onnx_picture_pipeline_and_workflow_step) {
+    namespace fs = std::filesystem;
+    const fs::path src = fs::path(NEURACRAFT_SOURCE_DIR) / "tests" / "onnx" / "pipeline";
+    const std::string dir = tempPath("onnx_pipeline");
+    fs::create_directories(dir + "/models");
+    for (const char* m : {"up2_fixed8.onnx", "mean_mask.onnx", "identity.onnx"}) fs::copy_file(src / m, dir + "/models/" + m, fs::copy_options::overwrite_existing);
+    Image pic;
+    pic.width = 20;
+    pic.height = 12;
+    pic.pixels.resize(20 * 12 * 3);
+    for (std::size_t k = 0; k < pic.pixels.size(); ++k) pic.pixels[k] = static_cast<std::uint8_t>((k * 37 + k / 7) % 256);
+    // A fixed 8 x 8 x2 model goes over 20 x 12 in overlapping tiles: exactly the nearest-neighbour x2 picture.
+    {
+        const onnx::Model up = onnx::Model::load(dir + "/models/up2_fixed8.onnx");
+        const onnx::OnnxPipeline p = onnx::OnnxPipeline::fromModel(up, onnx::onnxManifest(dir + "/models/up2_fixed8.onnx"));
+        CHECK(p.width == 8 && p.height == 8 && p.fixedByModel);
+        const Image big = p.run(up, pic);
+        CHECK(big.width == 40 && big.height == 24 && big.channels == 3);
+        bool same = true;
+        for (std::size_t y = 0; y < 24; ++y)
+            for (std::size_t x = 0; x < 40; ++x)
+                for (std::size_t c = 0; c < 3; ++c) same &= big.pixels[(y * 40 + x) * 3 + c] == pic.pixels[((y / 2) * 20 + x / 2) * 3 + c];
+        CHECK(same);
+        onnx::OnnxPipeline whole = p;
+        whole.tileOverlap = 0;  // no tiles: the picture is squeezed to 8 x 8, then comes back at 2x its size
+        CHECK(whole.run(up, pic).width == 40);
+    }
+    // Identity with BGR input only: red and blue swap; in and out BGR: unchanged. Fixed range [0, 1].
+    {
+        const onnx::Model id = onnx::Model::load(dir + "/models/identity.onnx");
+        std::ofstream(dir + "/models/identity.json") << R"({"input": {"channels": "BGR", "range": [-1, 1]}, "output": {"range": [-1, 1]}})";
+        onnx::OnnxPipeline p = onnx::OnnxPipeline::fromModel(id, onnx::onnxManifest(dir + "/models/identity.onnx"));
+        const Image swapped = p.run(id, pic);
+        CHECK(swapped.width == 20 && swapped.pixels[0] == pic.pixels[2] && swapped.pixels[2] == pic.pixels[0] && swapped.pixels[1] == pic.pixels[1]);
+        p.bgrOut = true;
+        CHECK(p.run(id, pic).pixels == pic.pixels);
+    }
+    // A mask of any size, stretched min..max by default; "apply" cuts the picture out (RGBA).
+    {
+        const onnx::Model mm = onnx::Model::load(dir + "/models/mean_mask.onnx");
+        onnx::OnnxPipeline p = onnx::OnnxPipeline::fromModel(mm, json::makeObject({}));
+        CHECK(p.width == 0);
+        const Image m = p.run(mm, pic);
+        CHECK(m.width == 20 && m.height == 12 && m.channels == 3);
+        const auto [lo, hi] = std::minmax_element(m.pixels.begin(), m.pixels.end());
+        CHECK(*lo == 0 && *hi == 255);
+        p.applyMask = true;
+        const Image cut = p.run(mm, pic);
+        CHECK(cut.channels == 4 && cut.pixels[0] == pic.pixels[0] && cut.pixels[3] == m.pixels[0]);
+    }
+    // The workflow step and the model listing.
+    {
+        savePng(dir + "/in.png", pic);
+        const auto clips = runWorkflow(R"({"steps": [
+            {"op": "load", "path": "in.png", "out": "pic"},
+            {"op": "onnx", "model": "models/up2_fixed8.onnx", "in": "pic", "out": "big"},
+            {"op": "onnx", "model": "models/mean_mask.onnx", "in": "pic", "apply": true, "out": "cut"},
+            {"op": "onnx", "model": "models/mean_mask.onnx", "in": "pic", "invert": true, "out": "inv"}]})", dir);
+        CHECK(clips.at("big").front().width == 40 && clips.at("cut").front().channels == 4);
+        CHECK(clips.at("inv").front().pixels[0] == 255 - onnx::OnnxPipeline::fromModel(onnx::Model::load(dir + "/models/mean_mask.onnx"), json::makeObject({}))
+                                                           .run(onnx::Model::load(dir + "/models/mean_mask.onnx"), pic).pixels[0]);
+        CHECK(checkWorkflow(R"({"steps": [{"op": "onnx", "model": "m.onnx", "in": "x", "kind": "picture"}]})").size() >= 1);
+        std::size_t listed = 0;
+        for (const ModelInfo& m : findModels(dir))
+            if (m.kind == "onnx") ++listed;
+        CHECK(listed == 3);
+    }
+    fs::remove_all(dir);
+}
+
 TEST(lora_merging_and_lcm_sampler) {
     // LoraMerger: kohya and PEFT names, alpha / rank scaling, user scale.
     const std::string file = tempPath("lora_k.safetensors"), peft = tempPath("lora_p.safetensors");

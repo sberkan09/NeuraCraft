@@ -26,6 +26,7 @@ add_library(neuracraft_lib STATIC
     src/Checkpoint.cpp
     src/Onnx.cpp
     src/OnnxOps.cpp
+    src/OnnxPipeline.cpp
     src/Conv.cpp
     src/Data.cpp
     src/Dense.cpp

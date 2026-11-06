@@ -3310,6 +3310,34 @@ std::map<std::string, Matrix> tinyMotionWeights(const std::vector<std::size_t>& 
     return w;
 }
 
+TEST(gpu_motion_modules_match_cpu) {
+    // CUDA runs a clip with motion modules as one device batch; it must agree with the CPU.
+    if (!gpuAvailable() || gpuBackendName() != "CUDA") return;
+    setSeed(83);
+    std::string tok;
+    const std::string dir = writeTinyStableDiffusion("gpu_motion", tok);
+    saveAll(dir + "/motion.safetensors", tinyMotionWeights({8, 16}, 1));
+    UNet2DCondition unet = loadUNet(dir, 8, 8);
+    loadMotionModules(unet, dir + "/motion.safetensors");
+    const std::size_t n = 4 * 8 * 8, F = 5;
+    const Matrix latents = Matrix::normal(F, n, 0.0f, 1.0f), a = Matrix::uniform(8, 6, -1, 1), b = Matrix::uniform(8, 6, -1, 1);
+    const std::vector<Matrix> contexts{a, b, a, b, a};  // prompt travel: one condition per frame
+    setDevice(Device::CPU);
+    const Matrix cpu = unet.forwardFrames(latents, 500.0f, contexts);
+    setDevice(Device::GPU);
+    Matrix gpu;
+    {
+        GpuWeightScope scope;
+        gpu = unet.forwardFrames(latents, 500.0f, contexts);
+    }
+    setDevice(Device::CPU);
+    double scale = 1e-3, worst = 0;
+    for (std::size_t i = 0; i < cpu.size(); ++i) scale = std::max(scale, static_cast<double>(std::fabs(cpu.data()[i])));
+    for (std::size_t i = 0; i < cpu.size(); ++i) worst = std::max(worst, static_cast<double>(std::fabs(cpu.data()[i] - gpu.data()[i])));
+    if (worst > 2e-3 * scale) std::cout << "         motion frames differ by " << worst << " (scale " << scale << ")\n";
+    CHECK(gpu.sameShape(cpu) && worst <= 2e-3 * scale);
+}
+
 TEST(animatediff_motion_modules_and_text_to_video) {
     std::string tok;
     const std::string dir = writeTinyStableDiffusion("sd_video", tok);

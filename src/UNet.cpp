@@ -735,8 +735,60 @@ DeviceTensor deviceTransformer(CrossTransformer& ct, const float* x, const std::
     return out;
 }
 
+// An AnimateDiff motion module on F frames (F x C x HW on the device), updated in place: the same
+// computation as TemporalTransformer::forward.
+void deviceMotion(TemporalTransformer& t, float* frames, std::size_t F) {
+    const std::size_t C = t.shape.channels, HW = t.shape.height * t.shape.width;
+    DeviceTensor stats(2 * t.groups);
+    dv::frameGroupStats(frames, F, C, HW, t.groups, 1e-6f, stats.get());
+    const DeviceTensor pe = DeviceTensor::upload(t.pe.data(), F * C);  // the first F frame positions
+    // Pixels in chunks, so the feed-forward's 8C-wide rows stay within about 512 MB.
+    const std::size_t P = std::max<std::size_t>(1, ((std::size_t(1) << 27) / (8 * C)) / F);
+    for (std::size_t p0 = 0; p0 < HW; p0 += P) {
+        const std::size_t np = std::min(P, HW - p0), rows = np * F;
+        DeviceTensor x(rows * C);
+        dv::framesToTokens(frames, stats.get(), t.gamma.data(), t.beta.data(), F, C, HW, t.groups, p0, np, x.get());
+        DeviceTensor h = deviceLinear(t.projIn, x.get(), rows);
+        DeviceTensor att(rows * C);
+        auto attend = [&](LayerNorm& ln, Dense& q, Dense& k, Dense& v, Dense& o) {
+            const DeviceTensor a = deviceLayerNorm(ln, h.get(), rows);
+            dv::addPeriodicRows(a.get(), pe.get(), rows, F, C);
+            const DeviceTensor qq = deviceLinear(q, a.get(), rows), kk = deviceLinear(k, a.get(), rows), vv = deviceLinear(v, a.get(), rows);
+            dv::frameAttention(qq.get(), kk.get(), vv.get(), att.get(), np, F, C, t.heads);
+            const DeviceTensor out = deviceLinear(o, att.get(), rows);
+            dv::add(h.get(), out.get(), rows * C);
+        };
+        attend(t.ln1, t.q1, t.k1, t.v1, t.o1);
+        attend(t.ln2, t.q2, t.k2, t.v2, t.o2);
+        {
+            const DeviceTensor a = deviceLayerNorm(t.ln3, h.get(), rows);
+            const DeviceTensor g = deviceLinear(t.ff1, a.get(), rows);
+            DeviceTensor gg(rows * 4 * C);
+            dv::geglu(g.get(), gg.get(), rows, 4 * C);
+            const DeviceTensor o = deviceLinear(t.ff2, gg.get(), rows);
+            dv::add(h.get(), o.get(), rows * C);
+        }
+        const DeviceTensor y = deviceLinear(t.projOut, h.get(), rows);
+        dv::addFrameTokens(frames, y.get(), F, C, HW, p0, np);
+    }
+}
+
+// Whether every motion module runs on the device for F frames.
+bool deviceMotionSupported(UNet2DCondition::Impl& m, std::size_t F) {
+    auto ok = [&](const TemporalTransformer& t) { return t.heads && t.shape.channels % t.heads == 0 && cuda::dev::frameAttentionSupported(F, t.shape.channels / t.heads); };
+    if (!m.midMotion || !ok(*m.midMotion)) return false;
+    for (auto& d : m.downs)
+        for (auto& t : d.motions)
+            if (!ok(*t)) return false;
+    for (auto& u : m.ups)
+        for (auto& t : u.motions)
+            if (!ok(*t)) return false;
+    return true;
+}
+
 // B predictions: latents has one row per prediction, or one row they all share; returns B x output size.
-Matrix deviceForward(UNet2DCondition::Impl& m, const Matrix& latents, const std::vector<DeviceCondition>& conds) {
+// temporal: the B predictions are the frames of one clip, mixed by the motion modules.
+Matrix deviceForward(UNet2DCondition::Impl& m, const Matrix& latents, const std::vector<DeviceCondition>& conds, bool temporal = false) {
     NC_PROFILE("unet (gpu graph)");
     const std::size_t B = conds.size(), n = latents.cols();
     DeviceTensor in(B * n);
@@ -755,6 +807,7 @@ Matrix deviceForward(UNet2DCondition::Impl& m, const Matrix& latents, const std:
         for (std::size_t j = 0; j < d.resnets.size(); ++j) {
             h = deviceResnet(*d.resnets[j], h.get(), conds);
             if (!d.attentions.empty()) h = deviceTransformer(*d.attentions[j], h.get(), conds);
+            if (temporal) deviceMotion(*d.motions[j], h.get(), B);
             keep(h, d.resnets[j]->out * d.resnets[j]->in.height * d.resnets[j]->in.width);
         }
         if (d.downsample) {
@@ -764,6 +817,7 @@ Matrix deviceForward(UNet2DCondition::Impl& m, const Matrix& latents, const std:
     }
     h = deviceResnet(*m.mid1, h.get(), conds);
     h = deviceTransformer(*m.midAttention, h.get(), conds);
+    if (temporal) deviceMotion(*m.midMotion, h.get(), B);
     h = deviceResnet(*m.mid2, h.get(), conds);
     const std::size_t midN = m.mid2->out * m.mid2->in.height * m.mid2->in.width;
     for (std::size_t b = 0; b < B; ++b) {  // ControlNet: added to the skips and to the mid block output
@@ -793,6 +847,7 @@ Matrix deviceForward(UNet2DCondition::Impl& m, const Matrix& latents, const std:
             skipSizes.pop_back();
             h = deviceResnet(r, cat.get(), conds);
             if (!u.attentions.empty()) h = deviceTransformer(*u.attentions[j], h.get(), conds);
+            if (temporal) deviceMotion(*u.motions[j], h.get(), B);
         }
         if (u.upsample) {
             const ImageShape s = u.upsample->inputShape();
@@ -848,15 +903,19 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
     if (residuals && residuals->size() != F) throw std::invalid_argument("UNet2DCondition::forwardFrames: one set of residuals per frame");
     Matrix out(F, m.latent.size());
 #ifdef NEURACRAFT_HAS_CUDA
-    if (!hasMotionModules() && !m.quantized && gpugraph::enabled()) {  // frames in device batches of up to 4
+    // On the device: a clip with motion modules as one batch (the modules mix its frames), other
+    // frames in batches of up to 4.
+    const bool temporal = hasMotionModules();
+    if (!m.quantized && gpugraph::enabled() && (!temporal || (F <= TemporalTransformer::kMaxFrames && deviceMotionSupported(m, F)))) {
         const Matrix temb = timeEmbedding(m, timestep);
-        for (std::size_t f0 = 0; f0 < F; f0 += 4) {
-            const std::size_t n = std::min<std::size_t>(4, F - f0);
+        const std::size_t batch = temporal ? F : 4;
+        for (std::size_t f0 = 0; f0 < F; f0 += batch) {
+            const std::size_t n = std::min(batch, F - f0);
             dv::Session session;
             std::vector<DeviceCondition> conds;
             for (std::size_t f = f0; f < f0 + n; ++f)
                 conds.push_back(deviceCondition(temb, ctx(f), m.ipLoaded ? &m.ipTokens : nullptr, m.ipScale, residuals ? &(*residuals)[f] : nullptr));
-            const Matrix eps = deviceForward(m, rowBlock(latents, f0, n), conds);
+            const Matrix eps = deviceForward(m, rowBlock(latents, f0, n), conds, temporal);
             setRowBlock(out, f0, eps);
         }
         return out;
@@ -993,6 +1052,7 @@ void loadMotionModules(UNet2DCondition& unet, const std::string& file, bool int8
             m.ups[i].motions.back()->load(w, "up_blocks." + std::to_string(i) + ".motion_modules." + std::to_string(j));
         }
     for (const auto& name : w.st.names()) m.params += w.st.info(name).elements();
+    if (int8 && !preferFloatWeights()) m.quantized = true;
 }
 
 Matrix UNet2DCondition::forward(const Matrix& latent, float timestep, const Matrix& context) {

@@ -580,6 +580,74 @@ __global__ void kGeglu(const float* g, float* out, std::size_t H, std::size_t to
     out[i] = a * 0.5f * gate * (1.0f + erff(gate * 0.70710678118654752f));
 }
 
+__global__ void kCombineFrameStats(const float* perFrame, float* stats, std::size_t F, std::size_t groups, float eps) {
+    const std::size_t g = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (g >= groups) return;
+    double mean = 0.0, second = 0.0;  // equal counts per frame: plain averages
+    for (std::size_t f = 0; f < F; ++f) {
+        const double m = perFrame[2 * (f * groups + g)], v = perFrame[2 * (f * groups + g) + 1];
+        mean += m;
+        second += v + m * m;
+    }
+    mean /= static_cast<double>(F);
+    const double var = fmax(second / static_cast<double>(F) - mean * mean, 0.0);
+    stats[2 * g] = static_cast<float>(mean);
+    stats[2 * g + 1] = static_cast<float>(1.0 / sqrt(var + static_cast<double>(eps)));
+}
+__global__ void kFramesToTokens(const float* frames, const float* stats, const float* gamma, const float* beta, std::size_t F, std::size_t C,
+                                std::size_t HW, std::size_t cg, std::size_t p0, std::size_t total, float* tokens) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i >= total) return;  // i = (p F + f) C + c
+    const std::size_t c = i % C, r = i / C, f = r % F, p = r / F, g = c / cg;
+    const float a = stats[2 * g + 1] * gamma[c];
+    tokens[i] = (frames[(f * C + c) * HW + p0 + p] - stats[2 * g]) * a + beta[c];
+}
+__global__ void kAddFrameTokens(float* frames, const float* y, std::size_t F, std::size_t C, std::size_t HW, std::size_t p0, std::size_t np,
+                                std::size_t total) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i >= total) return;  // i = (f C + c) np + p: writes along pixels
+    const std::size_t p = i % np, c = i / np % C, f = i / (np * C);
+    frames[(f * C + c) * HW + p0 + p] += y[(p * F + f) * C + c];
+}
+__global__ void kAddPeriodicRows(float* x, const float* pattern, std::size_t period, std::size_t C, std::size_t total) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i < total) x[i] += pattern[(i / C % period) * C + i % C];
+}
+// One block per (pixel, head); thread i < F handles query frame i. K and V of the pixel's frames in shared memory.
+__global__ void kFrameAttention(const float* q, const float* k, const float* v, float* out, std::size_t F, std::size_t C, std::size_t dh,
+                                float scale) {
+    extern __shared__ float sh[];  // K: F x dh, then V: F x dh
+    const std::size_t p = blockIdx.x, h = blockIdx.y;
+    float* sk = sh;
+    float* sv = sh + F * dh;
+    for (std::size_t t = threadIdx.x; t < F * dh; t += blockDim.x) {
+        const std::size_t j = t / dh, e = t % dh, src = (p * F + j) * C + h * dh + e;
+        sk[t] = k[src];
+        sv[t] = v[src];
+    }
+    __syncthreads();
+    const std::size_t i = threadIdx.x;
+    if (i >= F) return;
+    const float* qi = q + (p * F + i) * C + h * dh;
+    float s[32];
+    float m = -INFINITY;
+    for (std::size_t j = 0; j < F; ++j) {
+        float d = 0.0f;
+        for (std::size_t e = 0; e < dh; ++e) d += qi[e] * sk[j * dh + e];
+        s[j] = d * scale;
+        m = fmaxf(m, s[j]);
+    }
+    float sum = 0.0f;
+    for (std::size_t j = 0; j < F; ++j) sum += s[j] = __expf(s[j] - m);
+    const float inv = 1.0f / sum;
+    float* o = out + (p * F + i) * C + h * dh;
+    for (std::size_t e = 0; e < dh; ++e) {
+        float acc = 0.0f;
+        for (std::size_t j = 0; j < F; ++j) acc += s[j] * sv[j * dh + e];
+        o[e] = acc * inv;
+    }
+}
+
 State& ready() {
     State& st = state();
     if (!st.ok) throw std::runtime_error("cuda: no device");
@@ -733,6 +801,39 @@ void layerNorm(const float* x, float* y, std::size_t N, std::size_t C, float eps
 void attention(const float* q, const float* k, const float* v, float* out, std::size_t N, std::size_t M, std::size_t C, std::size_t heads) {
     deviceAttention(ready(), q, k, v, out, N, M, C, heads);
 }
+void frameGroupStats(const float* frames, std::size_t F, std::size_t C, std::size_t HW, std::size_t groups, float eps, float* stats) {
+    State& st = ready();
+    float* perFrame = st.scales.get<float>(2 * F * groups);
+    kGroupStats<<<static_cast<unsigned>(F * groups), 512, 0, st.stream>>>(frames, C / groups * HW, perFrame);
+    kCombineFrameStats<<<blocks(groups), 256, 0, st.stream>>>(perFrame, stats, F, groups, eps);
+    check(cudaGetLastError(), "frame group stats");
+}
+void framesToTokens(const float* frames, const float* stats, const float* hostGamma, const float* hostBeta, std::size_t F, std::size_t C,
+                    std::size_t HW, std::size_t groups, std::size_t p0, std::size_t np, float* tokens) {
+    State& st = ready();
+    const float* g = param(st, hostGamma, 1, C);
+    const float* b = param(st, hostBeta, 1, C);
+    const std::size_t total = np * F * C;
+    kFramesToTokens<<<blocks(total), 256, 0, st.stream>>>(frames, stats, g, b, F, C, HW, C / groups, p0, total, tokens);
+}
+void addFrameTokens(float* frames, const float* y, std::size_t F, std::size_t C, std::size_t HW, std::size_t p0, std::size_t np) {
+    const std::size_t total = F * C * np;
+    kAddFrameTokens<<<blocks(total), 256, 0, ready().stream>>>(frames, y, F, C, HW, p0, np, total);
+}
+void addPeriodicRows(float* x, const float* pattern, std::size_t rows, std::size_t period, std::size_t C) {
+    kAddPeriodicRows<<<blocks(rows * C), 256, 0, ready().stream>>>(x, pattern, period, C, rows * C);
+}
+// K and V of a pixel's frames fit 48 KB of shared memory.
+bool frameAttentionSupported(std::size_t F, std::size_t headSize) { return F >= 1 && F <= 32 && headSize >= 1 && headSize <= 192; }
+void frameAttention(const float* q, const float* k, const float* v, float* out, std::size_t P, std::size_t F, std::size_t C, std::size_t heads) {
+    const std::size_t dh = C / heads;
+    if (!frameAttentionSupported(F, dh)) throw std::invalid_argument("cuda::dev::frameAttention: unsupported shape");
+    const dim3 grid(static_cast<unsigned>(P), static_cast<unsigned>(heads));
+    const std::size_t shared = 2 * F * dh * sizeof(float);
+    kFrameAttention<<<grid, 32, shared, ready().stream>>>(q, k, v, out, F, C, dh, 1.0f / sqrtf(static_cast<float>(dh)));
+    check(cudaGetLastError(), "frame attention");
+}
+
 void geglu(const float* g, float* out, std::size_t N, std::size_t H) { kGeglu<<<blocks(N * H), 256, 0, ready().stream>>>(g, out, H, N * H); }
 
 } // namespace dev

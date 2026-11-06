@@ -5156,7 +5156,12 @@ TEST(gpu_resident_weights_follow_their_memory) {
                 CHECK(gpu.approxEquals(cpu, 1e-3f));
             }
         }
-        // A convolution against the CPU one, weights resident.
+        // A convolution against the CPU one, weights resident (whole convolutions: CUDA only).
+        if (gpuBackendName() != "CUDA") {
+            setDevice(Device::CPU);
+            setGpuMinWork(saved);
+            return;
+        }
         const std::size_t C = 24, H = 13, W = 11, O = 16, k = 3;
         const Matrix img = Matrix::uniform(2, C * H * W, -1, 1), wt = Matrix::uniform(C * k * k, O, -1, 1), bias = Matrix::uniform(1, O, -1, 1);
         Matrix out(2, O * H * W);

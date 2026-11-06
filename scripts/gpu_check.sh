@@ -12,13 +12,14 @@ echo "build: $(( $(date +%s) - t0 )) s"
 NC=bin/NeuraCraft
 echo "--- tests (FP32) ---"
 NEURACRAFT_CUDA_TF32=0 ./build-cuda/neuracraft_tests 2>&1 | grep -E "GPU:|FAIL|passed|failed|max diff|attention|differ|mismatch" | head -40
-echo "--- bench ---"
-$NC bench 2>&1 | tail -12
+if [ "${GPU_BENCH:-0}" = 1 ]; then echo "--- bench ---"; $NC bench 2>&1 | tail -12; fi
 echo "--- sd-turbo ---"
 M=/data/sd-turbo
 mkdir -p /data
 [ -s $M/unet/diffusion_pytorch_model.fp16.safetensors ] || bash scripts/download_sd_turbo.sh $M vae text_encoder unet > /tmp/dl.log 2>&1 || tail -5 /tmp/dl.log
+# (the CPU picture is made once: it is the reference)
 for dev in gpu gpu32 cpu; do
+    [ $dev = cpu ] && [ -s /tmp/fox_cpu.png ] && continue
     flag=""; [ $dev != cpu ] && flag=--gpu
     tf=1; [ $dev = gpu32 ] && tf=0
     s=$(date +%s.%N)

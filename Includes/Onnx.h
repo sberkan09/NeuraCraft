@@ -6,7 +6,9 @@
 // generic graph executor over n-dimensional tensors. So a network whose architecture NeuraCraft has
 // no code for - a background remover, a depth estimator, an upscaler, a face restorer - can be
 // used without changing the library. `NeuraCraft onnx model.onnx` shows what a model holds and runs
-// it on TensorProto inputs; NEURACRAFT_ONNX_PROFILE=1 prints the time per operator type.
+// it on TensorProto inputs; NEURACRAFT_ONNX_PROFILE=1 prints the time per operator type. Workflows
+// run image models with the "onnx" step, whose pre- and post-processing come from a manifest next
+// to the model (OnnxPipeline below).
 //
 // Supported: opsets 7-21 of the default domain for about 110 operators (elementwise maths and
 // activations, MatMul / Gemm / Conv / ConvTranspose on the library's GEMM, pooling, Resize, the
@@ -82,6 +84,47 @@ void saveTensorProto(const std::string& path, const Tensor& tensor, const std::s
 
 // The operators the executor runs (sorted), for listings and error messages.
 std::vector<std::string> supportedOperators();
+
+// ---- Image models: what a workflow's "onnx" step does around Model::run ----
+//
+// The manifest is <model>.json next to <model>.onnx (every key optional):
+// {
+//   "input":  {"name": "input", "layout": "NCHW" | "NHWC", "channels": "RGB" | "BGR" | "GRAY",
+//              "size": [H, W] (resize to) | "multiple_of": 8 (pad to) | "fixed": true (as the model says),
+//              "range": [0, 1] (pixel 0..255 maps to this), "mean": [..], "std": [..],
+//              "tile": 0 (run a fixed-size model over the picture in tiles with this much overlap)},
+//   "output": {"name": "...", "kind": "image" | "mask" | "depth",
+//              "range": [0, 1] (values that map to 0..255; "auto" stretches min..max),
+//              "layout": "NCHW" | "NHWC", "channels": "RGB" | "BGR", "invert": false,
+//              "apply": true (kind mask: cut the input out with it - RGBA - instead of returning it)}
+// }
+// Without a manifest: one NCHW RGB input in 0..1, the model's fixed size if it has one, the output
+// an image (3 channels) or a mask / depth (1 channel) stretched to 0..255. An image output comes back
+// at the input size times the model's own scale (an x4 upscaler gives 4x the input, a fixed-size
+// style model gives the input size); a fixed-size model whose output is bigger than its input (a
+// super-resolution model) runs over a larger picture in overlapping tiles.
+struct OnnxPipeline {
+    std::string inputName, outputName;
+    bool nhwcIn = false, nhwcOut = false, bgrIn = false, bgrOut = false, grayIn = false;
+    int width = 0, height = 0;        // resize the input to this (0: keep)
+    int multipleOf = 1;               // pad the input up to a multiple of this
+    float inLow = 0.0f, inHigh = 1.0f;
+    std::vector<float> mean, stdev;
+    std::string kind = "auto";        // image, mask, depth or auto (by channel count)
+    bool autoRange = true;
+    float outLow = 0.0f, outHigh = 1.0f;
+    bool invert = false;
+    bool applyMask = false;           // kind "mask": cut the input out with it (alpha) instead of returning the mask
+    int tileOverlap = -1;             // tiles for fixed-size models: overlap in input pixels (-1: automatic, 0: never)
+    bool rangeSet = false;            // the manifest gave output.range
+    bool fixedByModel = false;        // width / height are the model's own (not the manifest's "size")
+
+    static OnnxPipeline fromModel(const Model& model, const json::Value& manifest);
+    Image run(const Model& model, const Image& in) const;
+};
+
+// The manifest of a model (an empty object when there is none).
+json::Value onnxManifest(const std::string& modelPath);
 
 } // namespace nc::onnx
 

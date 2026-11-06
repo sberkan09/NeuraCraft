@@ -159,3 +159,23 @@ for name, model, inputs, outputs in cases:
     for k, (key, v) in enumerate(zip(outputs, res)):
         with open(os.path.join(d, f"output_{k}.pb"), "wb") as f: f.write(nh.from_array(np.asarray(v), key).SerializeToString())
 print(len(cases), "cases in", OUT)
+
+# Picture models for the "onnx" workflow step (no reference outputs: the C++ test knows what they do).
+PIPE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline")
+shutil.rmtree(PIPE, ignore_errors=True)
+os.makedirs(PIPE)
+def save_model(name, nodes, inp, out, inits=(), opset=17):
+    g = h.make_graph(nodes, name, [inp], [out], initializer=[nh.from_array(v, k) for k, v in inits])
+    m = h.make_model(g, opset_imports=[h.make_opsetid("", opset)])
+    m.ir_version = 8
+    onnx.save(m, os.path.join(PIPE, name + ".onnx"))
+# a fixed-size x2 "upscaler" (nearest): run over bigger pictures in tiles
+save_model("up2_fixed8", [n("Resize", ["x", "", "s"], ["y"], mode="nearest")], h.make_tensor_value_info("x", T.FLOAT, [1, 3, 8, 8]),
+           h.make_tensor_value_info("y", T.FLOAT, [1, 3, 16, 16]), inits=[("s", np.array([1, 1, 2, 2], np.float32))])
+# a "mask" of any size: the mean of the channels
+save_model("mean_mask", [n("ReduceMean", ["x"], ["y"], axes=[1], keepdims=1)], h.make_tensor_value_info("x", T.FLOAT, [1, 3, "h", "w"]),
+           h.make_tensor_value_info("y", T.FLOAT, [1, 1, "h", "w"]), opset=13)
+# identity, for channel order and value-range checks
+save_model("identity", [n("Identity", ["x"], ["y"])], h.make_tensor_value_info("x", T.FLOAT, [1, 3, "h", "w"]),
+           h.make_tensor_value_info("y", T.FLOAT, [1, 3, "h", "w"]))
+print("pipeline models in", PIPE)

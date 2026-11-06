@@ -574,6 +574,44 @@ onnxruntime's time (Real-ESRGAN 128 -> 512: 14.8 s vs 4.7 s);
 (`If` / `Loop`), quantised operators and strings are not supported: such a
 model fails to load with the operator and node named.
 
+In workflows (and Studio's "ONNX modeli" task) the `onnx` step runs a picture
+model on every frame of a clip. Pre- and post-processing come from a manifest
+next to the model, `<model>.json` — every key optional:
+
+```json
+{"input":  {"size": [518, 518], "multiple_of": 14, "channels": "RGB", "layout": "NCHW",
+            "range": [0, 1], "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225], "tile": 16},
+ "output": {"kind": "image | mask | depth", "range": [0, 1] or "auto", "channels": "RGB",
+            "invert": false, "apply": false}}
+```
+
+Without one: NCHW RGB in 0..1 at the model's own fixed size (if it has one).
+Images come back at the input size times the model's scale; masks and depth
+are stretched to 0..255 at the input size. `"apply": true` (or `apply` in the
+step) cuts the input out with a mask: a transparent-background RGBA picture.
+A fixed-size model that enlarges (an upscaler exported at 128 x 128) runs over
+bigger pictures in overlapping, blended tiles. With the manifests below,
+u2netp removes backgrounds, Depth Anything v2 small gives depth maps and
+Real-ESRGAN x4plus upscales, all in one workflow:
+
+```json
+{"steps": [
+  {"op": "load", "path": "fox.png", "out": "pic"},
+  {"op": "onnx", "model": "data/onnx/u2netp.onnx", "in": "pic", "apply": true, "out": "cut"},
+  {"op": "onnx", "model": "data/onnx/depth_anything_v2_small.onnx", "in": "pic", "out": "depth"},
+  {"op": "onnx", "model": "data/onnx/esrgan.onnx", "in": "pic", "out": "big"},
+  {"op": "save", "in": "cut", "path": "out/cut.png"}]}
+```
+
+<p><img src="docs/images/onnx_models.jpg" width="640"></p>
+
+The photo, u2netp's mask, the cut-out (on green), Depth Anything's depth and
+Real-ESRGAN's x4 (from 256 px, in tiles).
+
+`u2netp.json`: `{"input": {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}, "output": {"kind": "mask"}}`;
+`depth_anything_v2_small.json`: the same input plus `"size": [518, 518]` and
+`"output": {"kind": "depth"}`; Real-ESRGAN needs none.
+
 ### LoRA and the LCM sampler
 
 `--lora file.safetensors[:scale]` merges LoRA adapters

@@ -1,4 +1,5 @@
 #include "Workflow.h"
+#include "Onnx.h"
 #include "Depth.h"
 #include "Diffusion.h"
 #include "Interpolate.h"
@@ -179,7 +180,7 @@ std::set<std::string> modelsUsed(const Step& s) {
             out.insert(modelTag(ip));
             out.insert(modelTag(enc));
         }
-    } else if (op == "depth" || op == "parallax" || op == "upscale" || op == "interpolate") {
+    } else if (op == "depth" || op == "parallax" || op == "upscale" || op == "interpolate" || op == "onnx") {
         out.insert(modelTag(s.path("model")));
     }
     return out;
@@ -584,6 +585,20 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
             for (const Image& im : in) {
                 progress.frame(static_cast<std::size_t>(&im - in.data()), in.size());
                 out.push_back(up->upscale(im));
+            }
+        } else if (op == "onnx") {
+            const std::string path = s.path("model");
+            const auto model = cachedModel<onnx::Model>("onnx|" + modelTag(path), modelTag(path),
+                                                         [&] { return std::make_shared<onnx::Model>(onnx::Model::load(path)); });
+            onnx::OnnxPipeline pipe = onnx::OnnxPipeline::fromModel(*model, onnx::onnxManifest(path));
+            if (s.has("kind") && s.str("kind", "auto") != "auto") pipe.kind = s.str("kind", "auto");
+            if (s.has("apply")) pipe.applyMask = s.flag("apply", false);
+            if (s.has("invert")) pipe.invert = s.flag("invert", false);
+            if (s.has("tile")) pipe.tileOverlap = static_cast<int>(s.num("tile", -1));
+            const Clip& in = s.clip("in");
+            for (const Image& im : in) {
+                progress.frame(static_cast<std::size_t>(&im - in.data()), in.size());
+                out.push_back(pipe.run(*model, im));
             }
         } else if (op == "interpolate") {
             out = smallModel<FrameInterpolator>("rife", s.path("model"))->interpolate(s.clip("in"), s.size("passes", 1), s.flag("loop", false));

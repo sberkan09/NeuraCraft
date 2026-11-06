@@ -152,6 +152,15 @@ std::vector<WorkflowOp> buildOps() {
          number("size", "int", "518", "Depth network input size", 14, 2044)});
     add("upscale", "Upscale", "enhance", "Real-ESRGAN (compact) super-resolution", true,
         {model("model", "esrgan", "Real-ESRGAN weights", true), field("in", "clip", "", "Input", true)});
+    add("onnx", "ONNX model", "enhance",
+        "Any image model exported to ONNX (background removal, depth, upscaling, restoration, style): pre- and post-processing from "
+        "the manifest next to it (<model>.json), or the fields here",
+        true,
+        {model("model", "onnx", "The .onnx file", true), field("in", "clip", "", "Input", true),
+         choice("kind", {"auto", "image", "mask", "depth"}, "\"auto\"", "What the output is (auto: by channel count)"),
+         field("apply", "bool", "false", "Mask models: cut the input out with the mask (transparent background)"),
+         field("invert", "bool", "false", "Invert the output"),
+         number("tile", "int", "-1", "Fixed-size upscalers: tile overlap in pixels (-1 automatic, 0 never tile)", -1, 512)});
     add("interpolate", "Interpolate", "enhance", "RIFE in-between frames (each pass doubles the frame rate)", true,
         {model("model", "rife", "RIFE weights", true), field("in", "clip", "", "Clip", true),
          number("passes", "int", "1", "Doublings", 1, 4), field("loop", "bool", "false", "Also between the last and first frame")});
@@ -397,6 +406,8 @@ std::vector<ModelInfo> findModels(const std::string& root, std::size_t maxDepth)
                     // Folders inside a model can be models of their own (taesd, image_encoder, motion files).
                 }
                 if (depth + 1 < maxDepth) stack.push_back({p, depth + 1});
+            } else if (e.is_regular_file(ec) && p.extension() == ".onnx") {
+                out.push_back({p.string(), "onnx", p.filename().string(), static_cast<std::size_t>(e.file_size(ec))});
             } else if (e.is_regular_file(ec) && p.extension() == ".safetensors") {
                 if (p.parent_path().filename() == "unet" || p.parent_path().filename() == "vae" ||
                     p.parent_path().filename() == "text_encoder" || folderKind(p.parent_path()) != "")

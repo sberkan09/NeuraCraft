@@ -24,8 +24,9 @@ for dev in gpu gpu32 cpu; do
     tf=1; [ $dev = gpu32 ] && tf=0
     s=$(date +%s.%N)
     prof=""; [ $dev = gpu ] && prof=--profile
-    fp=""; [ $dev = cpu ] && fp=--fp32  # the GPU keeps float weights: compare with float on the CPU
-    NEURACRAFT_CUDA_TF32=$tf $NC $flag $prof txt2img $M "a red fox in the snow, photo" /tmp/fox_$dev.png --steps 1 --seed 7 --size 512 $fp > /tmp/sd_$dev.log 2>&1 || tail -5 /tmp/sd_$dev.log
+    fp=""; name=$dev
+    if [ $dev = cpu ]; then fp=--fp32; name=cpu32; fi  # the GPU keeps float weights: compare with float on the CPU
+    NEURACRAFT_CUDA_TF32=$tf $NC $flag $prof txt2img $M "a red fox in the snow, photo" /tmp/fox_$name.png --steps 1 --seed 7 --size 512 $fp > /tmp/sd_$dev.log 2>&1 || tail -5 /tmp/sd_$dev.log
     echo "$dev: $(echo "$(date +%s.%N) - $s" | bc 2>/dev/null || python3 -c "print(round($(date +%s.%N)-$s,2))") s"
     grep -iE "load unet|step [0-9]|vae decode|wrote" /tmp/sd_$dev.log | tail -4
 done

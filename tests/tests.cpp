@@ -3692,6 +3692,22 @@ TEST(onnx_picture_pipeline_and_workflow_step) {
 
 // Running other people's workflows: files only inside the allowed folders, bounded sizes and time,
 // files renamed for a service, and the readers' guards against hostile files.
+TEST(model_cache_keeps_recent_models_when_asked) {
+    ModelCacheScope scope;
+    auto load = [](int v) { return [v] { return std::make_shared<int>(v); }; };
+    cachedModel<int>("a", "A", load(1));
+    cachedModel<int>("b", "B", load(2));
+    cachedModel<int>("c", "C", load(3));
+    cachedModel<int>("a", "A", load(9));  // a used again: the most recent
+    setModelCacheKeep(1);
+    releaseModelsExcept({"C"});
+    CHECK(modelCacheEntries() == 2);  // C (kept) and A (most recent of the rest)
+    CHECK(*cachedModel<int>("a", "A", load(7)) == 1);
+    setModelCacheKeep(0);
+    releaseModelsExcept({});
+    CHECK(modelCacheEntries() == 0);
+}
+
 TEST(workflow_sandbox_and_limits) {
     namespace fs = std::filesystem;
     const std::string dir = tempPath("sandbox");

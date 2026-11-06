@@ -94,6 +94,21 @@ void attention(const float* q, const float* k, const float* v, float* out, std::
 void geglu(const float* g, float* out, std::size_t N, std::size_t H);
 // y (N x C) = a * x + y
 void axpy(float* y, const float* x, float a, std::size_t n);
+
+// AnimateDiff motion modules. F frames (F x C x HW, frame after frame) are normalized with group
+// statistics over all frames (stats: device, 2 * groups floats: mean, 1 / std), and a range of pixels
+// [p0, p0 + np) becomes tokens grouped by pixel: row p * F + f.
+void frameGroupStats(const float* frames, std::size_t F, std::size_t C, std::size_t HW, std::size_t groups, float eps, float* stats);
+void framesToTokens(const float* frames, const float* stats, const float* hostGamma, const float* hostBeta, std::size_t F, std::size_t C,
+                    std::size_t HW, std::size_t groups, std::size_t p0, std::size_t np, float* tokens);
+// frames[f, c, p0 + p] += y[p * F + f, c]
+void addFrameTokens(float* frames, const float* y, std::size_t F, std::size_t C, std::size_t HW, std::size_t p0, std::size_t np);
+// x[r, :] += pattern[r % period, :] for x rows x C (pattern: device)
+void addPeriodicRows(float* x, const float* pattern, std::size_t rows, std::size_t period, std::size_t C);
+// Self-attention within each group of F consecutive rows (one pixel's frames); q, k, v, out: (P F) x C.
+void frameAttention(const float* q, const float* k, const float* v, float* out, std::size_t P, std::size_t F, std::size_t C, std::size_t heads);
+// Whether frameAttention takes this shape (F <= 32, head size <= 192).
+bool frameAttentionSupported(std::size_t F, std::size_t headSize);
 } // namespace dev
 
 } // namespace cuda

@@ -36,6 +36,24 @@ for g in 0 5; do
     $NC --gpu txt2img $M "a red fox in the snow, photo" /tmp/fox_g$g.png --steps 4 --seed 7 --size 512 --guidance $g > /tmp/sd_g$g.log 2>&1 || tail -5 /tmp/sd_g$g.log
     echo "guidance $g: $(grep -E 'step [0-9]' /tmp/sd_g$g.log | sed 's/^ *//' | tr '\n' ' ')"
 done
+if [ "${GPU_VIDEO:-1}" = 1 ]; then
+    echo "--- video: AnimateDiff-Lightning, 16 frames, 4 steps, 512 x 512 (whole clip on the device vs layer by layer) ---"
+    V=/data/animatediff
+    bash scripts/download_animatediff.sh $V 4 > /tmp/dlv.log 2>&1 || tail -5 /tmp/dlv.log  # (skips files it has)
+    for graph in 1 0; do
+        s=$(date +%s.%N)
+        NEURACRAFT_GPU_GRAPH=$graph $NC --gpu video $V t2v "a red fox running in the snow" -o /tmp/clip_$graph.gif --frames 16 --steps 4 --seed 7 > /tmp/v_$graph.log 2>&1 || tail -5 /tmp/v_$graph.log
+        echo "graph=$graph: $(python3 -c "print(round($(date +%s.%N)-$s,1))") s; $(grep -E 'step [0-9]' /tmp/v_$graph.log | sed 's/^ *//' | tr '\n' ' ')"
+    done
+    python3 - <<'PY'
+import numpy as np
+from PIL import Image, ImageSequence
+def frames(p): return [np.asarray(f.convert("RGB")).astype(np.float64) for f in ImageSequence.Iterator(Image.open(p))]
+a, b = frames("/tmp/clip_1.gif"), frames("/tmp/clip_0.gif")
+mse = np.mean([((x - y) ** 2).mean() for x, y in zip(a, b)])
+print("clip: %d frames, device vs layers PSNR %.1f dB" % (len(a), 10 * np.log10(255 ** 2 / max(mse, 1e-9))))
+PY
+fi
 echo "--- profile (gpu) ---"
 sed -n '/rofile/,$p' /tmp/sd_gpu.log | head -25
 python3 - <<'PY'

@@ -41,3 +41,19 @@ for name in ["gpu", "gpu32"]:
     mse = ((a - b) ** 2).mean()
     print("%s vs cpu: mean abs %.3f, PSNR %.1f dB" % (name, np.abs(a - b).mean(), 10 * np.log10(255 ** 2 / max(mse, 1e-9))))
 PY
+# --- temporary: the NeuraCraft Cloud GPU worker end to end (removed before merging) ---
+CLOUD_BRANCH=gpu-workers
+if [ -n "$CLOUD_BRANCH" ]; then
+    echo "--- cloud gpu e2e ($CLOUD_BRANCH) ---"
+    if ! command -v node > /dev/null; then
+        curl -fsSL https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz | tar -xJ -C /opt && ln -sf /opt/node-v22.11.0-linux-x64/bin/* /usr/local/bin/
+        apt-get install -y -qq postgresql libcurl4-openssl-dev > /dev/null 2>&1
+    fi
+    service postgresql start > /dev/null 2>&1
+    su postgres -c "psql -q -c \"DROP DATABASE IF EXISTS nc_gpu\" -c \"DROP ROLE IF EXISTS nc\" -c \"CREATE ROLE nc LOGIN SUPERUSER PASSWORD 'nc'\" -c \"CREATE DATABASE nc_gpu OWNER nc\"" 2>&1 | tail -2
+    rm -rf /cloud && git clone -q -b $CLOUD_BRANCH https://github.com/sberkan09/neuracraft-cloud /cloud
+    (cd /cloud && npm ci --no-audit --no-fund > /tmp/npm.log 2>&1 && npm run build > /tmp/npmb.log 2>&1) || tail -20 /tmp/npm.log /tmp/npmb.log
+    cmake -S /cloud/worker -B /cloud/worker/build -DCMAKE_BUILD_TYPE=Release -DNEURACRAFT_DIR=/nc -DNEURACRAFT_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$ARCH" > /tmp/wc.log 2>&1 \
+        && cmake --build /cloud/worker/build --parallel "$(nproc)" --target neuracraft-worker > /tmp/wb.log 2>&1 || { grep -E "error|Error" -A3 /tmp/wc.log /tmp/wb.log | head -30; }
+    (cd /cloud && DATABASE_URL=postgres://nc:nc@localhost:5432/nc_gpu E2E_SD_TURBO=$M node tests/gpu_e2e.mjs 2>&1 | grep -E "gpu e2e|Error|assert|worker:" | head -20)
+fi

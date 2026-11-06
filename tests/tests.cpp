@@ -5134,6 +5134,56 @@ TEST(gpu_int8_products_match_cpu) {
     setGpuMinWork(saved);
 }
 
+TEST(gpu_graphs_match_layer_by_layer_passes) {
+    // CUDA keeps whole VAE and UNet passes on the device; they must agree with the CPU.
+    if (!gpuAvailable() || gpuBackendName() != "CUDA") return;
+    setSeed(61);
+    const std::string dir = tempPath("gpu_graph");
+    std::filesystem::create_directories(dir + "/vae");
+    std::ofstream(dir + "/vae/config.json") << R"({"_class_name":"AutoencoderKL","act_fn":"silu","block_out_channels":[8,16],)"
+                                            << R"("in_channels":3,"out_channels":3,"latent_channels":2,"layers_per_block":1,)"
+                                            << R"("norm_num_groups":4,"scaling_factor":0.5})";
+    std::map<std::string, Matrix> owned;
+    for (const auto& [name, shape] : vaeTensorShapes({8, 16}, 1, 2)) {
+        std::size_t n = 1;
+        for (std::size_t d : shape) n *= d;
+        const bool scale = name.find("norm") != std::string::npos && name.size() > 7 && name.substr(name.size() - 7) == ".weight";
+        owned[name] = scale ? Matrix::uniform(1, n, 0.8f, 1.2f) : Matrix::uniform(1, n, -0.2f, 0.2f);
+    }
+    std::vector<std::pair<std::string, const Matrix*>> refs;
+    for (const auto& [n, m] : owned) refs.emplace_back(n, &m);
+    saveSafeTensors(dir + "/vae/diffusion_pytorch_model.safetensors", refs);
+    writeTinyUNet(dir, 6);
+
+    auto close = [](const Matrix& a, const Matrix& b) {
+        double scale = 1e-3, worst = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) scale = std::max(scale, static_cast<double>(std::fabs(b.data()[i])));
+        for (std::size_t i = 0; i < a.size(); ++i) worst = std::max(worst, static_cast<double>(std::fabs(a.data()[i] - b.data()[i])));
+        if (worst > 2e-3 * scale) std::cout << "         gpu graph differs by " << worst << " (scale " << scale << ")\n";
+        return a.sameShape(b) && worst <= 2e-3 * scale;
+    };
+    Vae vae = loadVae(dir, 16, 8);
+    UNet2DCondition unet = loadUNet(dir, 4, 6);
+    const Matrix img = Matrix::uniform(2, 3 * 16 * 8, -1, 1), lat = Matrix::uniform(2, 2 * 4 * 8, -2, 2);
+    const Matrix z = Matrix::uniform(1, 4 * 6 * 4, -1, 1), ctx = Matrix::uniform(5, 6, -1, 1);
+    setDevice(Device::CPU);
+    const Matrix encCpu = vae.encode(img), decCpu = vae.decode(lat), epsCpu = unet.forward(z, 500.0f, ctx);
+    setDevice(Device::GPU);
+    Matrix encGpu, decGpu, epsGpu, epsAgain;
+    {
+        GpuWeightScope scope;
+        encGpu = vae.encode(img);
+        decGpu = vae.decode(lat);
+        epsGpu = unet.forward(z, 500.0f, ctx);
+        epsAgain = unet.forward(z, 500.0f, ctx);  // weights from the resident copies
+    }
+    setDevice(Device::CPU);
+    CHECK(close(encGpu, encCpu));
+    CHECK(close(decGpu, decCpu));
+    CHECK(close(epsGpu, epsCpu));
+    CHECK(close(epsAgain, epsCpu));
+}
+
 TEST(gpu_resident_weights_follow_their_memory) {
     // Inside a weight scope the GPU keeps constant operands; a freed and reused buffer (a model
     // swapped for another of the same shape) must not be served from the old copy.

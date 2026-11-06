@@ -41,6 +41,9 @@ public:
 
     Matrix& gamma() { return gamma_; }  // 1 x channels
     Matrix& beta() { return beta_; }
+    ImageShape shape() const { return shape_; }
+    std::size_t groups() const { return groups_; }
+    float epsilon() const { return epsilon_; }
 
 private:
     ImageShape shape_;
@@ -62,6 +65,8 @@ public:
     std::string describe() const override;
     std::size_t outputSize(std::size_t) const override { return outputShape().size(); }
     ImageShape outputShape() const { return {in_.channels, in_.height * factor_, in_.width * factor_}; }
+    ImageShape inputShape() const { return in_; }
+    std::size_t factor() const { return factor_; }
 
 private:
     ImageShape in_;
@@ -80,6 +85,11 @@ public:
     std::string describe() const override;
     std::size_t outputSize(std::size_t) const override { return outputShape().size(); }
     ImageShape outputShape() const { return {in_.channels, in_.height + top_ + bottom_, in_.width + left_ + right_}; }
+    ImageShape inputShape() const { return in_; }
+    std::size_t top() const { return top_; }
+    std::size_t bottom() const { return bottom_; }
+    std::size_t left() const { return left_; }
+    std::size_t right() const { return right_; }
 
 private:
     ImageShape in_;
@@ -101,6 +111,7 @@ public:
     std::string describe() const override;
     std::size_t outputSize(std::size_t) const override { return outputShape().size(); }
     ImageShape outputShape() const { return {outChannels_, in_.height, in_.width}; }
+    ImageShape inputShape() const { return in_; }
 
     Network& main() { return main_; }          // norm1, SiLU, conv1, norm2, SiLU, conv2
     Network& shortcut() { return shortcut_; }  // empty, or one 1x1 Conv2D
@@ -127,6 +138,8 @@ public:
     std::string describe() const override;
 
     GroupNorm& norm() { return norm_; }
+    ImageShape shape() const { return shape_; }
+    std::size_t heads() const { return heads_; }
     // Projections in PyTorch Linear layout: (out x in) = channels x channels.
     Matrix& query() { return wq_; }
     Matrix& key() { return wk_; }

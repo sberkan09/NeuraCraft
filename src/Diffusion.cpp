@@ -4,6 +4,7 @@
 #include "Profile.h"
 #include "Activations.h"
 #include "Dense.h"
+#include "GpuGraph.h"
 #include "Json.h"
 #include "SafeTensors.h"
 
@@ -122,7 +123,8 @@ struct Builder {
 
 Matrix Vae::encode(const Matrix& img) {
     NC_PROFILE("vae");
-    const Matrix moments = encoder.predict(img);
+    Matrix moments;
+    if (!gpugraph::forward(encoder, img, moments)) moments = encoder.predict(img);
     const std::size_t n = latent.size();
     Matrix z(moments.rows(), n);
     for (std::size_t r = 0; r < moments.rows(); ++r)
@@ -134,6 +136,8 @@ Matrix Vae::decode(const Matrix& z) {
     NC_PROFILE("vae");
     Matrix unscaled = z;
     for (float& v : unscaled.values()) v /= scalingFactor;
+    Matrix image;
+    if (gpugraph::forward(decoder, unscaled, image)) return image;
     return decoder.predict(unscaled);
 }
 

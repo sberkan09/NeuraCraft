@@ -87,6 +87,8 @@ public:
 
     Matrix& gamma() { return gamma_; }
     Matrix& beta() { return beta_; }
+    std::size_t dim() const { return dim_; }
+    float epsilon() const { return epsilon_; }
 
 private:
     std::size_t dim_;

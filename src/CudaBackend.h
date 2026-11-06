@@ -48,6 +48,54 @@ void forgetHost(const void* p, std::size_t bytes);
 // Device memory in use by the backend's buffers and resident weights (bytes), for diagnostics.
 std::size_t deviceBytesInUse();
 
+// ---- Device graphs: whole passes (a UNet step, a VAE decode) with the activations on the device ----
+//
+// A Session holds the backend for one pass: buffers come from the stream's memory pool, the host
+// parameters it uploads (norm scales, biases) live until it ends, and its destructor waits for the
+// stream. Layer weights of 64 KB or more are resident as with gemmConst. All pointers below are
+// device pointers except the ones named host*.
+namespace dev {
+class Session {
+public:
+    Session();
+    ~Session();
+    Session(const Session&) = delete;
+    Session& operator=(const Session&) = delete;
+};
+float* alloc(std::size_t floats);
+void release(float* p);
+void upload(float* dst, const float* host, std::size_t floats);
+void download(float* host, const float* src, std::size_t floats);
+void copy(float* dst, const float* src, std::size_t floats);
+void fill(float* dst, float value, std::size_t floats);
+
+// NCHW pictures (B x C x H x W).
+void conv2d(const float* in, std::size_t B, std::size_t C, std::size_t H, std::size_t W, const float* hostWeights, bool outByPatch,
+            const float* hostBias, std::size_t outC, std::size_t k, std::size_t stride, std::size_t pad, float* out);
+void groupNorm(const float* in, float* out, std::size_t B, std::size_t C, std::size_t HW, std::size_t groups, float eps, const float* hostGamma,
+               const float* hostBeta, bool silu);
+void silu(float* x, std::size_t n);
+void add(float* y, const float* x, std::size_t n);                                          // y += x
+void addChannels(float* x, const float* hostPerChannel, std::size_t B, std::size_t C, std::size_t HW);  // x[b, c, :] += v[c]
+void upsample(const float* in, float* out, std::size_t B, std::size_t C, std::size_t H, std::size_t W, std::size_t factor);
+void pad(const float* in, float* out, std::size_t B, std::size_t C, std::size_t H, std::size_t W, std::size_t top, std::size_t bottom,
+         std::size_t left, std::size_t right);
+// One picture's channels <-> tokens: C x HW <-> HW x C.
+void toTokens(const float* in, float* out, std::size_t C, std::size_t HW);
+void fromTokens(const float* in, float* out, std::size_t HW, std::size_t C);
+
+// Rows of tokens (N x features).
+// y (N x out) = x W + b with W host in x out (Dense); transW: W is out x in (PyTorch Linear).
+void linear(const float* x, std::size_t N, std::size_t in, const float* hostW, bool transW, const float* hostBias, std::size_t out, float* y);
+void layerNorm(const float* x, float* y, std::size_t N, std::size_t C, float eps, const float* hostGamma, const float* hostBeta);
+// out (N x C) = softmax(Q K^T / sqrt(dh)) V per head; Q is N x C, K and V are M x C.
+void attention(const float* q, const float* k, const float* v, float* out, std::size_t N, std::size_t M, std::size_t C, std::size_t heads);
+// out (N x H) = g[:, :H] * gelu(g[:, H:]) for g N x 2H (diffusers GEGLU, exact erf GELU).
+void geglu(const float* g, float* out, std::size_t N, std::size_t H);
+// y (N x C) = a * x + y
+void axpy(float* y, const float* x, float a, std::size_t n);
+} // namespace dev
+
 } // namespace cuda
 } // namespace nc
 

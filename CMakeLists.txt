@@ -34,6 +34,7 @@ add_library(neuracraft_lib STATIC
     src/Dense.cpp
     src/Depth.cpp
     src/Diffusion.cpp
+    src/GpuGraph.cpp
     src/Image.cpp
     src/Interpolate.cpp
     src/IpAdapter.cpp

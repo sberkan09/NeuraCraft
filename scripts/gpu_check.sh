@@ -19,12 +19,13 @@ mkdir -p /data
 [ -s $M/unet/diffusion_pytorch_model.fp16.safetensors ] || bash scripts/download_sd_turbo.sh $M vae text_encoder unet > /tmp/dl.log 2>&1 || tail -5 /tmp/dl.log
 # (the CPU picture is made once: it is the reference)
 for dev in gpu gpu32 cpu; do
-    [ $dev = cpu ] && [ -s /tmp/fox_cpu.png ] && continue
+    [ $dev = cpu ] && [ -s /tmp/fox_cpu32.png ] && continue
     flag=""; [ $dev != cpu ] && flag=--gpu
     tf=1; [ $dev = gpu32 ] && tf=0
     s=$(date +%s.%N)
     prof=""; [ $dev = gpu ] && prof=--profile
-    NEURACRAFT_CUDA_TF32=$tf $NC $flag $prof txt2img $M "a red fox in the snow, photo" /tmp/fox_$dev.png --steps 1 --seed 7 --size 512 > /tmp/sd_$dev.log 2>&1 || tail -5 /tmp/sd_$dev.log
+    fp=""; [ $dev = cpu ] && fp=--fp32  # the GPU keeps float weights: compare with float on the CPU
+    NEURACRAFT_CUDA_TF32=$tf $NC $flag $prof txt2img $M "a red fox in the snow, photo" /tmp/fox_$dev.png --steps 1 --seed 7 --size 512 $fp > /tmp/sd_$dev.log 2>&1 || tail -5 /tmp/sd_$dev.log
     echo "$dev: $(echo "$(date +%s.%N) - $s" | bc 2>/dev/null || python3 -c "print(round($(date +%s.%N)-$s,2))") s"
     grep -iE "load unet|step [0-9]|vae decode|wrote" /tmp/sd_$dev.log | tail -4
 done
@@ -33,7 +34,7 @@ sed -n '/rofile/,$p' /tmp/sd_gpu.log | head -25
 python3 - <<'PY'
 import numpy as np, base64, io
 from PIL import Image
-b = np.asarray(Image.open("/tmp/fox_cpu.png").convert("RGB")).astype(np.float64)
+b = np.asarray(Image.open("/tmp/fox_cpu32.png").convert("RGB")).astype(np.float64)
 for name in ["gpu", "gpu32"]:
     a = np.asarray(Image.open("/tmp/fox_%s.png" % name).convert("RGB")).astype(np.float64)
     mse = ((a - b) ** 2).mean()

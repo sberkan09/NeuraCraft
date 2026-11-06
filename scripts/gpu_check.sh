@@ -55,5 +55,5 @@ if [ -n "$CLOUD_BRANCH" ]; then
     (cd /cloud && npm ci --no-audit --no-fund > /tmp/npm.log 2>&1 && npm run build > /tmp/npmb.log 2>&1) || tail -20 /tmp/npm.log /tmp/npmb.log
     cmake -S /cloud/worker -B /cloud/worker/build -DCMAKE_BUILD_TYPE=Release -DNEURACRAFT_DIR=/nc -DNEURACRAFT_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$ARCH" > /tmp/wc.log 2>&1 \
         && cmake --build /cloud/worker/build --parallel "$(nproc)" --target neuracraft-worker > /tmp/wb.log 2>&1 || { grep -E "error|Error" -A3 /tmp/wc.log /tmp/wb.log | head -30; }
-    (cd /cloud && DATABASE_URL=postgres://nc:nc@localhost:5432/nc_gpu E2E_SD_TURBO=$M node tests/gpu_e2e.mjs 2>&1 | grep -E "gpu e2e|Error|assert|worker:" | head -20)
+    (cd /cloud && DATABASE_URL=postgres://nc:nc@localhost:5432/nc_gpu E2E_SD_TURBO=$M timeout 900 node tests/gpu_e2e.mjs 2>&1 | grep -E "gpu e2e|Error|assert|worker:" | head -20)
 fi

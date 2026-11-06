@@ -54,7 +54,7 @@ jobs:
     - uses: actions/checkout@v4
     - name: Build with CUDA
       run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNEURACRAFT_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 && cmake --build build --parallel
-    - name: Tests (no GPU: the CPU paths)
+    - name: Tests (no GPU, so the CPU paths)
       run: ./build/neuracraft_tests
 
   fuzz:

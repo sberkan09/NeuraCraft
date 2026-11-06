@@ -318,3 +318,14 @@ save_model("mean_mask", [n("ReduceMean", ["x"], ["y"], axes=[1], keepdims=1)], h
 save_model("identity", [n("Identity", ["x"], ["y"])], h.make_tensor_value_info("x", T.FLOAT, [1, 3, "h", "w"]),
            h.make_tensor_value_info("y", T.FLOAT, [1, 3, "h", "w"]))
 print("pipeline models in", PIPE)
+# hostile: an initializer whose external data points outside the model's folder (must not load)
+t = nh.from_array(np.ones(4, np.float32), "w")
+t.data_location = T.EXTERNAL
+t.ClearField("raw_data")
+for k, v in [("location", "../escape.bin"), ("offset", "0"), ("length", "16")]:
+    e = t.external_data.add(); e.key = k; e.value = v
+g = h.make_graph([n("Add", ["x", "w"], ["y"])], "escape", [h.make_tensor_value_info("x", T.FLOAT, [4])], [h.make_tensor_value_info("y", T.FLOAT, [4])], initializer=[t])
+m = h.make_model(g, opset_imports=[h.make_opsetid("", 17)]); m.ir_version = 8
+with open(os.path.join(PIPE, "external_escape.onnx"), "wb") as f: f.write(m.SerializeToString())
+print("hostile models in", PIPE)
+

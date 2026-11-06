@@ -6,6 +6,7 @@ option(NEURACRAFT_BUILD_TESTS "Build the unit tests" ON)
 option(NEURACRAFT_USE_ACCELERATE "Use Apple Accelerate for CPU matrix products (macOS)" ON)
 option(NEURACRAFT_USE_METAL "Build the Metal GPU backend (macOS)" ON)
 option(NEURACRAFT_NATIVE "Optimize for the build machine's CPU (-march=native / -mcpu=native)" OFF)
+option(NEURACRAFT_FUZZ "Build the libFuzzer targets in fuzz/ (Clang; the library gets ASan + UBSan)" OFF)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -93,6 +94,21 @@ if(APPLE AND NEURACRAFT_USE_METAL)
     set_source_files_properties(src/MetalBackend.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_compile_definitions(neuracraft_lib PRIVATE NEURACRAFT_HAS_METAL)
     target_link_libraries(neuracraft_lib PUBLIC "-framework Metal" "-framework Foundation")
+endif()
+
+# ---- Fuzz targets (fuzz/README.md) -----------------------------------------------------
+if(NEURACRAFT_FUZZ)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "NEURACRAFT_FUZZ needs Clang (libFuzzer)")
+    endif()
+    target_compile_options(neuracraft_lib PUBLIC -fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=undefined -g)
+    target_link_options(neuracraft_lib PUBLIC -fsanitize=address,undefined)
+    foreach(target json workflow png safetensors onnx tensorproto)
+        add_executable(fuzz_${target} fuzz/fuzz_${target}.cpp)
+        target_link_libraries(fuzz_${target} PRIVATE neuracraft_lib)
+        target_link_options(fuzz_${target} PRIVATE -fsanitize=fuzzer)
+    endforeach()
+    return()  # the demo and the tests are not built with the sanitizers
 endif()
 
 # ---- Demo executable (bin/NeuraCraft) ----------------------------------------------

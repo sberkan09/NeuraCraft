@@ -3690,6 +3690,103 @@ TEST(onnx_picture_pipeline_and_workflow_step) {
     fs::remove_all(dir);
 }
 
+// Running other people's workflows: files only inside the allowed folders, bounded sizes and time,
+// files renamed for a service, and the readers' guards against hostile files.
+TEST(workflow_sandbox_and_limits) {
+    namespace fs = std::filesystem;
+    const std::string dir = tempPath("sandbox");
+    fs::remove_all(dir);
+    fs::create_directories(dir + "/in");
+    fs::create_directories(dir + "/out");
+    fs::create_directories(dir + "/secret");
+    Image pic;
+    pic.width = 8;
+    pic.height = 6;
+    pic.channels = 3;
+    pic.pixels.assign(8 * 6 * 3, 100);
+    savePng(dir + "/in/a.png", pic);
+    savePng(dir + "/secret/b.png", pic);
+    fs::create_symlink(dir + "/secret/b.png", dir + "/in/link.png");
+    WorkflowLimits lim;
+    lim.readRoots = {dir + "/in"};
+    lim.writeRoot = dir + "/out";
+    const WorkflowEvents ev;
+    // allowed: read in/, write out/
+    const auto ok = runWorkflow(R"({"steps": [{"op": "load", "path": "in/a.png", "out": "p"},
+        {"op": "save", "in": "p", "path": "out/a.png"}]})", dir, ev, nullptr, lim);
+    CHECK(ok.at("p").front().width == 8 && fs::exists(dir + "/out/a.png"));
+    // refused: other folders, "..", absolute paths, symlinks out, saving outside out/
+    for (const char* bad : {R"({"steps": [{"op": "load", "path": "secret/b.png"}]})", R"({"steps": [{"op": "load", "path": "in/../secret/b.png"}]})",
+                            R"({"steps": [{"op": "load", "path": "in/link.png"}]})", R"({"steps": [{"op": "load", "dir": "secret"}]})"})
+        CHECK_THROWS(runWorkflow(bad, dir, ev, nullptr, lim), WorkflowLimitExceeded);
+    CHECK_THROWS(runWorkflow(R"({"steps": [{"op": "load", "path": ")" + dir + R"(/secret/b.png"}]})", dir, ev, nullptr, lim), WorkflowLimitExceeded);
+    CHECK_THROWS(runWorkflow(R"({"steps": [{"op": "load", "path": "in/a.png", "out": "p"}, {"op": "save", "in": "p", "path": "in/x.png"}]})", dir, ev, nullptr, lim),
+                 WorkflowLimitExceeded);
+    CHECK(!fs::exists(dir + "/in/x.png"));
+    // model fields are checked before anything loads (the folder need not exist)
+    CHECK(!checkWorkflowLimits(R"({"steps": [{"op": "upscale", "model": "/etc/esrgan", "in": "p"}]})", dir, lim).empty());
+    CHECK(!checkWorkflowLimits(R"({"steps": [{"op": "txt2img", "model": "in/sd", "prompt": "x", "lora": ["secret/l.safetensors:0.5"]}]})", dir, lim).empty());
+    CHECK(checkWorkflowLimits(R"({"steps": [{"op": "txt2img", "model": "in/sd", "prompt": "x", "lora": ["in/l.safetensors:0.5"]}]})", dir, lim).empty());
+    // sizes, counts, steps
+    WorkflowLimits small = lim;
+    small.maxPixels = 40;
+    small.maxSteps = 2;
+    small.maxDenoiseSteps = 8;
+    small.maxFrames = 4;
+    CHECK_THROWS(runWorkflow(R"({"steps": [{"op": "load", "path": "in/a.png"}]})", dir, ev, nullptr, small), std::runtime_error);  // 48 pixels to decode
+    CHECK(!checkWorkflowLimits(R"({"steps": [{"op": "txt2img", "model": "in/sd", "prompt": "x", "steps": 30}]})", dir, small).empty());
+    CHECK(!checkWorkflowLimits(R"({"steps": [{"op": "t2v", "model": "in/sd", "prompt": "x", "frames": 16, "width": 4, "height": 4}]})", dir, small).empty());
+    CHECK(!checkWorkflowLimits(R"({"steps": [{"op": "load", "path": "in/a.png"}, {"op": "load", "path": "in/a.png"}, {"op": "load", "path": "in/a.png"}]})", dir, small).empty());
+    WorkflowLimits frames = lim;
+    frames.maxFrames = 2;
+    CHECK_THROWS(runWorkflow(R"({"steps": [{"op": "load", "path": "in/a.png", "out": "p"}, {"op": "concat", "in": ["p", "p", "p"], "out": "c"}]})", dir, ev,
+                             nullptr, frames),
+                 WorkflowLimitExceeded);
+    WorkflowLimits quick = lim;
+    quick.maxSeconds = 1e-9;
+    CHECK_THROWS(runWorkflow(R"({"steps": [{"op": "load", "path": "in/a.png", "out": "p"}, {"op": "resize", "in": "p", "width": 4, "height": 4}]})", dir, ev,
+                             nullptr, quick),
+                 WorkflowLimitExceeded);
+    // outside a sandbox nothing changes, and the decode bound is restored after a run
+    CHECK(runWorkflow(R"({"steps": [{"op": "load", "path": "secret/b.png", "out": "p"}]})", dir).at("p").size() == 1);
+    CHECK(maxDecodePixels() == (std::size_t(1) << 28));
+    // file names mapped for a service (scales kept), every file seen
+    std::vector<std::string> seen;
+    const std::string mapped = mapWorkflowFiles(R"({"steps": [{"op": "txt2img", "model": "asset:sd", "prompt": "asset:not-a-file", "lora": ["asset:l1:0.7", "asset:l2"], "out": "x"},
+        {"op": "load", "path": "asset:pic"}]})",
+                                                [&](const WorkflowField& f, const std::string& v) {
+                                                    seen.push_back(f.name + "=" + v);
+                                                    return "/cache/" + v.substr(6);
+                                                });
+    CHECK(seen.size() == 4);
+    const json::Value m = json::parse(mapped);
+    CHECK(m.at("steps").array[0].at("model").string == "/cache/sd");
+    CHECK(m.at("steps").array[0].at("prompt").string == "asset:not-a-file");
+    CHECK(m.at("steps").array[0].at("lora").array[0].string == "/cache/l1:0.7");
+    CHECK(m.at("steps").array[0].at("lora").array[1].string == "/cache/l2");
+    CHECK(m.at("steps").array[1].at("path").string == "/cache/pic");
+    // hostile files: a PNG claiming to be huge is refused before allocating, an ONNX model cannot
+    // point its external data outside its folder
+    {
+        std::vector<std::uint8_t> png{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n', 0, 0, 0, 13, 'I', 'H', 'D', 'R', 0x7F, 0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 8, 2, 0, 0, 0, 0, 0, 0, 0};
+        std::ofstream(dir + "/huge.png", std::ios::binary).write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+        CHECK_THROWS(loadPng(dir + "/huge.png"), std::runtime_error);
+    }
+    {
+        const std::string escape = (fs::path(NEURACRAFT_SOURCE_DIR) / "tests" / "onnx" / "pipeline" / "external_escape.onnx").string();
+        std::ofstream(fs::path(escape).parent_path().parent_path() / "escape.bin", std::ios::binary).write("0123456789abcdef", 16);
+        bool refused = false;
+        try {
+            onnx::Model::load(escape);
+        } catch (const std::exception& e) {
+            refused = std::string(e.what()).find("outside the model's folder") != std::string::npos;
+        }
+        fs::remove(fs::path(escape).parent_path().parent_path() / "escape.bin");
+        CHECK(refused);
+    }
+    fs::remove_all(dir);
+}
+
 TEST(lora_merging_and_lcm_sampler) {
     // LoraMerger: kohya and PEFT names, alpha / rank scaling, user scale.
     const std::string file = tempPath("lora_k.safetensors"), peft = tempPath("lora_p.safetensors");

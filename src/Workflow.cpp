@@ -27,9 +27,13 @@ struct StepProgress {
     const WorkflowEvents* events = nullptr;
     std::size_t step = 0, steps = 0;
     std::string op;
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max();
+    double maxSeconds = 0;
 
     void check() const {
         if (events && events->cancelled && events->cancelled()) throw WorkflowCancelled();
+        if (std::chrono::steady_clock::now() > deadline)
+            throw WorkflowLimitExceeded("the workflow ran longer than " + std::to_string(static_cast<long long>(maxSeconds)) + " s");
     }
     void stage(const std::string& s) const {
         check();
@@ -43,11 +47,11 @@ struct StepProgress {
             if (!num.empty() && !den.empty() && den.find_first_not_of("0123456789") == std::string::npos && std::stod(den) > 0)
                 fraction = std::stod(num) / std::stod(den);
         }
-        events->progress(step, steps, op, s, fraction);
+        if (events && events->progress) events->progress(step, steps, op, s, fraction);
     }
     void frame(std::size_t i, std::size_t n) const { stage("frame " + std::to_string(i + 1) + "/" + std::to_string(n)); }
     std::function<void(const std::string&, double)> stageCallback() const {
-        if (!events || (!events->progress && !events->cancelled)) return {};
+        if ((!events || (!events->progress && !events->cancelled)) && deadline == std::chrono::steady_clock::time_point::max()) return {};
         const StepProgress* self = this;
         return [self](const std::string& s, double) { self->stage(s); };
     }
@@ -61,12 +65,45 @@ struct StepProgress {
     }
 };
 
+// Whether `path` is inside one of `roots` once ".." and symlinks are resolved.
+bool insideRoots(const std::string& path, const std::vector<std::string>& roots) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path p = fs::weakly_canonical(fs::absolute(path, ec), ec);
+    if (ec) return false;
+    for (const std::string& r : roots) {
+        const fs::path root = fs::weakly_canonical(fs::absolute(r, ec), ec);
+        if (ec) continue;
+        auto pi = p.begin();
+        bool inside = true;
+        for (auto ri = root.begin(); ri != root.end(); ++ri, ++pi) {
+            if (ri->empty()) continue;  // a trailing separator
+            if (pi == p.end() || *pi != *ri) {
+                inside = false;
+                break;
+            }
+        }
+        if (inside) return true;
+    }
+    return false;
+}
+
+void allowRead(const WorkflowLimits* limits, const std::string& path) {
+    if (!limits || !limits->sandboxed() || path.empty()) return;
+    if (!insideRoots(path, limits->readRoots)) throw WorkflowLimitExceeded("reading " + path + " is not allowed");
+}
+void allowWrite(const WorkflowLimits* limits, const std::string& path) {
+    if (!limits || !limits->sandboxed()) return;
+    if (limits->writeRoot.empty() || !insideRoots(path, {limits->writeRoot})) throw WorkflowLimitExceeded("writing " + path + " is not allowed");
+}
+
 struct Step {
     const json::Value& v;
     std::string op;
     std::string base;
     std::map<std::string, Clip>& clips;
     const StepProgress* progress = nullptr;
+    const WorkflowLimits* limits = nullptr;
 
     bool has(const char* k) const { return v.find(k) != nullptr; }
     std::string str(const char* k, const std::string& fallback = "") const {
@@ -75,11 +112,15 @@ struct Step {
         if (!x->isString()) throw std::invalid_argument(op + ": \"" + k + "\" must be a string");
         return x->string;
     }
+    // A file field as a path (relative to the base folder), checked against the sandbox.
     std::string path(const char* k) const {
         const std::string s = str(k);
         if (s.empty()) return s;
         const std::filesystem::path p(s);
-        return p.is_absolute() ? s : (std::filesystem::path(base) / p).string();
+        const std::string full = p.is_absolute() ? s : (std::filesystem::path(base) / p).string();
+        if (std::string(k) == "path" && op == "save") allowWrite(limits, full);
+        else allowRead(limits, full);
+        return full;
     }
     std::string need(const char* k) const {
         const std::string s = str(k);
@@ -118,6 +159,7 @@ struct Step {
             }
             const std::filesystem::path p(s);
             out.push_back({p.is_absolute() ? s : (std::filesystem::path(base) / p).string(), scale});
+            allowRead(limits, out.back().file);
         }
         return out;
     }
@@ -151,6 +193,10 @@ TextToImageOptions imageOptions(const Step& s) {
     if (s.has("ip_adapter")) {
         o.ipAdapter = s.path("ip_adapter");
         o.imageEncoder = s.path("image_encoder");
+        if (o.imageEncoder.empty() && s.limits && s.limits->sandboxed()) {
+            o.imageEncoder = std::filesystem::path(o.ipAdapter).parent_path().append("image_encoder").string();
+            allowRead(s.limits, o.imageEncoder);
+        }
         o.imagePrompt = s.image("image_prompt");
         o.ipScale = static_cast<float>(s.num("ip_scale", 0.6));
     }
@@ -391,6 +437,143 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
 
 std::map<std::string, Clip> runWorkflow(const std::string& text, const std::string& base, const WorkflowEvents& events,
                                         WorkflowResultCache* results) {
+    return runWorkflow(text, base, events, results, WorkflowLimits{});
+}
+
+namespace {
+const std::set<std::string> generationOps{"txt2img", "img2img", "inpaint", "t2v", "morph", "zoom", "outpaint"};
+
+// The files a step names, as written (LoRA scales removed).
+void stepFiles(const json::Value& v, const std::function<void(const WorkflowField&, const std::string&)>& f) {
+    const json::Value* opv = v.find("op");
+    const WorkflowOp* op = opv && opv->isString() ? findWorkflowOp(opv->string) : nullptr;
+    if (!op) return;
+    for (const WorkflowField& field : op->fields) {
+        if (field.type != "model" && field.type != "file" && field.type != "dir" && field.type != "loras") continue;
+        const json::Value* x = v.find(field.name);
+        if (!x) continue;
+        auto one = [&](const std::string& value) {
+            std::string name = value;
+            if (field.type == "loras") {
+                const std::size_t colon = name.rfind(':');
+                if (colon != std::string::npos && colon + 1 < name.size() && (std::isdigit(static_cast<unsigned char>(name[colon + 1])) || name[colon + 1] == '.'))
+                    name = name.substr(0, colon);
+            }
+            if (!name.empty()) f(field, name);
+        };
+        if (x->isString()) one(x->string);
+        else if (x->isArray())
+            for (const auto& e : x->array)
+                if (e.isString()) one(e.string);
+    }
+}
+
+void checkClip(const WorkflowLimits& limits, const Clip& clip, const std::string& what) {
+    if (limits.maxFrames && clip.size() > limits.maxFrames)
+        throw WorkflowLimitExceeded(what + " has " + std::to_string(clip.size()) + " frames, more than the limit of " + std::to_string(limits.maxFrames));
+    if (limits.maxPixels)
+        for (const Image& im : clip)
+            if (im.width * im.height > limits.maxPixels)
+                throw WorkflowLimitExceeded(what + " is " + std::to_string(im.width) + " x " + std::to_string(im.height) + ", more than the limit of " +
+                                            std::to_string(limits.maxPixels) + " pixels");
+}
+
+// Sets the picture readers' bound for the run.
+struct DecodeLimit {
+    std::size_t before;
+    explicit DecodeLimit(std::size_t pixels) : before(maxDecodePixels()) {
+        if (pixels) setMaxDecodePixels(pixels);
+    }
+    ~DecodeLimit() { setMaxDecodePixels(before); }
+};
+} // namespace
+
+std::vector<std::string> checkWorkflowLimits(const std::string& text, const std::string& base, const WorkflowLimits& limits) {
+    std::vector<std::string> out;
+    json::Value doc;
+    try {
+        doc = json::parse(text);
+    } catch (const std::exception& e) {
+        return {e.what()};
+    }
+    const json::Value* steps = doc.find("steps");
+    if (!steps || !steps->isArray()) return out;
+    if (limits.maxSteps && steps->array.size() > limits.maxSteps)
+        out.push_back(std::to_string(steps->array.size()) + " steps, more than the limit of " + std::to_string(limits.maxSteps));
+    std::size_t index = 0;
+    for (const json::Value& v : steps->array) {
+        ++index;
+        const std::string where = "step " + std::to_string(index) + ": ";
+        const json::Value* opv = v.find("op");
+        const std::string op = opv && opv->isString() ? opv->string : "";
+        const double w = v.numberOr("width", 512), h = v.numberOr("height", 512);
+        if (limits.maxPixels && (v.find("width") || v.find("height") || generationOps.count(op)) && w * h > static_cast<double>(limits.maxPixels))
+            out.push_back(where + "width x height is more than the limit of " + std::to_string(limits.maxPixels) + " pixels");
+        if (limits.maxPixels && v.find("size") && op == "depth") {
+            const double sz = v.numberOr("size", 518);
+            if (sz * sz > static_cast<double>(limits.maxPixels)) out.push_back(where + "size is more than the pixel limit");
+        }
+        if (limits.maxDenoiseSteps && generationOps.count(op) && v.numberOr("steps", 0) > static_cast<double>(limits.maxDenoiseSteps))
+            out.push_back(where + "more than " + std::to_string(limits.maxDenoiseSteps) + " denoising steps");
+        if (limits.maxFrames) {
+            double frames = v.numberOr("frames", 0);
+            if (op == "morph") frames *= std::max<double>(1, static_cast<double>(v.find("prompts") ? v.at("prompts").array.size() : 1));
+            if (op == "outpaint") frames *= v.numberOr("keyframes", 6);
+            if (frames > static_cast<double>(limits.maxFrames)) out.push_back(where + "more frames than the limit of " + std::to_string(limits.maxFrames));
+        }
+        if (limits.sandboxed()) {
+            stepFiles(v, [&](const WorkflowField& field, const std::string& value) {
+                const std::filesystem::path p(value);
+                const std::string full = p.is_absolute() ? value : (std::filesystem::path(base) / p).string();
+                try {
+                    if (op == "save" && field.name == "path") allowWrite(&limits, full);
+                    else allowRead(&limits, full);
+                } catch (const std::exception& e) {
+                    out.push_back(where + e.what());
+                }
+            });
+        }
+    }
+    return out;
+}
+
+std::string mapWorkflowFiles(const std::string& text, const std::function<std::string(const WorkflowField&, const std::string&)>& map) {
+    json::Value doc = json::parse(text);
+    json::Value* steps = nullptr;
+    for (auto& [k, x] : doc.object)
+        if (k == "steps") steps = &x;
+    if (!steps || !steps->isArray()) return text;
+    for (json::Value& v : steps->array) {
+        const json::Value* opv = v.find("op");
+        const WorkflowOp* op = opv && opv->isString() ? findWorkflowOp(opv->string) : nullptr;
+        if (!op) continue;
+        for (auto& [k, x] : v.object) {
+            const WorkflowField* field = nullptr;
+            for (const WorkflowField& f : op->fields)
+                if (f.name == k) field = &f;
+            if (!field || (field->type != "model" && field->type != "file" && field->type != "dir" && field->type != "loras")) continue;
+            auto one = [&](json::Value& e) {
+                if (!e.isString() || e.string.empty()) return;
+                std::string name = e.string, suffix;
+                if (field->type == "loras") {
+                    const std::size_t colon = name.rfind(':');
+                    if (colon != std::string::npos && colon + 1 < name.size() && (std::isdigit(static_cast<unsigned char>(name[colon + 1])) || name[colon + 1] == '.')) {
+                        suffix = name.substr(colon);
+                        name = name.substr(0, colon);
+                    }
+                }
+                e.string = map(*field, name) + suffix;
+            };
+            if (x.isString()) one(x);
+            else if (x.isArray())
+                for (json::Value& e : x.array) one(e);
+        }
+    }
+    return json::dump(doc);
+}
+
+std::map<std::string, Clip> runWorkflow(const std::string& text, const std::string& base, const WorkflowEvents& events,
+                                        WorkflowResultCache* results, const WorkflowLimits& limits) {
     const auto& log = events.log;
     const std::vector<std::string> problems = checkWorkflow(text);
     if (!problems.empty()) {
@@ -398,6 +581,15 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
         for (const std::string& p : problems) message += "\n  " + p;
         throw std::invalid_argument(message);
     }
+    if (const std::vector<std::string> over = checkWorkflowLimits(text, base, limits); !over.empty()) {
+        std::string message = "workflow limits:";
+        for (const std::string& p : over) message += "\n  " + p;
+        throw WorkflowLimitExceeded(message);
+    }
+    const DecodeLimit decodeLimit(limits.maxPixels);
+    const auto deadline = limits.maxSeconds > 0
+                              ? std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(limits.maxSeconds))
+                              : std::chrono::steady_clock::time_point::max();
     const json::Value doc = json::parse(text);
     const json::Value* steps = doc.find("steps");
     std::map<std::string, Clip> clips;
@@ -417,7 +609,7 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
     std::size_t index = 0;
     for (const json::Value& v : steps->array) {
         ++index;
-        StepProgress progress{&events, index, steps->array.size(), v.at("op").string};
+        StepProgress progress{&events, index, steps->array.size(), v.at("op").string, deadline, limits.maxSeconds};
         const std::string& stepOp = v.at("op").string;
         const std::string key = results ? stepKey(v, base, clipKeys) : std::string();
         const std::string outField = v.find("out") && v.at("out").isString() ? v.at("out").string : std::string();
@@ -434,7 +626,7 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
             }
         }
         progress.stage("start");
-        Step s{v, v.at("op").string, base, clips, &progress};
+        Step s{v, v.at("op").string, base, clips, &progress, &limits};
         const auto start = std::chrono::steady_clock::now();
         Clip out;
         const std::string& op = s.op;
@@ -446,7 +638,11 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
                     if (ext == ".png" || ext == ".ppm") files.push_back(e.path().string());
                 }
                 std::sort(files.begin(), files.end());
-                for (const auto& f : files) out.push_back(toRgb(loadImage(f)));
+                if (limits.maxFrames && files.size() > limits.maxFrames) throw WorkflowLimitExceeded("load: more frames than the limit");
+                for (const auto& f : files) {
+                    allowRead(&limits, f);
+                    out.push_back(toRgb(loadImage(f)));
+                }
             } else out.push_back(toRgb(loadImage(s.path("path"))));
         } else if (op == "save") {
             save(s, s.clip("in"));
@@ -582,6 +778,9 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
         } else if (op == "upscale") {
             const auto up = smallModel<Upscaler>("upscaler", s.path("model"));
             const Clip& in = s.clip("in");
+            if (limits.maxPixels)
+                for (const Image& im : in)
+                    if (im.width * im.height * up->scale() * up->scale() > limits.maxPixels) throw WorkflowLimitExceeded("upscale: the result would be bigger than the pixel limit");
             for (const Image& im : in) {
                 progress.frame(static_cast<std::size_t>(&im - in.data()), in.size());
                 out.push_back(up->upscale(im));
@@ -601,11 +800,17 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
                 out.push_back(pipe.run(*model, im));
             }
         } else if (op == "interpolate") {
-            out = smallModel<FrameInterpolator>("rife", s.path("model"))->interpolate(s.clip("in"), s.size("passes", 1), s.flag("loop", false));
+            const std::size_t passes = s.size("passes", 1), n = s.clip("in").size();
+            const std::size_t made = passes > 16 ? std::numeric_limits<std::size_t>::max()
+                                     : s.flag("loop", false) ? n << passes : n ? ((n - 1) << passes) + 1 : 0;
+            if (limits.maxFrames && made > limits.maxFrames)
+                throw WorkflowLimitExceeded("interpolate: the result would have more frames than the limit");
+            out = smallModel<FrameInterpolator>("rife", s.path("model"))->interpolate(s.clip("in"), passes, s.flag("loop", false));
         } else {
             throw std::invalid_argument("workflow: unknown op \"" + op + "\" in step " + std::to_string(index));
         }
         if (cache) releaseModelsExcept(index < needed.size() ? needed[index] : std::set<std::string>{});
+        checkClip(limits, out, "step " + std::to_string(index) + " (" + op + ")");
         const std::string outName = s.str("out");
         const std::string clipName = out.empty() ? std::string() : (outName.empty() ? op : outName);
         if (!out.empty()) {

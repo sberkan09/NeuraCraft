@@ -102,6 +102,43 @@ private:
 std::map<std::string, Clip> runWorkflow(const std::string& json, const std::string& baseDirectory, const WorkflowEvents& events,
                                         WorkflowResultCache* results);
 
+// ---- Running other people's workflows (a service) ----
+//
+// Without limits a workflow may name any file and ask for any amount of work - right for local use.
+// A service passes WorkflowLimits: files only inside the given folders (checked after resolving ".."
+// and symlinks), saves only inside the output folder, and bounds on sizes, counts and time, checked
+// before the run (from the fields) and as it goes (on what each step makes). Breaking one throws
+// WorkflowLimitExceeded naming it. Model folders are trusted to contain no symlinks leading out.
+struct WorkflowLimits {
+    std::vector<std::string> readRoots;  // models and inputs; empty = anywhere (no sandbox)
+    std::string writeRoot;               // saves; with readRoots set and this empty, saving is refused
+    std::size_t maxSteps = 0;            // steps in the workflow
+    std::size_t maxPixels = 0;           // width x height of any picture asked for, loaded or made
+    std::size_t maxFrames = 0;           // frames in any clip
+    std::size_t maxDenoiseSteps = 0;     // "steps" of a generation step
+    double maxSeconds = 0;               // wall-clock time of the whole run
+    // 0 = no bound. sandboxed(): files are checked.
+    bool sandboxed() const { return !readRoots.empty(); }
+};
+
+struct WorkflowLimitExceeded : std::runtime_error {
+    explicit WorkflowLimitExceeded(const std::string& what) : std::runtime_error(what) {}
+};
+
+// As above, within `limits` (results may be null).
+std::map<std::string, Clip> runWorkflow(const std::string& json, const std::string& baseDirectory, const WorkflowEvents& events,
+                                        WorkflowResultCache* results, const WorkflowLimits& limits);
+
+// What breaks the limits before running (the same checks runWorkflow makes first); empty if nothing.
+std::vector<std::string> checkWorkflowLimits(const std::string& json, const std::string& baseDirectory, const WorkflowLimits& limits);
+
+// Rewrites every file a workflow names - fields of type model, file, dir and loras (a LoRA's ":scale"
+// is kept) - with map(field, value), returning the new JSON. A service gives workflows names of its
+// own ("asset:3f2a...") and maps them to local paths here, refusing anything else by throwing; map
+// also sees every file the run will need, so it can fetch them first.
+struct WorkflowField;
+std::string mapWorkflowFiles(const std::string& json, const std::function<std::string(const WorkflowField& field, const std::string& value)>& map);
+
 // ---- Schema: what each operation takes (drives validation, docs and the Studio UI) ----
 
 struct WorkflowField {

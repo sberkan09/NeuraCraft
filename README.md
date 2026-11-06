@@ -603,6 +603,11 @@ Real-ESRGAN x4plus upscales, all in one workflow:
   {"op": "save", "in": "cut", "path": "out/cut.png"}]}
 ```
 
+<p><img src="docs/images/onnx_models.jpg" width="640"></p>
+
+The photo, u2netp's mask, the cut-out (on green), Depth Anything's depth and
+Real-ESRGAN's x4 (from 256 px, in tiles).
+
 `u2netp.json`: `{"input": {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}, "output": {"kind": "mask"}}`;
 `depth_anything_v2_small.json`: the same input plus `"size": [518, 518]` and
 `"output": {"kind": "depth"}`; Real-ESRGAN needs none.

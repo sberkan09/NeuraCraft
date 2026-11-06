@@ -864,7 +864,7 @@ double timeGemm(std::size_t n, const std::function<void()>& run) {
 int runBench(bool quick) {
     banner("Matrix multiply benchmark");
     std::cout << "CPU backend: " << cpuBackendName() << ", " << threadCount() << " threads\n"
-              << "GPU: " << (gpuAvailable() ? gpuName() + " (Metal)" : std::string("not available")) << "\n\n";
+              << "GPU: " << (gpuAvailable() ? gpuName() + " (" + gpuBackendName() + ")" : std::string("not available")) << "\n\n";
 
     using RawGemm = void (*)(bool, bool, std::size_t, std::size_t, std::size_t, const float*, std::size_t,
                              const float*, std::size_t, float*, std::size_t, bool);
@@ -875,9 +875,11 @@ int runBench(bool quick) {
     };
     std::vector<Column> columns{{"blocked", gemmBlocked, false}};
     if (cpuBackendName() != "NeuraCraft blocked kernel") columns.push_back({"accelerate", gemmCpu, false});
-    if (gpuAvailable()) {
+    if (gpuAvailable() && gpuBackendName() == "Metal") {
         columns.push_back({"metal copy", gemmGpu, false});
         columns.push_back({"metal 0-copy", nullptr, true});
+    } else if (gpuAvailable()) {
+        columns.push_back({"cuda", gemmGpu, false});
     }
 
     const std::vector<std::size_t> sizes = quick ? std::vector<std::size_t>{64, 129}

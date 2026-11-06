@@ -23,6 +23,7 @@ Device currentDevice();
 std::string deviceDescription();
 std::string cpuBackendName();  // "Accelerate" or "NeuraCraft blocked kernel"
 std::string gpuName();         // empty if no GPU
+std::string gpuBackendName();  // "Metal", "CUDA", or empty without a GPU backend
 // Whether int8 layers (QuantizedWeights) multiply on the GPU straight from
 // their int8 weights; otherwise they expand them to float for the GPU GEMM.
 bool gpuInt8Available();

@@ -11,29 +11,29 @@ cmake --build build-cuda --parallel "$(nproc)" > /tmp/build.log 2>&1 || { grep -
 echo "build: $(( $(date +%s) - t0 )) s"
 NC=bin/NeuraCraft
 echo "--- tests (FP32) ---"
-NEURACRAFT_CUDA_TF32=0 ./build-cuda/neuracraft_tests 2>&1 | grep -E "GPU:|FAIL|passed|failed" | head -40
-echo "--- tests (TF32) ---"
-./build-cuda/neuracraft_tests 2>&1 | grep -E "FAIL|passed|failed" | head -20
+NEURACRAFT_CUDA_TF32=0 ./build-cuda/neuracraft_tests 2>&1 | grep -E "GPU:|FAIL|passed|failed|max diff|attention|differ|mismatch" | head -40
 echo "--- bench ---"
 $NC bench 2>&1 | tail -12
 echo "--- sd-turbo ---"
 M=/data/sd-turbo
 mkdir -p /data
 [ -s $M/unet/diffusion_pytorch_model.fp16.safetensors ] || bash scripts/download_sd_turbo.sh $M vae text_encoder unet > /tmp/dl.log 2>&1 || tail -5 /tmp/dl.log
-for dev in gpu cpu; do
-    flag=""; [ $dev = gpu ] && flag=--gpu
+for dev in gpu gpu32 cpu; do
+    flag=""; [ $dev != cpu ] && flag=--gpu
+    tf=1; [ $dev = gpu32 ] && tf=0
     s=$(date +%s.%N)
-    $NC $flag txt2img $M "a red fox in the snow, photo" /tmp/fox_$dev.png --steps 1 --seed 7 --size 512 > /tmp/sd_$dev.log 2>&1 || tail -5 /tmp/sd_$dev.log
+    NEURACRAFT_CUDA_TF32=$tf $NC $flag txt2img $M "a red fox in the snow, photo" /tmp/fox_$dev.png --steps 1 --seed 7 --size 512 > /tmp/sd_$dev.log 2>&1 || tail -5 /tmp/sd_$dev.log
     echo "$dev: $(echo "$(date +%s.%N) - $s" | bc 2>/dev/null || python3 -c "print(round($(date +%s.%N)-$s,2))") s"
     grep -iE "unet|denois|step|vae|decode|text" /tmp/sd_$dev.log | tail -4
 done
 python3 - <<'PY'
 import numpy as np, base64, io
 from PIL import Image
-a = np.asarray(Image.open("/tmp/fox_gpu.png").convert("RGB")).astype(np.float64)
 b = np.asarray(Image.open("/tmp/fox_cpu.png").convert("RGB")).astype(np.float64)
-mse = ((a - b) ** 2).mean()
-print("gpu vs cpu: mean abs %.3f, PSNR %.1f dB" % (np.abs(a - b).mean(), 10 * np.log10(255 ** 2 / max(mse, 1e-9))))
+for name in ["gpu", "gpu32"]:
+    a = np.asarray(Image.open("/tmp/fox_%s.png" % name).convert("RGB")).astype(np.float64)
+    mse = ((a - b) ** 2).mean()
+    print("%s vs cpu: mean abs %.3f, PSNR %.1f dB" % (name, np.abs(a - b).mean(), 10 * np.log10(255 ** 2 / max(mse, 1e-9))))
 buf = io.BytesIO(); Image.open("/tmp/fox_gpu.png").convert("RGB").resize((128, 128)).save(buf, "JPEG", quality=80)
 print("thumb:" + base64.b64encode(buf.getvalue()).decode())
 PY

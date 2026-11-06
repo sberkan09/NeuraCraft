@@ -5003,7 +5003,7 @@ TEST(gemm_gpu_matches_reference_when_available) {
         return;
     }
     std::cout << "         (GPU: " << gpuName() << ")\n";
-    checkGemmImplementation(gemmGpu, "metal");
+    checkGemmImplementation(gemmGpu, gpuBackendName());
 }
 
 TEST(gpu_device_trains_same_as_cpu) {
@@ -5122,7 +5122,8 @@ TEST(gpu_fused_attention_matches_cpu) {
     if (!gpuAvailable()) return;
     std::cout << "         (attention kernels: head 40 " << gpuAttentionKernel(40) << ", head 64 " << gpuAttentionKernel(64)
               << ", head 36 " << gpuAttentionKernel(36) << ")\n";
-    CHECK(gpuAttentionKernel(36) == "scalar" && gpuAttentionKernel(512).empty());
+    if (gpuBackendName() == "Metal") CHECK(gpuAttentionKernel(36) == "scalar" && gpuAttentionKernel(512).empty());
+    else CHECK(!gpuAttentionKernel(36).empty() && gpuAttentionKernel(512).empty());
     setSeed(91);
     const std::size_t saved = gpuMinWork();
     setGpuMinWork(1);

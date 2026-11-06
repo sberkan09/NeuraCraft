@@ -267,6 +267,24 @@ for lbr in [0, 1]:
 case("rnn_relu", [n("RNN", ["x", "w", "r", "b"], ["y", "yh"], hidden_size=H_, activations=["Relu"])], {"x": xs_}, outputs=["y", "yh"],
      inits=[("w", f32(1, H_, I_)), ("r", f32(1, H_, H_) * 0.5), ("b", f32(1, 2 * H_))])
 
+# a channel Concat read only by a Conv is folded into it (direct stride-1 path, a strided path, and a
+# Concat read twice, which stays)
+case("concat_into_conv", [n("Conv", ["x", "w0"], ["a"], pads=[1, 1, 1, 1]), n("LeakyRelu", ["a"], ["la"], alpha=0.2), n("Concat", ["x", "la"], ["c1"], axis=1),
+                          n("Conv", ["c1", "w1", "b1"], ["y1"], pads=[1, 1, 1, 1]), n("Concat", ["x", "la", "y1"], ["c2"], axis=1),
+                          n("Conv", ["c2", "w2"], ["y"], pads=[1, 1, 1, 1], strides=[2, 2])],
+     {"x": f32(1, 16, 9, 11)}, inits=[("w0", f32(8, 16, 3, 3) * 0.3), ("w1", f32(12, 24, 3, 3) * 0.3), ("b1", f32(12)), ("w2", f32(5, 36, 3, 3) * 0.3)])
+case("concat_read_twice", [n("Concat", ["a", "b"], ["c"], axis=1), n("Conv", ["c", "w"], ["y1"], pads=[1, 1, 1, 1]), n("Add", ["y1", "y1"], ["s"]),
+                           n("ReduceSum", ["c"], ["r"], axes=[1], keepdims=1), n("Add", ["s", "r"], ["y"])],
+     {"a": f32(2, 10, 6, 7), "b": f32(2, 14, 6, 7)}, inits=[("w", f32(3, 24, 3, 3))], opset=11)
+
+# depthwise convolutions (one input channel per group)
+case("conv_depthwise_stride", [n("Conv", ["x", "w", "b"], ["y"], group=6, pads=[1, 1, 1, 1], strides=[2, 2])], {"x": f32(2, 6, 9, 8)},
+     inits=[("w", f32(6, 1, 3, 3)), ("b", f32(6))])
+case("conv_depthwise_multiplier_dilation", [n("Conv", ["x", "w"], ["y"], group=4, dilations=[2, 2], pads=[2, 1, 2, 3])], {"x": f32(1, 4, 7, 10)},
+     inits=[("w", f32(8, 1, 3, 3))])
+case("conv_depthwise_1d_clip", [n("Conv", ["x", "w"], ["c"], group=5, pads=[2, 2]), n("Clip", ["c", "lo", "hi"], ["y"])], {"x": f32(1, 5, 13)},
+     inits=[("w", f32(5, 1, 5)), ("lo", np.array(0.0, np.float32)), ("hi", np.array(0.6, np.float32))])
+
 shutil.rmtree(OUT, ignore_errors=True)
 for name, model, inputs, outputs in cases:
     # (outputs are declared without shapes, which onnx.checker refuses; onnxruntime accepts them)

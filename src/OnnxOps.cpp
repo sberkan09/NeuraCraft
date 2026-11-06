@@ -500,8 +500,55 @@ ConvGeometry convGeometry(const Node& n, const Shape& x, const Shape& w, bool tr
     return g;
 }
 
+// The channel planes of a Conv input: one tensor, or the pieces of a Concat folded into the Conv
+// (Model::load, "_concat"), each read where it is.
+struct ConvInput {
+    Shape shape;
+    std::vector<std::pair<const Tensor*, std::size_t>> pieces;  // tensor, channels
+    std::size_t plane = 0;
+    // The plane of channel c of image b.
+    const float* channel(std::size_t b, std::size_t c) const {
+        for (const auto& [t, ch] : pieces) {
+            if (c < ch) return t->f.data() + (b * ch + c) * plane;
+            c -= ch;
+        }
+        return nullptr;
+    }
+};
+
+ConvInput convInput(const Node& n, const Ins& in) {
+    ConvInput ci;
+    const Tensor& X0 = need(in, 0);
+    ci.shape = X0.shape;
+    ci.pieces.push_back({&X0, static_cast<std::size_t>(X0.shape.at(1))});
+    const std::size_t extra = static_cast<std::size_t>(n.i("_concat", 1)) - 1;
+    for (std::size_t k = 0; k < extra; ++k) {
+        const Tensor& p = need(in, 3 + k);
+        if (p.shape.size() != X0.shape.size() || p.kind != Tensor::Kind::Float) throw std::runtime_error("Concat: pieces of different ranks");
+        for (std::size_t d = 0; d < p.shape.size(); ++d)
+            if (d != 1 && p.shape[d] != X0.shape[d]) throw std::runtime_error("Concat " + shapeText(X0.shape) + " with " + shapeText(p.shape));
+        ci.pieces.push_back({&p, static_cast<std::size_t>(p.shape[1])});
+        ci.shape[1] += p.shape[1];
+    }
+    ci.plane = numel(Shape(X0.shape.begin() + 2, X0.shape.end()));
+    return ci;
+}
+
 Outs convOp(const Node& n, const Ins& in, int) {
-    const Tensor& X = need(in, 0);
+    const ConvInput xin = convInput(n, in);
+    // The paths below other than the direct one read one tensor: concatenate there.
+    Tensor joined;
+    auto whole = [&]() -> const Tensor& {
+        if (xin.pieces.size() == 1) return *xin.pieces[0].first;
+        if (joined.f.empty()) {
+            joined = floatTensor(xin.shape);
+            const std::size_t Nb = static_cast<std::size_t>(xin.shape[0]), Ct = static_cast<std::size_t>(xin.shape[1]);
+            for (std::size_t b = 0; b < Nb; ++b)
+                for (std::size_t c = 0; c < Ct; ++c) std::copy_n(xin.channel(b, c), xin.plane, joined.f.data() + (b * Ct + c) * xin.plane);
+        }
+        return joined;
+    };
+    struct ShapeOnly { const Shape& shape; } X{xin.shape};
     const Tensor& W = need(in, 1);
     const Tensor* B = opt(in, 2);
     const ConvGeometry g = convGeometry(n, X.shape, W.shape);
@@ -527,6 +574,40 @@ Outs convOp(const Node& n, const Ins& in, int) {
     // channels-last; then every output pixel's taps are fixed offsets from its own position, so the
     // product reads them in place (gemmIndirectA). Pixels are computed over the padded width and the
     // few columns past the right edge dropped.
+    if (Cg == 1 && !pointwise) {
+        // Depthwise (MobileNet-style): each output channel reads one input channel; per tap, a scaled
+        // input row segment is added to the output row (contiguous, so it vectorises at stride 1).
+        const std::size_t KK = g.kh * g.kw;
+        parallelFor(0, N * M, 1, [&](std::size_t p0, std::size_t p1) {
+            for (std::size_t p = p0; p < p1; ++p) {
+                const std::size_t b = p / M, m = p % M;
+                const float* x = xin.channel(b, m / Mg);
+                const float* w = W.f.data() + m * KK;
+                float* y = r.f.data() + p * OH * OW;
+                std::fill(y, y + OH * OW, 0.0f);
+                for (std::size_t kj = 0; kj < g.kw; ++kj) {
+                    const std::int64_t off = static_cast<std::int64_t>(kj * g.dw) - g.padLeft, sw = static_cast<std::int64_t>(g.sw);
+                    const std::int64_t lo64 = off >= 0 ? 0 : (-off + sw - 1) / sw;
+                    const std::int64_t hi64 = std::min<std::int64_t>(static_cast<std::int64_t>(OW), (static_cast<std::int64_t>(Wd) - off + sw - 1) / sw);
+                    if (hi64 <= lo64) continue;
+                    const std::size_t lo = static_cast<std::size_t>(lo64), hi = static_cast<std::size_t>(hi64);
+                    for (std::size_t oy = 0; oy < OH; ++oy) {
+                        float* d = y + oy * OW;
+                        for (std::size_t ki = 0; ki < g.kh; ++ki) {
+                            const std::int64_t iy = static_cast<std::int64_t>(oy * g.sh + ki * g.dh) - g.padTop;
+                            if (iy < 0 || iy >= static_cast<std::int64_t>(H)) continue;
+                            const float wv = w[ki * g.kw + kj];
+                            const float* src = x + static_cast<std::size_t>(iy) * Wd;
+                            if (g.sw == 1)
+                                for (std::size_t ox = lo; ox < hi; ++ox) d[ox] += wv * src[static_cast<std::int64_t>(ox) + off];
+                            else
+                                for (std::size_t ox = lo; ox < hi; ++ox) d[ox] += wv * src[static_cast<std::int64_t>(ox) * sw + off];
+                        }
+                    }
+                }
+            }
+        });
+    } else
     if (!pointwise && gemmPackedAvailable() && g.sh == 1 && g.sw == 1 && Cg >= 16) {
         const std::size_t R = gemmPanelRows();
         const std::size_t Hp = H + static_cast<std::size_t>(g.padTop + g.padBottom), Wp = Wd + static_cast<std::size_t>(g.padLeft + g.padRight);
@@ -542,7 +623,8 @@ Outs convOp(const Node& n, const Ins& in, int) {
         }
         for (std::size_t b = 0; b < N; ++b)
             for (std::size_t gr = 0; gr < group; ++gr) {
-                const float* x = X.f.data() + (b * C + gr * Cg) * H * Wd;
+                std::vector<const float*> planes(Cg);
+                for (std::size_t c = 0; c < Cg; ++c) planes[c] = xin.channel(b, gr * Cg + c);
                 const float* w = W.f.data() + gr * Mg * Kc;
                 float* y = r.f.data() + (b * M + gr * Mg) * OH * OW;
                 xp.assign((Hp * Wp + R + 1) * Cg, 0.0f);
@@ -550,7 +632,7 @@ Outs convOp(const Node& n, const Ins& in, int) {
                     for (std::size_t iy = y0; iy < y1; ++iy) {
                         float* dst = xp.data() + ((iy + static_cast<std::size_t>(g.padTop)) * Wp + static_cast<std::size_t>(g.padLeft)) * Cg;
                         for (std::size_t c = 0; c < Cg; ++c) {
-                            const float* src = x + (c * H + iy) * Wd;
+                            const float* src = planes[c] + iy * Wd;
                             for (std::size_t ix = 0; ix < Wd; ++ix) dst[ix * Cg + c] = src[ix];
                         }
                     }
@@ -575,7 +657,7 @@ Outs convOp(const Node& n, const Ins& in, int) {
         std::vector<float> packed, tmp;
         for (std::size_t b = 0; b < N; ++b)
             for (std::size_t gr = 0; gr < group; ++gr) {
-                const float* x = X.f.data() + (b * C + gr * Cg) * H * Wd;
+                const float* x = whole().f.data() + (b * C + gr * Cg) * H * Wd;
                 const float* w = W.f.data() + gr * Mg * Kc;
                 float* y = r.f.data() + (b * M + gr * Mg) * P;
                 for (std::size_t p0 = 0; p0 < P; p0 += chunk) {
@@ -657,7 +739,7 @@ Outs convOp(const Node& n, const Ins& in, int) {
     std::vector<float> col;
     for (std::size_t b = 0; b < N; ++b) {
         for (std::size_t gr = 0; gr < group; ++gr) {
-            const float* x = X.f.data() + (b * C + gr * Cg) * H * Wd;
+            const float* x = whole().f.data() + (b * C + gr * Cg) * H * Wd;
             const float* w = W.f.data() + gr * Mg * Kc;
             float* y = r.f.data() + (b * M + gr * Mg) * OH * OW;
             if (pointwise) {

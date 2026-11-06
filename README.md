@@ -565,7 +565,7 @@ depth_anything_v2_small.onnx: opset 14, 823 nodes, 24711136 parameters (loaded i
 $ ./bin/NeuraCraft onnx model.onnx out/ input_0.pb      # run on TensorProto inputs
 ```
 
-`tests/onnx/make_cases.py` writes 140 operator cases with onnxruntime's
+`tests/onnx/make_cases.py` writes 145 operator cases with onnxruntime's
 outputs, and the tests check every one. Real models match onnxruntime to about
 1e-6 (max abs): MobileNet v2, u2netp (background masks), Depth Anything v2
 small and Real-ESRGAN x4plus.
@@ -581,8 +581,12 @@ correlate 0.9996 on a photo, each within about 2 % of the float model); the
 fp16 exports are computed in float, so they come out slightly more precise.
 
 Speed on the 2-core CPU, against onnxruntime 1.29: Real-ESRGAN 128 -> 512
-5.7 s vs 4.4-5.1 s, Depth Anything 266 x 350 0.8 s vs 0.3-0.4 s, u2netp 0.8 s
-vs 0.5 s. Stride-1 convolutions copy their input once, padded and
+4.3 s vs 4.3-5.1 s, Depth Anything 266 x 350 0.8 s vs 0.3-0.4 s, u2netp 0.66 s
+vs 0.45 s, MobileNet v2 18 ms vs 10 ms. A `Concat` along the channels that only
+feeds a convolution is never built: the convolution reads its pieces where they
+are (ESRGAN's dense blocks: 276 copies saved; `NEURACRAFT_ONNX_FUSE_CONCAT=0`
+turns it off). Depthwise convolutions have their own loop (MobileNet 156 ->
+18 ms). Stride-1 convolutions copy their input once, padded and
 channels-last, and multiply with every tap read in place (an "indirect" GEMM,
 no im2col); strided ones write their im2col rows straight in the GEMM kernel's
 packed layout. A `Relu`, `LeakyRelu` or `Clip` that only reads a convolution's

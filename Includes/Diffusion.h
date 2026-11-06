@@ -97,6 +97,17 @@ struct ControlResiduals {
     Matrix mid;
 };
 
+// One prediction of UNet2DCondition::forwardBatch: its text condition and, where the model uses
+// them, ControlNet residuals, IP-Adapter tokens (null or empty: none) and SDXL added conditions.
+struct UNetCondition {
+    const Matrix* context = nullptr;
+    const ControlResiduals* residuals = nullptr;
+    const Matrix* ipTokens = nullptr;
+    float ipScale = 1.0f;
+    const Matrix* textEmbeds = nullptr;
+    const std::vector<float>* timeIds = nullptr;
+};
+
 // Stable Diffusion's denoiser (diffusers UNet2DConditionModel, SD 1.x / 2.x /
 // Turbo layouts): predicts the noise in a latent at a timestep, conditioned
 // on text hidden states through cross-attention. Built for one latent size.
@@ -112,6 +123,10 @@ public:
     Matrix forward(const Matrix& latent, float timestep, const Matrix& context);
     // ... with ControlNet residuals added to the skips and the mid block (null: none).
     Matrix forward(const Matrix& latent, float timestep, const Matrix& context, const ControlResiduals* residuals);
+    // The same latent under several conditions (classifier-free guidance: the prompt and the negative
+    // prompt), one 1 x (C h w) prediction per condition. A CUDA GPU runs them as one batch; elsewhere
+    // it is forward() per condition. Leaves the image prompt / added conditions as the last one set them.
+    std::vector<Matrix> forwardBatch(const Matrix& latent, float timestep, const std::vector<UNetCondition>& conditions);
     // Several frames at once (AnimateDiff): latents has one frame per row and
     // the same text conditions every frame. With motion modules loaded,
     // temporal attention mixes the frames after every spatial block; without,

@@ -549,6 +549,7 @@ struct UNet2DCondition::Impl {
     std::unique_ptr<GroupNorm> normOut;
     std::size_t groups = 32;
     bool quantized = false;  // int8 layers (no device graph)
+    float ipScale = 0.0f;
     Matrix ipTokens;  // current image prompt tokens (IP-Adapter)
     bool ipLoaded = false;
     // ControlNet parts (a ControlNetModel loads as a UNet without up blocks).
@@ -618,6 +619,212 @@ std::size_t UNet2DCondition::outputChannels() const { return impl_->convOut->out
 std::size_t UNet2DCondition::parameterCount() const { return impl_->params; }
 bool UNet2DCondition::hasMotionModules() const { return impl_->midMotion != nullptr; }
 
+#ifdef NEURACRAFT_HAS_CUDA
+// ---- UNet steps on the device (gpugraph): the same computation as forward() below, for a batch of
+// B predictions of one latent (each with its own condition) ----------------------------------------
+
+namespace {
+namespace dv = cuda::dev;
+using gpugraph::DeviceTensor;
+
+// What one prediction of a device batch sees.
+struct DeviceCondition {
+    Matrix temb;                 // SiLU(time embedding [+ added conditions]), 1 x tembDim
+    DeviceTensor context;        // tokens x contextDim
+    std::size_t contextRows = 0;
+    DeviceTensor ip;             // IP-Adapter tokens (empty: none)
+    std::size_t ipRows = 0;
+    float ipScale = 0.0f;
+    const ControlResiduals* residuals = nullptr;
+};
+
+DeviceTensor deviceConv(Conv2D& c, const float* x, std::size_t B) {
+    const ImageShape in = c.inputShape(), out = c.outputShape();
+    DeviceTensor y(B * out.size());
+    dv::conv2d(x, B, in.channels, in.height, in.width, c.weights().data(), false, c.bias().data(), out.channels, c.kernelSize(), c.stride(),
+               c.padding(), y.get());
+    return y;
+}
+void deviceNorm(GroupNorm& g, const float* x, float* y, std::size_t B, bool silu) {
+    const ImageShape s = g.shape();
+    dv::groupNorm(x, y, B, s.channels, s.height * s.width, g.groups(), g.epsilon(), g.gamma().data(), g.beta().data(), silu);
+}
+DeviceTensor deviceLinear(Dense& d, const float* x, std::size_t rows) {
+    DeviceTensor y(rows * d.outputSize());
+    dv::linear(x, rows, d.inputSize(), d.weights().data(), false, d.bias().data(), d.outputSize(), y.get());
+    return y;
+}
+DeviceTensor deviceLayerNorm(LayerNorm& n, const float* x, std::size_t rows) {
+    DeviceTensor y(rows * n.dim());
+    dv::layerNorm(x, y.get(), rows, n.dim(), n.epsilon(), n.gamma().data(), n.beta().data());
+    return y;
+}
+
+DeviceTensor deviceResnet(TimeResnet& r, const float* x, const std::vector<DeviceCondition>& conds) {
+    const std::size_t B = conds.size(), HW = r.in.height * r.in.width, outN = r.out * HW;
+    DeviceTensor a(B * r.in.size());
+    deviceNorm(r.n1, x, a.get(), B, true);
+    DeviceTensor h = deviceConv(r.c1, a.get(), B);
+    for (std::size_t b = 0; b < B; ++b) {  // the time embedding's projection: one number per channel
+        const Matrix t = r.temb.forward(conds[b].temb, false);
+        dv::addChannels(h.get() + b * outN, t.data(), 1, r.out, HW);
+    }
+    DeviceTensor n(B * outN);
+    deviceNorm(r.n2, h.get(), n.get(), B, true);
+    DeviceTensor y = deviceConv(r.c2, n.get(), B);
+    if (r.shortcut) {
+        const DeviceTensor s = deviceConv(*r.shortcut, x, B);
+        dv::add(y.get(), s.get(), B * outN);
+    } else {
+        dv::add(y.get(), x, B * outN);
+    }
+    return y;
+}
+
+DeviceTensor deviceTransformer(CrossTransformer& ct, const float* x, const std::vector<DeviceCondition>& conds) {
+    const std::size_t B = conds.size(), C = ct.shape.channels, HW = ct.shape.height * ct.shape.width, N = B * HW;
+    DeviceTensor h;
+    {
+        DeviceTensor normed(B * C * HW), tokens(N * C);
+        deviceNorm(ct.norm, x, normed.get(), B, false);
+        for (std::size_t b = 0; b < B; ++b) dv::toTokens(normed.get() + b * C * HW, tokens.get() + b * HW * C, C, HW);
+        h = deviceLinear(ct.projIn, tokens.get(), N);  // the linear layers see all B * HW tokens at once
+    }
+    DeviceTensor att(N * C);
+    for (auto& blk : ct.blocks) {
+        TransformerBlock& t = *blk;
+        {
+            const DeviceTensor a = deviceLayerNorm(t.ln1, h.get(), N);
+            const DeviceTensor q = deviceLinear(t.q1, a.get(), N), k = deviceLinear(t.k1, a.get(), N), v = deviceLinear(t.v1, a.get(), N);
+            for (std::size_t b = 0; b < B; ++b)  // attention stays within each image
+                dv::attention(q.get() + b * HW * C, k.get() + b * HW * C, v.get() + b * HW * C, att.get() + b * HW * C, HW, HW, C, ct.heads);
+            const DeviceTensor o = deviceLinear(t.o1, att.get(), N);
+            dv::add(h.get(), o.get(), N * C);
+        }
+        {
+            const DeviceTensor a = deviceLayerNorm(t.ln2, h.get(), N);
+            const DeviceTensor q = deviceLinear(t.q2, a.get(), N);
+            for (std::size_t b = 0; b < B; ++b) {
+                const DeviceCondition& c = conds[b];
+                const DeviceTensor k = deviceLinear(t.k2, c.context.get(), c.contextRows), v = deviceLinear(t.v2, c.context.get(), c.contextRows);
+                float* ab = att.get() + b * HW * C;
+                dv::attention(q.get() + b * HW * C, k.get(), v.get(), ab, HW, c.contextRows, C, ct.heads);
+                if (ct.kIp && c.ipRows && c.ipScale != 0.0f) {
+                    const DeviceTensor ki = deviceLinear(*ct.kIp, c.ip.get(), c.ipRows), vi = deviceLinear(*ct.vIp, c.ip.get(), c.ipRows);
+                    DeviceTensor ia(HW * C);
+                    dv::attention(q.get() + b * HW * C, ki.get(), vi.get(), ia.get(), HW, c.ipRows, C, ct.heads);
+                    dv::axpy(ab, ia.get(), c.ipScale, HW * C);
+                }
+            }
+            const DeviceTensor o = deviceLinear(t.o2, att.get(), N);
+            dv::add(h.get(), o.get(), N * C);
+        }
+        {
+            const DeviceTensor a = deviceLayerNorm(t.ln3, h.get(), N);
+            const DeviceTensor g = deviceLinear(t.ff1, a.get(), N);  // N x 8C: [hidden | gate]
+            DeviceTensor gg(N * 4 * C);
+            dv::geglu(g.get(), gg.get(), N, 4 * C);
+            const DeviceTensor o = deviceLinear(t.ff2, gg.get(), N);
+            dv::add(h.get(), o.get(), N * C);
+        }
+    }
+    const DeviceTensor y = deviceLinear(ct.projOut, h.get(), N);
+    DeviceTensor out(B * C * HW);
+    for (std::size_t b = 0; b < B; ++b) dv::fromTokens(y.get() + b * HW * C, out.get() + b * C * HW, HW, C);
+    dv::add(out.get(), x, B * C * HW);
+    return out;
+}
+
+// B predictions: latents has one row per prediction, or one row they all share; returns B x output size.
+Matrix deviceForward(UNet2DCondition::Impl& m, const Matrix& latents, const std::vector<DeviceCondition>& conds) {
+    NC_PROFILE("unet (gpu graph)");
+    const std::size_t B = conds.size(), n = latents.cols();
+    DeviceTensor in(B * n);
+    for (std::size_t b = 0; b < B; ++b) dv::upload(in.get() + b * n, latents.data() + (latents.rows() == 1 ? 0 : b) * n, n);
+    DeviceTensor h = deviceConv(*m.convIn, in.get(), B);
+    std::vector<DeviceTensor> skips;
+    std::vector<std::size_t> skipSizes;  // per image
+    auto keep = [&](const DeviceTensor& x, std::size_t n) {  // skips are copies: h moves on
+        DeviceTensor s(B * n);
+        dv::copy(s.get(), x.get(), B * n);
+        skips.push_back(std::move(s));
+        skipSizes.push_back(n);
+    };
+    keep(h, m.convIn->outputShape().size());
+    for (auto& d : m.downs) {
+        for (std::size_t j = 0; j < d.resnets.size(); ++j) {
+            h = deviceResnet(*d.resnets[j], h.get(), conds);
+            if (!d.attentions.empty()) h = deviceTransformer(*d.attentions[j], h.get(), conds);
+            keep(h, d.resnets[j]->out * d.resnets[j]->in.height * d.resnets[j]->in.width);
+        }
+        if (d.downsample) {
+            h = deviceConv(*d.downsample, h.get(), B);
+            keep(h, d.downsample->outputShape().size());
+        }
+    }
+    h = deviceResnet(*m.mid1, h.get(), conds);
+    h = deviceTransformer(*m.midAttention, h.get(), conds);
+    h = deviceResnet(*m.mid2, h.get(), conds);
+    const std::size_t midN = m.mid2->out * m.mid2->in.height * m.mid2->in.width;
+    for (std::size_t b = 0; b < B; ++b) {  // ControlNet: added to the skips and to the mid block output
+        const ControlResiduals* r = conds[b].residuals;
+        if (!r) continue;
+        if (r->down.size() != skips.size()) throw std::invalid_argument("UNet2DCondition::forward: residuals do not match the skips");
+        for (std::size_t k = 0; k < skips.size(); ++k) {
+            if (r->down[k].rows() != 1 || r->down[k].cols() != skipSizes[k])
+                throw std::invalid_argument("UNet2DCondition::forward: residual shape mismatch");
+            const DeviceTensor d = DeviceTensor::upload(r->down[k]);
+            dv::add(skips[k].get() + b * skipSizes[k], d.get(), skipSizes[k]);
+        }
+        if (r->mid.size() != midN) throw std::invalid_argument("UNet2DCondition::forward: residual shape mismatch");
+        const DeviceTensor d = DeviceTensor::upload(r->mid);
+        dv::add(h.get() + b * midN, d.get(), midN);
+    }
+    for (auto& u : m.ups) {
+        for (std::size_t j = 0; j < u.resnets.size(); ++j) {
+            TimeResnet& r = *u.resnets[j];
+            const std::size_t skipN = skipSizes.back(), hN = r.in.size() - skipN;
+            DeviceTensor cat(B * r.in.size());  // per image: [h's channels | the skip's channels]
+            for (std::size_t b = 0; b < B; ++b) {
+                dv::copy(cat.get() + b * r.in.size(), h.get() + b * hN, hN);
+                dv::copy(cat.get() + b * r.in.size() + hN, skips.back().get() + b * skipN, skipN);
+            }
+            skips.pop_back();
+            skipSizes.pop_back();
+            h = deviceResnet(r, cat.get(), conds);
+            if (!u.attentions.empty()) h = deviceTransformer(*u.attentions[j], h.get(), conds);
+        }
+        if (u.upsample) {
+            const ImageShape s = u.upsample->inputShape();
+            DeviceTensor up(B * u.upsample->outputShape().size());
+            dv::upsample(h.get(), up.get(), B, s.channels, s.height, s.width, u.upsample->factor());
+            h = deviceConv(*u.upConv, up.get(), B);
+        }
+    }
+    DeviceTensor a(B * m.normOut->shape().size());
+    deviceNorm(*m.normOut, h.get(), a.get(), B, true);
+    const DeviceTensor out = deviceConv(*m.convOut, a.get(), B);
+    return out.download(B, m.convOut->outputShape().size());
+}
+
+// A prediction's condition on the device (inside a session).
+DeviceCondition deviceCondition(const Matrix& temb, const Matrix& context, const Matrix* ipTokens, float ipScale,
+                                const ControlResiduals* residuals) {
+    DeviceCondition c;
+    c.temb = temb;
+    c.context = DeviceTensor::upload(context);
+    c.contextRows = context.rows();
+    if (ipTokens && !ipTokens->empty() && ipScale != 0.0f) {
+        c.ip = DeviceTensor::upload(*ipTokens);
+        c.ipRows = ipTokens->rows();
+        c.ipScale = ipScale;
+    }
+    c.residuals = residuals;
+    return c;
+}
+} // namespace
+#endif
+
 Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, const Matrix& context) {
     return forwardFrames(latents, timestep, std::vector<Matrix>{context});
 }
@@ -640,6 +847,21 @@ Matrix UNet2DCondition::forwardFrames(const Matrix& latents, float timestep, con
     auto ctx = [&](std::size_t f) -> const Matrix& { return contexts[contexts.size() == 1 ? 0 : f]; };
     if (residuals && residuals->size() != F) throw std::invalid_argument("UNet2DCondition::forwardFrames: one set of residuals per frame");
     Matrix out(F, m.latent.size());
+#ifdef NEURACRAFT_HAS_CUDA
+    if (!hasMotionModules() && !m.quantized && gpugraph::enabled()) {  // frames in device batches of up to 4
+        const Matrix temb = timeEmbedding(m, timestep);
+        for (std::size_t f0 = 0; f0 < F; f0 += 4) {
+            const std::size_t n = std::min<std::size_t>(4, F - f0);
+            dv::Session session;
+            std::vector<DeviceCondition> conds;
+            for (std::size_t f = f0; f < f0 + n; ++f)
+                conds.push_back(deviceCondition(temb, ctx(f), m.ipLoaded ? &m.ipTokens : nullptr, m.ipScale, residuals ? &(*residuals)[f] : nullptr));
+            const Matrix eps = deviceForward(m, rowBlock(latents, f0, n), conds);
+            setRowBlock(out, f0, eps);
+        }
+        return out;
+    }
+#endif
     if (!hasMotionModules()) {
         for (std::size_t f = 0; f < F; ++f) {
             Matrix one(1, m.latent.size());
@@ -787,6 +1009,7 @@ void UNet2DCondition::setImagePrompt(const Matrix& tokens, float scale) {
     if (!tokens.empty() && tokens.cols() != m.contextDim)
         throw std::invalid_argument("UNet2DCondition::setImagePrompt: tokens must have " + std::to_string(m.contextDim) + " columns");
     m.ipTokens = tokens;
+    m.ipScale = scale;
     for (CrossTransformer* c : crossLayers(m)) {
         c->ipTokens = m.ipTokens.empty() ? nullptr : &m.ipTokens;
         c->ipScale = scale;
@@ -841,185 +1064,45 @@ ControlResiduals UNet2DCondition::control(const Matrix& latent, float timestep, 
     return r;
 }
 
+
+std::vector<Matrix> UNet2DCondition::forwardBatch(const Matrix& latent, float timestep, const std::vector<UNetCondition>& conditions) {
+    Impl& m = *impl_;
+    if (latent.rows() != 1 || latent.cols() != m.latent.size())
+        throw std::invalid_argument("UNet2DCondition::forwardBatch: expected a 1 x " + std::to_string(m.latent.size()) + " latent");
+    for (const UNetCondition& c : conditions)
+        if (!c.context || c.context->cols() != m.contextDim)
+            throw std::invalid_argument("UNet2DCondition::forwardBatch: every condition needs a context of " + std::to_string(m.contextDim) +
+                                        " columns");
+    const Matrix none;
+    auto apply = [&](const UNetCondition& c) {  // the per-prediction state of the single-call API
+        if (m.ipLoaded) setImagePrompt(c.ipTokens ? *c.ipTokens : none, c.ipScale);
+        if (m.add1 && c.textEmbeds) setAddedConditions(*c.textEmbeds, c.timeIds ? *c.timeIds : std::vector<float>{});
+    };
+    std::vector<Matrix> out;
 #ifdef NEURACRAFT_HAS_CUDA
-// ---- The UNet step on the device (gpugraph): the same computation as forward() below ------------
-
-namespace {
-namespace dv = cuda::dev;
-using gpugraph::DeviceTensor;
-
-void deviceConv(Conv2D& c, const float* x, float* y, const float* biasOverride = nullptr) {
-    const ImageShape in = c.inputShape(), out = c.outputShape();
-    dv::conv2d(x, 1, in.channels, in.height, in.width, c.weights().data(), false, biasOverride ? biasOverride : c.bias().data(), out.channels,
-               c.kernelSize(), c.stride(), c.padding(), y);
-}
-DeviceTensor deviceConv(Conv2D& c, const float* x) {
-    DeviceTensor y(c.outputShape().size());
-    deviceConv(c, x, y.get());
-    return y;
-}
-void deviceNorm(GroupNorm& g, const float* x, float* y, bool silu) {
-    const ImageShape s = g.shape();
-    dv::groupNorm(x, y, 1, s.channels, s.height * s.width, g.groups(), g.epsilon(), g.gamma().data(), g.beta().data(), silu);
-}
-DeviceTensor deviceLinear(Dense& d, const float* x, std::size_t rows) {
-    DeviceTensor y(rows * d.outputSize());
-    dv::linear(x, rows, d.inputSize(), d.weights().data(), false, d.bias().data(), d.outputSize(), y.get());
-    return y;
-}
-DeviceTensor deviceLayerNorm(LayerNorm& n, const float* x, std::size_t rows) {
-    DeviceTensor y(rows * n.dim());
-    dv::layerNorm(x, y.get(), rows, n.dim(), n.epsilon(), n.gamma().data(), n.beta().data());
-    return y;
-}
-
-DeviceTensor deviceResnet(TimeResnet& r, const float* x, const Matrix& tembAct) {
-    const std::size_t HW = r.in.height * r.in.width;
-    DeviceTensor a(r.in.size());
-    deviceNorm(r.n1, x, a.get(), true);
-    // The time embedding's projection is one number per channel: folded into conv1's bias.
-    Matrix bias = r.temb.forward(tembAct, false);
-    for (std::size_t c = 0; c < r.out; ++c) bias(0, c) += r.c1.bias()(0, c);
-    DeviceTensor h(r.out * HW);
-    deviceConv(r.c1, a.get(), h.get(), bias.data());
-    DeviceTensor b(r.out * HW);
-    deviceNorm(r.n2, h.get(), b.get(), true);
-    deviceConv(r.c2, b.get(), h.get());
-    if (r.shortcut) {
-        const DeviceTensor s = deviceConv(*r.shortcut, x);
-        dv::add(h.get(), s.get(), r.out * HW);
-    } else {
-        dv::add(h.get(), x, r.out * HW);
-    }
-    return h;
-}
-
-DeviceTensor deviceTransformer(CrossTransformer& ct, const float* x, const DeviceTensor& context, std::size_t contextRows,
-                               const DeviceTensor* ip, std::size_t ipRows) {
-    const std::size_t C = ct.shape.channels, HW = ct.shape.height * ct.shape.width;
-    DeviceTensor h;
-    {
-        DeviceTensor normed(C * HW), tokens(HW * C);
-        deviceNorm(ct.norm, x, normed.get(), false);
-        dv::toTokens(normed.get(), tokens.get(), C, HW);
-        h = deviceLinear(ct.projIn, tokens.get(), HW);
-    }
-    DeviceTensor att(HW * C);
-    for (auto& blk : ct.blocks) {
-        TransformerBlock& t = *blk;
-        {
-            const DeviceTensor a = deviceLayerNorm(t.ln1, h.get(), HW);
-            const DeviceTensor q = deviceLinear(t.q1, a.get(), HW), k = deviceLinear(t.k1, a.get(), HW), v = deviceLinear(t.v1, a.get(), HW);
-            dv::attention(q.get(), k.get(), v.get(), att.get(), HW, HW, C, ct.heads);
-            const DeviceTensor o = deviceLinear(t.o1, att.get(), HW);
-            dv::add(h.get(), o.get(), HW * C);
+    if (!conditions.empty() && !m.controlNet && !m.quantized && gpugraph::enabled()) {
+        std::vector<Matrix> tembs;
+        for (const UNetCondition& c : conditions) {
+            apply(c);
+            tembs.push_back(timeEmbedding(m, timestep));
         }
-        {
-            const DeviceTensor a = deviceLayerNorm(t.ln2, h.get(), HW);
-            const DeviceTensor q = deviceLinear(t.q2, a.get(), HW);
-            const DeviceTensor k = deviceLinear(t.k2, context.get(), contextRows), v = deviceLinear(t.v2, context.get(), contextRows);
-            dv::attention(q.get(), k.get(), v.get(), att.get(), HW, contextRows, C, ct.heads);
-            if (ip) {
-                const DeviceTensor ki = deviceLinear(*ct.kIp, ip->get(), ipRows), vi = deviceLinear(*ct.vIp, ip->get(), ipRows);
-                DeviceTensor ia(HW * C);
-                dv::attention(q.get(), ki.get(), vi.get(), ia.get(), HW, ipRows, C, ct.heads);
-                dv::axpy(att.get(), ia.get(), ct.ipScale, HW * C);
-            }
-            const DeviceTensor o = deviceLinear(t.o2, att.get(), HW);
-            dv::add(h.get(), o.get(), HW * C);
+        dv::Session session;
+        std::vector<DeviceCondition> conds;
+        for (std::size_t i = 0; i < conditions.size(); ++i) {
+            const UNetCondition& c = conditions[i];
+            conds.push_back(deviceCondition(tembs[i], *c.context, m.ipLoaded ? c.ipTokens : nullptr, c.ipScale, c.residuals));
         }
-        {
-            const DeviceTensor a = deviceLayerNorm(t.ln3, h.get(), HW);
-            const DeviceTensor g = deviceLinear(t.ff1, a.get(), HW);  // HW x 8C: [hidden | gate]
-            DeviceTensor gg(HW * 4 * C);
-            dv::geglu(g.get(), gg.get(), HW, 4 * C);
-            const DeviceTensor o = deviceLinear(t.ff2, gg.get(), HW);
-            dv::add(h.get(), o.get(), HW * C);
-        }
+        const Matrix all = deviceForward(m, latent, conds);
+        for (std::size_t i = 0; i < conditions.size(); ++i) out.push_back(rowBlock(all, i, 1));
+        return out;
     }
-    const DeviceTensor y = deviceLinear(ct.projOut, h.get(), HW);
-    DeviceTensor out(C * HW);
-    dv::fromTokens(y.get(), out.get(), HW, C);
-    dv::add(out.get(), x, C * HW);
+#endif
+    for (const UNetCondition& c : conditions) {
+        apply(c);
+        out.push_back(forward(latent, timestep, *c.context, c.residuals));
+    }
     return out;
 }
-
-Matrix deviceForward(UNet2DCondition::Impl& m, const Matrix& latent, const Matrix& temb, const Matrix& context,
-                     const ControlResiduals* residuals) {
-    NC_PROFILE("unet (gpu graph)");
-    dv::Session session;
-    const DeviceTensor ctx = DeviceTensor::upload(context);
-    DeviceTensor ipTokens;
-    const bool ip = m.ipLoaded && !m.ipTokens.empty();
-    if (ip) ipTokens = DeviceTensor::upload(m.ipTokens);
-    auto attend = [&](CrossTransformer& a, const float* x) {
-        const bool useIp = ip && a.kIp && a.ipScale != 0.0f;
-        return deviceTransformer(a, x, ctx, context.rows(), useIp ? &ipTokens : nullptr, m.ipTokens.rows());
-    };
-
-    const DeviceTensor in = DeviceTensor::upload(latent);
-    DeviceTensor h = deviceConv(*m.convIn, in.get());
-    std::vector<DeviceTensor> skips;
-    std::vector<std::size_t> skipSizes;
-    auto keep = [&](const DeviceTensor& x, std::size_t n) {  // skips are copies: h moves on
-        DeviceTensor s(n);
-        dv::copy(s.get(), x.get(), n);
-        skips.push_back(std::move(s));
-        skipSizes.push_back(n);
-    };
-    keep(h, m.convIn->outputShape().size());
-    for (auto& d : m.downs) {
-        for (std::size_t j = 0; j < d.resnets.size(); ++j) {
-            h = deviceResnet(*d.resnets[j], h.get(), temb);
-            if (!d.attentions.empty()) h = attend(*d.attentions[j], h.get());
-            keep(h, d.resnets[j]->out * d.resnets[j]->in.height * d.resnets[j]->in.width);
-        }
-        if (d.downsample) {
-            h = deviceConv(*d.downsample, h.get());
-            keep(h, d.downsample->outputShape().size());
-        }
-    }
-    h = deviceResnet(*m.mid1, h.get(), temb);
-    h = attend(*m.midAttention, h.get());
-    h = deviceResnet(*m.mid2, h.get(), temb);
-    if (residuals) {  // ControlNet: added to the skips and to the mid block output
-        if (residuals->down.size() != skips.size()) throw std::invalid_argument("UNet2DCondition::forward: residuals do not match the skips");
-        for (std::size_t k = 0; k < skips.size(); ++k) {
-            if (residuals->down[k].rows() != 1 || residuals->down[k].cols() != skipSizes[k])
-                throw std::invalid_argument("UNet2DCondition::forward: residual shape mismatch");
-            const DeviceTensor r = DeviceTensor::upload(residuals->down[k]);
-            dv::add(skips[k].get(), r.get(), skipSizes[k]);
-        }
-        const DeviceTensor r = DeviceTensor::upload(residuals->mid);
-        dv::add(h.get(), r.get(), residuals->mid.size());
-    }
-    for (auto& u : m.ups) {
-        for (std::size_t j = 0; j < u.resnets.size(); ++j) {
-            TimeResnet& r = *u.resnets[j];
-            const std::size_t skipN = skipSizes.back(), hN = r.in.size() - skipN;
-            DeviceTensor cat(r.in.size());  // [h's channels | the skip's channels]
-            dv::copy(cat.get(), h.get(), hN);
-            dv::copy(cat.get() + hN, skips.back().get(), skipN);
-            skips.pop_back();
-            skipSizes.pop_back();
-            h = deviceResnet(r, cat.get(), temb);
-            if (!u.attentions.empty()) h = attend(*u.attentions[j], h.get());
-        }
-        if (u.upsample) {
-            const ImageShape s = u.upsample->inputShape();
-            DeviceTensor up(u.upsample->outputShape().size());
-            dv::upsample(h.get(), up.get(), 1, s.channels, s.height, s.width, u.upsample->factor());
-            h = deviceConv(*u.upConv, up.get());
-        }
-    }
-    const ImageShape s = m.normOut->shape();
-    DeviceTensor a(s.size());
-    deviceNorm(*m.normOut, h.get(), a.get(), true);
-    const DeviceTensor out = deviceConv(*m.convOut, a.get());
-    return out.download(1, m.convOut->outputShape().size());
-}
-} // namespace
-#endif
 
 Matrix UNet2DCondition::forward(const Matrix& latent, float timestep, const Matrix& context, const ControlResiduals* residuals) {
     Impl& m = *impl_;
@@ -1030,7 +1113,12 @@ Matrix UNet2DCondition::forward(const Matrix& latent, float timestep, const Matr
         throw std::invalid_argument("UNet2DCondition::forward: context must have " + std::to_string(m.contextDim) + " columns");
     const Matrix temb = timeEmbedding(m, timestep);  // SiLU applied: every resnet starts with it
 #ifdef NEURACRAFT_HAS_CUDA
-    if (!m.quantized && gpugraph::enabled()) return deviceForward(m, latent, temb, context, residuals);
+    if (!m.quantized && gpugraph::enabled()) {
+        dv::Session session;
+        std::vector<DeviceCondition> conds;
+        conds.push_back(deviceCondition(temb, context, m.ipLoaded ? &m.ipTokens : nullptr, m.ipScale, residuals));
+        return deviceForward(m, latent, conds);
+    }
 #endif
 
     Matrix h = m.convIn->forward(latent, false);
@@ -1599,10 +1687,32 @@ void denoise(const std::string& dir, const Conditioning& context, const EulerSch
         embedding = controlNetPtr->controlEmbedding(imageToTensor(fitImage(toRgb(o.controlImage), o.width, o.height), 0.0f, 1.0f));
         reportStage(o, "load controlnet", t);
     }
-    auto predict = [&](const Matrix& in, float timestep, const Matrix& ctx) {
-        if (embedding.empty()) return unet.forward(in, timestep, ctx);
-        const ControlResiduals r = controlNetPtr->control(in, timestep, ctx, embedding, o.controlScale);
-        return unet.forward(in, timestep, ctx, &r);
+    // The noise prediction, guided: the prompt's and the negative prompt's predictions in one batch.
+    auto predict = [&](const Matrix& in, float timestep) {
+        const bool guided = o.guidance > 1.0f;
+        ControlResiduals residuals[2];
+        std::vector<UNetCondition> conds;
+        for (int k = 0; k < (guided ? 2 : 1); ++k) {
+            UNetCondition c;
+            c.context = k == 0 ? &context.cond : &context.uncond;
+            c.ipTokens = k == 0 ? &ipTokens.first : &ipTokens.second;
+            c.ipScale = o.ipScale;
+            if (unet.needsAddedConditions()) {
+                c.textEmbeds = k == 0 ? &context.pooled : &context.pooledUncond;
+                c.timeIds = &context.timeIds;
+            }
+            if (controlNetPtr) {
+                if (controlNetPtr->needsAddedConditions()) controlNetPtr->setAddedConditions(*c.textEmbeds, context.timeIds);
+                residuals[k] = controlNetPtr->control(in, timestep, *c.context, embedding, o.controlScale);
+                c.residuals = &residuals[k];
+            }
+            conds.push_back(c);
+        }
+        std::vector<Matrix> eps = unet.forwardBatch(in, timestep, conds);
+        if (guided)
+            for (std::size_t k = 0; k < eps[0].size(); ++k)
+                eps[0].data()[k] = eps[1].data()[k] + o.guidance * (eps[0].data()[k] - eps[1].data()[k]);
+        return std::move(eps[0]);
     };
     if (latent.empty()) {  // text to image: a Gaussian latent at the first sigma
         setSeed(o.seed);
@@ -1614,17 +1724,7 @@ void denoise(const std::string& dir, const Conditioning& context, const EulerSch
         Matrix in = latent;
         const float scale = static_cast<float>(sched.inputScale(i));
         for (float& v : in.values()) v *= scale;
-        if (unet.hasImagePrompt()) unet.setImagePrompt(ipTokens.first, o.ipScale);
-        if (unet.needsAddedConditions()) unet.setAddedConditions(context.pooled, context.timeIds);
-        if (controlNetPtr && controlNetPtr->needsAddedConditions()) controlNetPtr->setAddedConditions(context.pooled, context.timeIds);
-        Matrix eps = predict(in, static_cast<float>(sched.timesteps[i]), context.cond);
-        if (o.guidance > 1.0f) {
-            if (unet.hasImagePrompt()) unet.setImagePrompt(ipTokens.second, o.ipScale);
-            if (unet.needsAddedConditions()) unet.setAddedConditions(context.pooledUncond, context.timeIds);
-            if (controlNetPtr && controlNetPtr->needsAddedConditions()) controlNetPtr->setAddedConditions(context.pooledUncond, context.timeIds);
-            const Matrix uncond = predict(in, static_cast<float>(sched.timesteps[i]), context.uncond);
-            for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + o.guidance * (eps.data()[k] - uncond.data()[k]);
-        }
+        Matrix eps = predict(in, static_cast<float>(sched.timesteps[i]));
         if (o.preview) reportPreview(o, latent.data(), eps.data(), sched.sigmas[i], unet.latentShape().channels);
         sched.step(i, eps, latent);
         reportStage(o, "step " + std::to_string(i - first + 1) + "/" + std::to_string(sched.timesteps.size() - first), t);
@@ -1888,6 +1988,26 @@ std::vector<Image> textToVideo(const std::string& dir, const std::string& prompt
 
 // ---- Persistent model and animations --------------------------------------------------------------
 
+namespace {
+// uncond + guidance (cond - uncond) with both predictions in one batch (or just cond, unguided).
+Matrix guidedPrediction(UNet2DCondition& unet, const Matrix& in, float timestep, const Matrix& context, const Matrix& negative, float guidance,
+                        const std::pair<Matrix, Matrix>& ipTokens, float ipScale) {
+    std::vector<UNetCondition> conds(guidance > 1.0f ? 2 : 1);
+    conds[0].context = &context;
+    conds[0].ipTokens = &ipTokens.first;
+    conds[0].ipScale = ipScale;
+    if (conds.size() == 2) {
+        conds[1].context = &negative;
+        conds[1].ipTokens = &ipTokens.second;
+        conds[1].ipScale = ipScale;
+    }
+    std::vector<Matrix> eps = unet.forwardBatch(in, timestep, conds);
+    if (conds.size() == 2)
+        for (std::size_t k = 0; k < eps[0].size(); ++k) eps[0].data()[k] = eps[1].data()[k] + guidance * (eps[0].data()[k] - eps[1].data()[k]);
+    return std::move(eps[0]);
+}
+} // namespace
+
 struct StableDiffusion::Impl {
     std::string dir;
     TextToImageOptions options;
@@ -1986,13 +2106,8 @@ Image StableDiffusion::inpaint(const Image& input, const Image& mask, const std:
         for (std::size_t k = 0; k < C * plane; ++k) in.data()[k] = latent.data()[k] * scale;
         std::copy(latentMask.begin(), latentMask.end(), in.data() + C * plane);
         std::copy(maskedLatent.data(), maskedLatent.data() + C * plane, in.data() + (C + 1) * plane);
-        if (impl_->unet->hasImagePrompt()) impl_->unet->setImagePrompt(impl_->ipTokens.first, impl_->options.ipScale);
-        Matrix eps = impl_->unet->forward(in, static_cast<float>(sched.timesteps[i]), context);
-        if (guidance > 1.0f) {
-            if (impl_->unet->hasImagePrompt()) impl_->unet->setImagePrompt(impl_->ipTokens.second, impl_->options.ipScale);
-            const Matrix un = impl_->unet->forward(in, static_cast<float>(sched.timesteps[i]), negative);
-            for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = un.data()[k] + guidance * (eps.data()[k] - un.data()[k]);
-        }
+        Matrix eps = guidedPrediction(*impl_->unet, in, static_cast<float>(sched.timesteps[i]), context, negative, guidance, impl_->ipTokens,
+                                      impl_->options.ipScale);
         sched.step(i, eps, latent);
     }
     Image out = decode(latent);
@@ -2035,16 +2150,10 @@ void StableDiffusion::denoise(Matrix& latent, const Matrix& context, const Euler
         Matrix in = latent;
         const float scale = static_cast<float>(sched.inputScale(i));
         for (float& v : in.values()) v *= scale;
-        UNet2DCondition& unet = *impl_->unet;
-        if (unet.hasImagePrompt()) unet.setImagePrompt(impl_->ipTokens.first, impl_->options.ipScale);
-        Matrix eps = unet.forward(in, static_cast<float>(sched.timesteps[i]), context);
-        if (guidance > 1.0f) {
-            if (unet.hasImagePrompt()) unet.setImagePrompt(impl_->ipTokens.second, impl_->options.ipScale);
-            const Matrix uncond = unet.forward(in, static_cast<float>(sched.timesteps[i]), negative);
-            for (std::size_t k = 0; k < eps.size(); ++k) eps.data()[k] = uncond.data()[k] + guidance * (eps.data()[k] - uncond.data()[k]);
-        }
+        Matrix eps = guidedPrediction(*impl_->unet, in, static_cast<float>(sched.timesteps[i]), context, negative, guidance, impl_->ipTokens,
+                                      impl_->options.ipScale);
         const TextToImageOptions& o = impl_->options;
-        if (o.preview) reportPreview(o, latent.data(), eps.data(), sched.sigmas[i], unet.latentShape().channels);
+        if (o.preview) reportPreview(o, latent.data(), eps.data(), sched.sigmas[i], impl_->unet->latentShape().channels);
         sched.step(i, eps, latent);
     }
 }

@@ -1016,9 +1016,11 @@ SD-Turbo 512 x 512, one step, against the same machine's CPU:
 | GEMM 2048 x 2048, copies included (RTX 4090, 8 vCPUs) | 150 GFLOPS | 1050 GFLOPS | |
 | attention, 4096 tokens x 320, 8 heads (RTX 4090) | 630 ms | 5 ms | |
 
+The first step includes uploading the weights; later steps of the same run take about 0.1 s at
+512 x 512 (A40), and classifier-free guidance runs its two predictions as one batch
+(`UNet2DCondition::forwardBatch`), so a guided step costs about the same.
 All tests pass on the GPU; its picture matches the CPU's float32 one at 68.5 dB PSNR (exact FP32)
-and 55 dB (TF32). Most of a single-picture run is now reading the weights from disk (about 5 s of
-the 11).
+and 55 dB (TF32). Most of a single-picture run is now loading the weights.
 
 `scripts/mac_benchmark.sh` times SD-Turbo on the CPU and the GPU (int8 and
 float32) and a short animation, pausing between runs so a laptop stays

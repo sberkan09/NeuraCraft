@@ -62,9 +62,20 @@ jobs:
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
-    - name: Install Clang's sanitizer runtimes
-      timeout-minutes: 10
-      run: sudo apt-get update && sudo apt-get install -y clang-18 libclang-rt-18-dev && sudo ln -sf /usr/bin/clang++-18 /usr/local/bin/clang++
+    - name: Clang with libFuzzer and the sanitizers
+      timeout-minutes: 15
+      run: |
+        # The runner's own Clang when it links fuzzers; otherwise apt, with retries and off the
+        # Azure mirror (which has stalled for minutes on single packages).
+        echo 'extern "C" int LLVMFuzzerTestOneInput(const unsigned char*, unsigned long) { return 0; }' > /tmp/probe.cpp
+        for cxx in clang++ clang++-20 clang++-19 clang++-18; do
+          if command -v $cxx > /dev/null && $cxx -fsanitize=fuzzer,address,undefined /tmp/probe.cpp -o /tmp/probe 2> /dev/null; then
+            sudo ln -sf "$(command -v $cxx)" /usr/local/bin/clang++; echo "using $cxx"; exit 0
+          fi
+        done
+        sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/* 2> /dev/null || true
+        APT="-o Acquire::Retries=5 -o Acquire::http::Timeout=30"
+        sudo apt-get $APT update && sudo apt-get $APT install -y clang-18 libclang-rt-18-dev && sudo ln -sf /usr/bin/clang++-18 /usr/local/bin/clang++
     - name: Fuzz the file readers (30 s each)
       run: fuzz/run.sh 30
 

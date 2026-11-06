@@ -175,8 +175,10 @@ void dropResident(State& st, std::map<const float*, Resident>::iterator it) {
 
 // The device copy of a constant host operand (rows x cols, stride ld), made if missing; null outside
 // a weight scope or when it cannot fit (the caller then copies it as usual).
+// Only operands of at least 64 KB: their host memory is a page-backed Matrix block, whose release
+// reaches forgetHost() (smaller blocks are not tracked, so they are not kept either).
 const float* residentCopy(State& st, const float* host, std::size_t rows, std::size_t cols, std::size_t ld) {
-    if (st.scopes == 0) return nullptr;
+    if (st.scopes == 0 || rows * ld * sizeof(float) < (std::size_t(64) << 10)) return nullptr;
     auto it = st.resident.find(host);
     if (it != st.resident.end()) {
         Resident& r = it->second;

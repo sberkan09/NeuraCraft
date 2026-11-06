@@ -68,7 +68,8 @@ bool gpuAttentionEnabled();
 // gemmConst() and gpuConvolution() (layer weights in inference) are uploaded to the GPU once and
 // reused, instead of being copied on every product; the copies go when their host memory is freed
 // and when the last scope closes. Inside a scope those weights must not be changed in place
-// (inference never does; training should not open one). No effect on the CPU or without CUDA.
+// (inference never does; training should not open one). Only operands of 64 KB or more are kept,
+// and they must live in Matrix storage (whose frees are tracked). No effect on the CPU or without CUDA.
 class GpuWeightScope {
 public:
     GpuWeightScope();

@@ -5128,14 +5128,17 @@ TEST(gpu_resident_weights_follow_their_memory) {
     setDevice(Device::GPU);
     {
         GpuWeightScope scope;
-        const Matrix x = Matrix::uniform(64, 96, -1, 1);
-        for (int round = 0; round < 3; ++round) {
-            const Matrix w = Matrix::uniform(96, 80, -1, 1);  // likely the same address each round
-            Matrix gpu(64, 80), cpu(64, 80);
-            gemmConst(false, false, false, 64, 80, 96, x.data(), 96, w.data(), 80, gpu.data(), 80);
-            gemmConst(false, false, false, 64, 80, 96, x.data(), 96, w.data(), 80, gpu.data(), 80);  // from the resident copy
-            gemmReference(false, false, 64, 80, 96, x.data(), 96, w.data(), 80, cpu.data(), 80);
-            CHECK(gpu.approxEquals(cpu, 1e-3f));
+        for (const std::size_t n : {std::size_t(80), std::size_t(256)}) {  // 30 KB (not kept) and 96 KB (kept) weights
+            const Matrix x = Matrix::uniform(64, 96, -1, 1);
+            for (int round = 0; round < 3; ++round) {
+                const Matrix w = Matrix::uniform(96, n, -1, 1);  // likely the same address each round
+                Matrix gpu(64, n), cpu(64, n);
+                gemmConst(false, false, false, 64, n, 96, x.data(), 96, w.data(), n, gpu.data(), n);
+                gemmConst(false, false, false, 64, n, 96, x.data(), 96, w.data(), n, gpu.data(), n);  // from the resident copy
+                gemmReference(false, false, 64, n, 96, x.data(), 96, w.data(), n, cpu.data(), n);
+                if (!gpu.approxEquals(cpu, 1e-3f)) std::cout << "         resident gemm " << n << " round " << round << " differs\n";
+                CHECK(gpu.approxEquals(cpu, 1e-3f));
+            }
         }
         // A convolution against the CPU one, weights resident.
         const std::size_t C = 24, H = 13, W = 11, O = 16, k = 3;
@@ -5158,6 +5161,7 @@ TEST(gpu_resident_weights_follow_their_memory) {
                                 }
                         worst = std::max(worst, std::fabs(static_cast<float>(acc) - out(b, (o * H + y) * W + xx)));
                     }
+        if (worst >= 1e-3f) std::cout << "         gpu convolution max diff " << worst << "\n";
         CHECK(worst < 1e-3f);
     }
     setDevice(Device::CPU);

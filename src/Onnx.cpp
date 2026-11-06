@@ -329,6 +329,8 @@ ValueInfo parseValueInfo(Reader r) {
     return v;
 }
 
+std::shared_ptr<Graph> parseGraph(Reader g, const std::string& baseDir);
+
 Attribute parseAttribute(Reader r, const std::string& baseDir) {
     Attribute a;
     while (!r.done()) {
@@ -340,7 +342,7 @@ Attribute parseAttribute(Reader r, const std::string& baseDir) {
         case 3: a.i = static_cast<std::int64_t>(r.varint()); a.has = true; break;
         case 4: a.s = r.string(); a.has = true; break;
         case 5: a.t = std::make_shared<Tensor>(parseTensor(r.bytes(), baseDir)); a.has = true; break;
-        case 6: r.skip(wire); a.graph = true; break;
+        case 6: a.g = parseGraph(r.bytes(), baseDir); a.has = true; break;
         case 7: r.repeated(wire, [&](Reader& x) { const std::uint32_t b = x.fixed32(); float f; std::memcpy(&f, &b, 4); a.floats.push_back(f); }); a.has = true; break;
         case 8: r.repeated(wire, [&](Reader& x) { a.ints.push_back(static_cast<std::int64_t>(x.varint())); }); a.has = true; break;
         case 9: a.strings.push_back(r.string()); a.has = true; break;
@@ -350,23 +352,58 @@ Attribute parseAttribute(Reader r, const std::string& baseDir) {
     return a;
 }
 
+std::shared_ptr<Graph> parseGraph(Reader g, const std::string& baseDir) {
+    auto graph = std::make_shared<Graph>();
+    while (!g.done()) {
+        const std::uint64_t k = g.varint();
+        const int f = static_cast<int>(k >> 3), w = static_cast<int>(k & 7);
+        if (f == 1) {
+            Reader nr = g.bytes();
+            Node node;
+            while (!nr.done()) {
+                const std::uint64_t nk = nr.varint();
+                const int nf = static_cast<int>(nk >> 3), nw = static_cast<int>(nk & 7);
+                if (nf == 1) node.inputs.push_back(nr.string());
+                else if (nf == 2) node.outputs.push_back(nr.string());
+                else if (nf == 3) node.name = nr.string();
+                else if (nf == 4) node.op = nr.string();
+                else if (nf == 5) {
+                    Attribute a = parseAttribute(nr.bytes(), baseDir);
+                    node.attrs[a.name] = std::move(a);
+                } else if (nf == 7) node.domain = nr.string();
+                else nr.skip(nw);
+            }
+            graph->nodes.push_back(std::move(node));
+        } else if (f == 5) {
+            std::string name;
+            Tensor t = parseTensor(g.bytes(), baseDir, &name);
+            graph->initializers[name] = std::make_shared<const Tensor>(std::move(t));
+        } else if (f == 11) {
+            graph->inputs.push_back(parseValueInfo(g.bytes()));
+        } else if (f == 12) {
+            graph->outputs.push_back(parseValueInfo(g.bytes()));
+        } else {
+            g.skip(w);
+        }
+    }
+    return graph;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------------------------
 // Model
 
 struct Model::Impl {
-    std::vector<Node> nodes;
-    std::unordered_map<std::string, std::shared_ptr<const Tensor>> initializers;
-    std::vector<ValueInfo> inputs, outputs;
+    std::shared_ptr<Graph> graph;
+    std::vector<ValueInfo> inputs;  // the graph inputs that are not initializers
     int opset = 1;
-    std::unordered_map<std::string, std::size_t> lastUse;  // value -> index of the last node reading it
 };
 
 namespace {
 // A Conv whose output only feeds one Relu / LeakyRelu / Clip (and is not a graph output) takes the
 // activation over: it is applied in the convolution's last pass and the node goes.
-void fuseActivations(Model::Impl& m) {
+void fuseActivations(Graph& m) {
     std::unordered_map<std::string, std::vector<std::size_t>> readers;
     for (std::size_t k = 0; k < m.nodes.size(); ++k)
         for (const std::string& in : m.nodes[k].inputs)
@@ -429,19 +466,262 @@ Model& Model::operator=(Model&&) noexcept = default;
 Model::~Model() = default;
 
 const std::vector<ValueInfo>& Model::inputs() const { return impl_->inputs; }
-const std::vector<ValueInfo>& Model::outputs() const { return impl_->outputs; }
+const std::vector<ValueInfo>& Model::outputs() const { return impl_->graph->outputs; }
 int Model::opset() const { return impl_->opset; }
-std::size_t Model::nodeCount() const { return impl_->nodes.size(); }
+namespace {
+template <typename F>
+void eachNode(const Graph& g, F&& f) {
+    for (const Node& n : g.nodes) {
+        f(n);
+        for (const auto& [_, a] : n.attrs)
+            if (a.g) eachNode(*a.g, f);
+    }
+}
+} // namespace
+std::size_t Model::nodeCount() const {
+    std::size_t c = 0;
+    eachNode(*impl_->graph, [&](const Node&) { ++c; });
+    return c;
+}
 std::map<std::string, std::size_t> Model::operatorCounts() const {
     std::map<std::string, std::size_t> c;
-    for (const Node& n : impl_->nodes) ++c[n.key()];
+    eachNode(*impl_->graph, [&](const Node& n) { ++c[n.key()]; });
     return c;
 }
 std::size_t Model::parameterCount() const {
     std::size_t n = 0;
-    for (const auto& [_, t] : impl_->initializers) n += t->size();
+    for (const auto& [_, t] : impl_->graph->initializers) n += t->size();
     return n;
 }
+
+namespace {
+
+bool controlFlow(const std::string& key) { return key == "If" || key == "Loop" || key == "Scan"; }
+
+// Checks every operator, fuses activations, and works out which values each graph reads from the
+// graphs around it and when each value is read for the last time (a node with subgraphs reads what
+// they read from outside).
+void prepare(Graph& g, const std::string& path) {
+    fuseActivations(g);
+    const auto& ops = operatorTable();
+    std::set<std::string> local;
+    for (const ValueInfo& v : g.inputs) local.insert(v.name);
+    for (const auto& [name, _] : g.initializers) local.insert(name);
+    for (std::size_t k = 0; k < g.nodes.size(); ++k) {
+        Node& n = g.nodes[k];
+        if (!ops.count(n.key()) && !controlFlow(n.key()))
+            throw std::runtime_error("onnx: " + path + ": operator " + n.key() + " (node '" + n.name + "') is not supported");
+        std::vector<std::string> reads(n.inputs.begin(), n.inputs.end());
+        for (auto& [_, a] : n.attrs)
+            if (a.g) {
+                prepare(*a.g, path);
+                reads.insert(reads.end(), a.g->outer.begin(), a.g->outer.end());
+            }
+        for (const std::string& in : reads) {
+            if (in.empty()) continue;
+            g.lastUse[in] = k;
+            if (!local.count(in)) g.outer.insert(in);
+        }
+        for (const std::string& out : n.outputs) local.insert(out);
+    }
+    for (const ValueInfo& o : g.outputs)
+        if (!local.count(o.name)) g.outer.insert(o.name);  // an output passed straight through from outside
+}
+
+// Values by name: this graph's, then the enclosing graphs'.
+struct Scope {
+    std::unordered_map<std::string, std::shared_ptr<const Tensor>> values;
+    const Scope* parent = nullptr;
+    const Tensor* find(const std::string& name) const {
+        for (const Scope* s = this; s; s = s->parent) {
+            auto it = s->values.find(name);
+            if (it != s->values.end()) return it->second.get();
+        }
+        return nullptr;
+    }
+    std::shared_ptr<const Tensor> share(const std::string& name) const {
+        for (const Scope* s = this; s; s = s->parent) {
+            auto it = s->values.find(name);
+            if (it != s->values.end()) return it->second;
+        }
+        return nullptr;
+    }
+};
+
+using Profile = std::map<std::string, std::pair<double, std::size_t>>;
+std::vector<std::shared_ptr<const Tensor>> runGraph(const Graph& g, Scope& scope, const std::set<std::string>& keep, int opset, Profile* profile,
+                                                    const std::vector<std::string>* results = nullptr);
+
+// Stacks equally shaped tensors along a new first axis.
+Tensor stack(const std::vector<std::shared_ptr<const Tensor>>& parts) {
+    Tensor r;
+    if (parts.empty()) {
+        r.shape = {0};
+        return r;
+    }
+    r.kind = parts[0]->kind;
+    r.elemType = parts[0]->elemType;
+    r.shape = parts[0]->shape;
+    r.shape.insert(r.shape.begin(), static_cast<std::int64_t>(parts.size()));
+    for (const auto& p : parts) {
+        if (p->shape != parts[0]->shape) throw std::runtime_error("Loop / Scan: scan outputs of different shapes");
+        if (r.kind == Tensor::Kind::Float) r.f.insert(r.f.end(), p->f.begin(), p->f.end());
+        else r.i.insert(r.i.end(), p->i.begin(), p->i.end());
+    }
+    return r;
+}
+
+bool truth(const Tensor& t) {
+    if (t.size() != 1) throw std::runtime_error("condition is not a single value");
+    return t.kind == Tensor::Kind::Float ? t.f[0] != 0.0f : t.i[0] != 0;
+}
+
+std::vector<std::shared_ptr<const Tensor>> runSubgraph(const Graph& body, const Scope& outer, const std::vector<std::shared_ptr<const Tensor>>& inputs,
+                                                       int opset, Profile* profile) {
+    Scope s;
+    s.parent = &outer;
+    for (const auto& [name, t] : body.initializers) s.values[name] = t;
+    for (std::size_t k = 0; k < body.inputs.size() && k < inputs.size(); ++k)
+        if (inputs[k]) s.values[body.inputs[k].name] = inputs[k];
+    std::set<std::string> keep;
+    for (const ValueInfo& o : body.outputs) keep.insert(o.name);
+    return runGraph(body, s, keep, opset, profile);
+}
+
+std::vector<std::shared_ptr<const Tensor>> runControlFlow(const Node& n, const Scope& scope, const std::vector<const Tensor*>& ins, int opset,
+                                                          Profile* profile) {
+    auto share = [&](std::size_t k) -> std::shared_ptr<const Tensor> {
+        if (k >= n.inputs.size() || n.inputs[k].empty()) return nullptr;
+        return scope.share(n.inputs[k]);
+    };
+    if (n.op == "If") {
+        if (ins.empty() || !ins[0]) throw std::runtime_error("If without a condition");
+        const Attribute* branch = n.attr(truth(*ins[0]) ? "then_branch" : "else_branch");
+        if (!branch || !branch->g) throw std::runtime_error("If without its branches");
+        return runSubgraph(*branch->g, scope, {}, opset, profile);
+    }
+    const Attribute* body = n.attr("body");
+    if (!body || !body->g) throw std::runtime_error(n.op + " without a body");
+    const Graph& g = *body->g;
+    if (n.op == "Loop") {
+        const std::int64_t maxTrips = ins.size() > 0 && ins[0] ? (ins[0]->kind == Tensor::Kind::Int ? ins[0]->i.at(0) : static_cast<std::int64_t>(ins[0]->f.at(0)))
+                                                               : std::numeric_limits<std::int64_t>::max();
+        bool cond = ins.size() > 1 && ins[1] ? truth(*ins[1]) : true;
+        std::vector<std::shared_ptr<const Tensor>> carried;
+        for (std::size_t k = 2; k < n.inputs.size(); ++k) carried.push_back(share(k));
+        const std::size_t N = carried.size(), K = g.outputs.size() - 1 - N;
+        std::vector<std::vector<std::shared_ptr<const Tensor>>> scans(K);
+        for (std::int64_t i = 0; i < maxTrips && cond; ++i) {
+            std::vector<std::shared_ptr<const Tensor>> bodyIn{std::make_shared<const Tensor>(Tensor::ints({}, {i})),
+                                                              std::make_shared<const Tensor>(Tensor::ints({}, {cond ? 1 : 0}, 9))};
+            bodyIn.insert(bodyIn.end(), carried.begin(), carried.end());
+            const auto out = runSubgraph(g, scope, bodyIn, opset, profile);
+            cond = truth(*out.at(0));
+            for (std::size_t c = 0; c < N; ++c) carried[c] = out.at(1 + c);
+            for (std::size_t q = 0; q < K; ++q) scans[q].push_back(out.at(1 + N + q));
+        }
+        std::vector<std::shared_ptr<const Tensor>> result = carried;
+        for (auto& sc : scans) result.push_back(std::make_shared<const Tensor>(stack(sc)));
+        return result;
+    }
+    // Scan (opset 9+): state variables, then num_scan_inputs inputs sliced along their scan axis.
+    const std::size_t M = static_cast<std::size_t>(n.i("num_scan_inputs", 0)), N = n.inputs.size() - M;
+    std::vector<std::int64_t> inAxes = n.ints("scan_input_axes"), outAxes = n.ints("scan_output_axes"), inDirs = n.ints("scan_input_directions"),
+                              outDirs = n.ints("scan_output_directions");
+    auto nonZero = [](const std::vector<std::int64_t>& v) { return std::any_of(v.begin(), v.end(), [](std::int64_t x) { return x != 0; }); };
+    if (nonZero(inAxes) || nonZero(outAxes) || nonZero(outDirs)) throw std::runtime_error("Scan: only axis 0, forward outputs are supported");
+    std::vector<std::shared_ptr<const Tensor>> state;
+    for (std::size_t k = 0; k < N; ++k) state.push_back(share(k));
+    std::int64_t steps = -1;
+    for (std::size_t q = 0; q < M; ++q) {
+        const Tensor* t = ins.at(N + q);
+        if (steps >= 0 && t->shape.at(0) != steps) throw std::runtime_error("Scan: scan inputs of different lengths");
+        steps = t->shape.at(0);
+    }
+    const std::size_t K = g.outputs.size() - N;
+    std::vector<std::vector<std::shared_ptr<const Tensor>>> scans(K);
+    for (std::int64_t i = 0; i < steps; ++i) {
+        std::vector<std::shared_ptr<const Tensor>> bodyIn = state;
+        for (std::size_t q = 0; q < M; ++q) {
+            const Tensor* t = ins.at(N + q);
+            const std::int64_t row = !inDirs.empty() && inDirs[q] ? steps - 1 - i : i;
+            Tensor slice;
+            slice.kind = t->kind;
+            slice.elemType = t->elemType;
+            slice.shape.assign(t->shape.begin() + 1, t->shape.end());
+            const std::size_t len = slice.size(), at = static_cast<std::size_t>(row) * len;
+            if (t->kind == Tensor::Kind::Float) slice.f.assign(t->f.begin() + at, t->f.begin() + at + len);
+            else slice.i.assign(t->i.begin() + at, t->i.begin() + at + len);
+            bodyIn.push_back(std::make_shared<const Tensor>(std::move(slice)));
+        }
+        const auto out = runSubgraph(g, scope, bodyIn, opset, profile);
+        for (std::size_t c = 0; c < N; ++c) state[c] = out.at(c);
+        for (std::size_t q = 0; q < K; ++q) scans[q].push_back(out.at(N + q));
+    }
+    std::vector<std::shared_ptr<const Tensor>> result = state;
+    for (auto& sc : scans) result.push_back(std::make_shared<const Tensor>(stack(sc)));
+    return result;
+}
+
+// Runs the nodes in order and returns the graph outputs (or the `results` values instead).
+std::vector<std::shared_ptr<const Tensor>> runGraph(const Graph& g, Scope& scope, const std::set<std::string>& keep, int opset, Profile* profile,
+                                                    const std::vector<std::string>* results) {
+    const auto& ops = operatorTable();
+    for (std::size_t k = 0; k < g.nodes.size(); ++k) {
+        const Node& n = g.nodes[k];
+        const auto started = std::chrono::steady_clock::now();
+        std::vector<const Tensor*> ins;
+        for (const std::string& name : n.inputs) {
+            if (name.empty()) {
+                ins.push_back(nullptr);
+                continue;
+            }
+            const Tensor* t = scope.find(name);
+            if (!t) throw std::runtime_error("onnx: node '" + n.name + "' (" + n.op + ") reads '" + name + "', which nothing made");
+            ins.push_back(t);
+        }
+        std::vector<std::shared_ptr<const Tensor>> outs;
+        try {
+            if (controlFlow(n.key())) {
+                outs = runControlFlow(n, scope, ins, opset, profile);
+            } else {
+                std::vector<Tensor> made = ops.at(n.key())(n, ins, opset);
+                for (Tensor& t : made) outs.push_back(std::make_shared<const Tensor>(std::move(t)));
+            }
+        } catch (const std::exception& e) {
+            throw std::runtime_error("onnx: " + n.op + " node '" + n.name + "': " + e.what());
+        }
+        for (std::size_t o = 0; o < n.outputs.size() && o < outs.size(); ++o)
+            if (!n.outputs[o].empty()) scope.values[n.outputs[o]] = std::move(outs[o]);
+        if (profile && !controlFlow(n.key())) {
+            auto& sp = (*profile)[n.key()];
+            sp.first += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            ++sp.second;
+        }
+        // Free what no later node reads (only this graph's own values).
+        auto drop = [&](const std::string& name) {
+            if (name.empty() || keep.count(name) || g.initializers.count(name)) return;
+            auto lu = g.lastUse.find(name);
+            if (lu != g.lastUse.end() && lu->second == k) scope.values.erase(name);
+        };
+        for (const std::string& name : n.inputs) drop(name);
+        for (const auto& [_, a] : n.attrs)
+            if (a.g)
+                for (const std::string& name : a.g->outer) drop(name);
+    }
+    std::vector<std::string> names;
+    if (!results)
+        for (const ValueInfo& o : g.outputs) names.push_back(o.name);
+    std::vector<std::shared_ptr<const Tensor>> out;
+    for (const std::string& name : results ? *results : names) {
+        auto t = scope.share(name);
+        if (!t) throw std::runtime_error("onnx: output '" + name + "' was not computed");
+        out.push_back(t);
+    }
+    return out;
+}
+
+} // namespace
 
 Model Model::load(const std::string& path) {
     const std::string bytes = readFileBytes(path);
@@ -449,8 +729,6 @@ Model Model::load(const std::string& path) {
     Model model;
     Impl& m = *model.impl_;
     Reader r{reinterpret_cast<const std::uint8_t*>(bytes.data()), reinterpret_cast<const std::uint8_t*>(bytes.data()) + bytes.size()};
-    bool haveGraph = false;
-    std::vector<ValueInfo> declaredInputs;
     while (!r.done()) {
         const std::uint64_t key = r.varint();
         const int field = static_cast<int>(key >> 3), wire = static_cast<int>(key & 7);
@@ -466,65 +744,23 @@ Model Model::load(const std::string& path) {
             }
             if (domain.empty() || domain == "ai.onnx") m.opset = static_cast<int>(version);
         } else if (field == 7) {  // graph
-            haveGraph = true;
-            Reader g = r.bytes();
-            while (!g.done()) {
-                const std::uint64_t k = g.varint();
-                const int f = static_cast<int>(k >> 3), w = static_cast<int>(k & 7);
-                if (f == 1) {
-                    Reader nr = g.bytes();
-                    Node node;
-                    while (!nr.done()) {
-                        const std::uint64_t nk = nr.varint();
-                        const int nf = static_cast<int>(nk >> 3), nw = static_cast<int>(nk & 7);
-                        if (nf == 1) node.inputs.push_back(nr.string());
-                        else if (nf == 2) node.outputs.push_back(nr.string());
-                        else if (nf == 3) node.name = nr.string();
-                        else if (nf == 4) node.op = nr.string();
-                        else if (nf == 5) {
-                            Attribute a = parseAttribute(nr.bytes(), baseDir);
-                            node.attrs[a.name] = std::move(a);
-                        } else if (nf == 7) node.domain = nr.string();
-                        else nr.skip(nw);
-                    }
-                    m.nodes.push_back(std::move(node));
-                } else if (f == 5) {
-                    std::string name;
-                    Tensor t = parseTensor(g.bytes(), baseDir, &name);
-                    m.initializers[name] = std::make_shared<const Tensor>(std::move(t));
-                } else if (f == 11) {
-                    declaredInputs.push_back(parseValueInfo(g.bytes()));
-                } else if (f == 12) {
-                    m.outputs.push_back(parseValueInfo(g.bytes()));
-                } else {
-                    g.skip(w);
-                }
-            }
+            m.graph = parseGraph(r.bytes(), baseDir);
         } else {
             r.skip(wire);
         }
     }
-    if (!haveGraph) throw std::runtime_error("onnx: " + path + " has no graph");
-    fuseActivations(m);
-    for (ValueInfo& v : declaredInputs)
-        if (!m.initializers.count(v.name)) m.inputs.push_back(std::move(v));
-    // Every operator must be one we run; nodes are in topological order (the ONNX rule).
-    const auto& ops = operatorTable();
-    for (std::size_t k = 0; k < m.nodes.size(); ++k) {
-        const Node& n = m.nodes[k];
-        if (!ops.count(n.key()))
-            throw std::runtime_error("onnx: " + path + ": operator " + n.key() + " (node '" + n.name + "') is not supported");
-        for (const auto& [name, a] : n.attrs)
-            if (a.graph) throw std::runtime_error("onnx: " + path + ": control flow (" + n.op + " node '" + n.name + "') is not supported");
-        for (const std::string& in : n.inputs)
-            if (!in.empty()) m.lastUse[in] = k;
-    }
+    if (!m.graph) throw std::runtime_error("onnx: " + path + " has no graph");
+    prepare(*m.graph, path);
+    for (const ValueInfo& v : m.graph->inputs)
+        if (!m.graph->initializers.count(v.name)) m.inputs.push_back(v);
     return model;
 }
 
 std::map<std::string, Tensor> Model::run(const std::map<std::string, Tensor>& feeds, const std::vector<std::string>& wanted) const {
     const Impl& m = *impl_;
-    std::unordered_map<std::string, std::shared_ptr<const Tensor>> values = m.initializers;
+    const Graph& g = *m.graph;
+    Scope scope;
+    scope.values = g.initializers;
     for (const ValueInfo& in : m.inputs) {
         auto it = feeds.find(in.name);
         if (it == feeds.end()) throw std::invalid_argument("onnx: missing input '" + in.name + "'");
@@ -535,65 +771,29 @@ std::map<std::string, Tensor> Model::run(const std::map<std::string, Tensor>& fe
             if (in.shape[d] > 0 && it->second.shape[d] != in.shape[d])
                 throw std::invalid_argument("onnx: input '" + in.name + "' dimension " + std::to_string(d) + " is " + std::to_string(it->second.shape[d]) +
                                             ", the model expects " + std::to_string(in.shape[d]));
-        values[in.name] = std::make_shared<const Tensor>(it->second);
+        scope.values[in.name] = std::make_shared<const Tensor>(it->second);
     }
     std::set<std::string> keep;
     if (wanted.empty())
-        for (const ValueInfo& o : m.outputs) keep.insert(o.name);
+        for (const ValueInfo& o : g.outputs) keep.insert(o.name);
     else
         keep.insert(wanted.begin(), wanted.end());
-    const auto& ops = operatorTable();
     // NEURACRAFT_ONNX_PROFILE=1: time per operator type, printed to stderr after the run.
-    static const bool profile = [] {
+    static const bool profiling = [] {
         const char* e = std::getenv("NEURACRAFT_ONNX_PROFILE");
         return e && *e && std::string(e) != "0";
     }();
-    std::map<std::string, std::pair<double, std::size_t>> spent;
-    for (std::size_t k = 0; k < m.nodes.size(); ++k) {
-        const Node& n = m.nodes[k];
-        const auto started = std::chrono::steady_clock::now();
-        std::vector<const Tensor*> ins;
-        for (const std::string& name : n.inputs) {
-            if (name.empty()) {
-                ins.push_back(nullptr);
-                continue;
-            }
-            auto it = values.find(name);
-            if (it == values.end()) throw std::runtime_error("onnx: node '" + n.name + "' (" + n.op + ") reads '" + name + "', which nothing made");
-            ins.push_back(it->second.get());
-        }
-        std::vector<Tensor> outs;
-        try {
-            outs = ops.at(n.key())(n, ins, m.opset);
-        } catch (const std::exception& e) {
-            throw std::runtime_error("onnx: " + n.op + " node '" + n.name + "': " + e.what());
-        }
-        for (std::size_t o = 0; o < n.outputs.size() && o < outs.size(); ++o)
-            if (!n.outputs[o].empty()) values[n.outputs[o]] = std::make_shared<const Tensor>(std::move(outs[o]));
-        if (profile) {
-            auto& sp = spent[n.key()];
-            sp.first += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-            ++sp.second;
-        }
-        // Free what no later node reads.
-        for (const std::string& name : n.inputs) {
-            if (name.empty() || keep.count(name) || m.initializers.count(name)) continue;
-            auto lu = m.lastUse.find(name);
-            if (lu != m.lastUse.end() && lu->second == k) values.erase(name);
-        }
-    }
-    if (profile) {
+    Profile spent;
+    std::vector<std::string> names(keep.begin(), keep.end());
+    const auto values = runGraph(g, scope, keep, m.opset, profiling ? &spent : nullptr, &names);
+    if (profiling) {
         std::vector<std::pair<double, std::string>> rows;
         for (const auto& [op, sp] : spent) rows.push_back({sp.first, op + " x" + std::to_string(sp.second)});
         std::sort(rows.rbegin(), rows.rend());
         for (const auto& [sec, what] : rows) std::fprintf(stderr, "  onnx %-28s %8.3f s\n", what.c_str(), sec);
     }
     std::map<std::string, Tensor> out;
-    for (const std::string& name : keep) {
-        auto it = values.find(name);
-        if (it == values.end()) throw std::runtime_error("onnx: output '" + name + "' was not computed");
-        out[name] = *it->second;
-    }
+    for (std::size_t k = 0; k < names.size(); ++k) out[names[k]] = *values[k];
     return out;
 }
 
@@ -645,6 +845,7 @@ void saveTensorProto(const std::string& path, const Tensor& t, const std::string
 std::vector<std::string> supportedOperators() {
     std::vector<std::string> names;
     for (const auto& [name, _] : operatorTable()) names.push_back(name);
+    names.insert(names.end(), {"If", "Loop", "Scan"});  // run by the executor itself
     std::sort(names.begin(), names.end());
     return names;
 }

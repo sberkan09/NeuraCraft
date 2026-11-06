@@ -218,6 +218,55 @@ def bnb4_case(name, K, N, bs, quant_type):
 bnb4_case("matmul_bnb4_nf4", 32, 6, 64, 1)
 bnb4_case("matmul_bnb4_fp4", 16, 4, 16, 0)
 
+# control flow: If branches, Loop bodies and Scan bodies are subgraphs that may read outer values
+def vi(name, t=T.FLOAT, shape=None): return h.make_tensor_value_info(name, t, shape)
+def graph(name, nodes, ins, outs): return h.make_graph(nodes, name, ins, outs)
+then_g = graph("then", [n("Mul", ["x", "w"], ["t_out"])], [], [vi("t_out")])          # reads outer x and w
+else_g = graph("else", [n("Sub", ["x", "w"], ["e1"]), n("Abs", ["e1"], ["e_out"])], [], [vi("e_out")])
+for tag, thr in [("then", -10.0), ("else", 10.0)]:
+    case("if_" + tag, [n("ReduceSum", ["x"], ["s"], keepdims=0), n("Greater", ["s", "thr"], ["c"]),
+                       n("If", ["c"], ["y"], then_branch=then_g, else_branch=else_g), n("Add", ["y", "x"], ["z"])],
+         {"x": f32(2, 3)}, outputs=["z"], inits=[("w", f32(2, 3)), ("thr", np.array(thr, np.float32))])
+# Loop: 4 trips, a carried accumulator, a scan output, and the body reading an outer value
+loop_body = graph("body", [n("Add", ["acc_in", "x"], ["acc_out"]), n("Cast", ["iter"], ["itf"], to=T.FLOAT), n("Mul", ["acc_out", "itf"], ["scan"]),
+                           n("Identity", ["cond_in"], ["cond_out"])],
+                  [vi("iter", T.INT64, []), vi("cond_in", T.BOOL, []), vi("acc_in")], [vi("cond_out", T.BOOL), vi("acc_out"), vi("scan")])
+case("loop_carried_scan", [n("Loop", ["trips", "", "a0"], ["acc", "scans"], body=loop_body)], {"x": f32(2, 3), "a0": f32(2, 3)},
+     outputs=["acc", "scans"], inits=[("trips", np.array(4, np.int64))])
+# Loop stopped by its condition (no trip count): keep going while the sum stays below a limit
+while_body = graph("while", [n("Mul", ["v_in", "two"], ["v_out"]), n("ReduceSum", ["v_out"], ["s"], keepdims=0), n("Less", ["s", "lim"], ["cond_out"])],
+                   [vi("iter", T.INT64, []), vi("cond_in", T.BOOL, []), vi("v_in")], [vi("cond_out", T.BOOL), vi("v_out")])
+case("loop_while", [n("Loop", ["", "c0", "v"], ["vf"], body=while_body)], {"v": f32(3, lo=0.5, hi=1.0)}, outputs=["vf"],
+     inits=[("c0", np.array(True)), ("two", np.array(2.0, np.float32)), ("lim", np.array(40.0, np.float32))])
+# nested: a Loop whose body holds an If on the iteration number
+odd = graph("odd", [n("Neg", ["acc_in"], ["o_out"])], [], [vi("o_out")])
+even = graph("even", [n("Add", ["acc_in", "x"], ["ev_out"])], [], [vi("ev_out")])
+nest_body = graph("nest", [n("Mod", ["iter", "two_i"], ["r"]), n("Equal", ["r", "one_i"], ["isodd"]), n("If", ["isodd"], ["acc_out"], then_branch=odd, else_branch=even),
+                           n("Identity", ["cond_in"], ["cond_out"])],
+                  [vi("iter", T.INT64, []), vi("cond_in", T.BOOL, []), vi("acc_in")], [vi("cond_out", T.BOOL), vi("acc_out")])
+case("loop_nested_if", [n("Loop", ["trips", "", "a0"], ["acc"], body=nest_body)], {"x": f32(4), "a0": f32(4)}, outputs=["acc"],
+     inits=[("trips", np.array(5, np.int64)), ("two_i", np.array(2, np.int64)), ("one_i", np.array(1, np.int64))])
+# Scan: a running sum over the rows (one reversed), with a scan output per step
+scan_body = graph("scan", [n("Add", ["st_in", "row"], ["st_out"]), n("Mul", ["st_out", "rrow"], ["out"])],
+                  [vi("st_in", T.FLOAT, [3]), vi("row", T.FLOAT, [3]), vi("rrow", T.FLOAT, [3])], [vi("st_out", T.FLOAT, [3]), vi("out", T.FLOAT, [3])])
+case("scan_running_sum", [n("Scan", ["s0", "xs", "xs"], ["sf", "outs"], body=scan_body, num_scan_inputs=2, scan_input_directions=[0, 1])],
+     {"s0": f32(3), "xs": f32(5, 3)}, outputs=["sf", "outs"], opset=11)
+
+# recurrent layers
+T_, N_, I_, H_ = 5, 3, 4, 6
+xs_ = f32(T_, N_, I_)
+case("lstm_peephole", [n("LSTM", ["x", "w", "r", "b", "", "h0", "c0", "p"], ["y", "yh", "yc"], hidden_size=H_)], {"x": xs_}, outputs=["y", "yh", "yc"],
+     inits=[("w", f32(1, 4 * H_, I_)), ("r", f32(1, 4 * H_, H_)), ("b", f32(1, 8 * H_)), ("h0", f32(1, N_, H_)), ("c0", f32(1, N_, H_)), ("p", f32(1, 3 * H_))])
+case("lstm_bidirectional_lens", [n("LSTM", ["x", "w", "r", "b", "lens"], ["y", "yh", "yc"], hidden_size=H_, direction="bidirectional")], {"x": xs_},
+     outputs=["y", "yh", "yc"], inits=[("w", f32(2, 4 * H_, I_)), ("r", f32(2, 4 * H_, H_)), ("b", f32(2, 8 * H_)), ("lens", np.array([5, 2, 4], np.int32))])
+case("lstm_reverse_clip", [n("LSTM", ["x", "w", "r"], ["y", "yh"], hidden_size=H_, clip=0.5, direction="reverse")],
+     {"x": f32(T_, N_, I_) * 3}, outputs=["y", "yh"], inits=[("w", f32(1, 4 * H_, I_)), ("r", f32(1, 4 * H_, H_))])
+for lbr in [0, 1]:
+    case(f"gru_lbr{lbr}", [n("GRU", ["x", "w", "r", "b", "", "h0"], ["y", "yh"], hidden_size=H_, linear_before_reset=lbr, direction="bidirectional")],
+         {"x": xs_}, outputs=["y", "yh"], inits=[("w", f32(2, 3 * H_, I_)), ("r", f32(2, 3 * H_, H_)), ("b", f32(2, 6 * H_)), ("h0", f32(2, N_, H_))])
+case("rnn_relu", [n("RNN", ["x", "w", "r", "b"], ["y", "yh"], hidden_size=H_, activations=["Relu"])], {"x": xs_}, outputs=["y", "yh"],
+     inits=[("w", f32(1, H_, I_)), ("r", f32(1, H_, H_) * 0.5), ("b", f32(1, 2 * H_))])
+
 shutil.rmtree(OUT, ignore_errors=True)
 for name, model, inputs, outputs in cases:
     # (outputs are declared without shapes, which onnx.checker refuses; onnxruntime accepts them)

@@ -553,8 +553,8 @@ models need. AnimateDiff, morph / zoom / outpaint and IP-Adapter stay SD 1.x /
 A network NeuraCraft has no code for — exported from PyTorch or TensorFlow as a
 `.onnx` file — runs on its own executor (`Onnx.h`): a small protobuf reader (no
 dependency; inline or external weights, fp32 / fp16 / bf16 / int / bool) and a
-graph executor for about 110 operators of opsets 7-21, with `MatMul`, `Gemm`
-and the convolutions on the library's GEMM.
+graph executor for about 115 operators of opsets 7-21, with `MatMul`, `Gemm`,
+the convolutions and the recurrent layers on the library's GEMM.
 
 ```
 $ ./bin/NeuraCraft onnx depth_anything_v2_small.onnx
@@ -565,7 +565,7 @@ depth_anything_v2_small.onnx: opset 14, 823 nodes, 24711136 parameters (loaded i
 $ ./bin/NeuraCraft onnx model.onnx out/ input_0.pb      # run on TensorProto inputs
 ```
 
-`tests/onnx/make_cases.py` writes 125 operator cases with onnxruntime's
+`tests/onnx/make_cases.py` writes 140 operator cases with onnxruntime's
 outputs, and the tests check every one. Real models match onnxruntime to about
 1e-6 (max abs): MobileNet v2, u2netp (background masks), Depth Anything v2
 small and Real-ESRGAN x4plus.
@@ -589,8 +589,17 @@ packed layout. A `Relu`, `LeakyRelu` or `Clip` that only reads a convolution's
 output is folded into it at load. Built with `NEURACRAFT_NATIVE` on an AVX-512
 CPU the GEMM kernel uses a 12 x 32 tile (a 1024³ product: 150 -> 257 GFLOPS).
 `NEURACRAFT_ONNX_PROFILE=1` prints the time per
-operator type. Control flow (`If` / `Loop`) and strings are not supported:
-such a model fails to load with the operator and node named.
+operator type.
+
+Control flow runs as well: `If` picks a branch, `Loop` repeats its body (a trip
+count, a condition or both; carried values and stacked scan outputs) and
+`Scan` walks its inputs along the first axis. Their subgraphs read values of
+the graphs around them, nest to any depth, and keep those values alive until
+the last subgraph is done with them. With `LSTM`, `GRU` and `RNN` (forward,
+reverse, bidirectional; sequence lengths, peepholes, clip, batch-first layout)
+this runs speech models such as Silero VAD — 15 `If` nodes and two LSTMs —
+matching onnxruntime to 5e-7 at both sample rates. Sequences and strings are
+not supported: such a model fails to load with the operator and node named.
 
 In workflows (and Studio's "ONNX modeli" task) the `onnx` step runs a picture
 model on every frame of a clip. Pre- and post-processing come from a manifest

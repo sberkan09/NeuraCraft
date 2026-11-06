@@ -7,15 +7,19 @@
 
 #include <functional>
 #include <map>
+#include <set>
+#include <unordered_map>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace nc::onnx {
 
+struct Graph;
+
 struct Attribute {
     std::string name;
-    bool has = false, graph = false;
+    bool has = false;
     float f = 0.0f;
     std::int64_t i = 0;
     std::string s;
@@ -23,6 +27,7 @@ struct Attribute {
     std::vector<float> floats;
     std::vector<std::int64_t> ints;
     std::vector<std::string> strings;
+    std::shared_ptr<Graph> g;  // a subgraph (If branches, Loop / Scan bodies)
 };
 
 struct Node {
@@ -53,6 +58,16 @@ struct Node {
         const Attribute* a = attr(n);
         return a ? a->ints : std::vector<std::int64_t>{};
     }
+};
+
+// A graph: the model's, or a subgraph of an If / Loop / Scan, whose nodes may also read values of the
+// graphs around it ("outer" lists those).
+struct Graph {
+    std::vector<Node> nodes;
+    std::unordered_map<std::string, std::shared_ptr<const Tensor>> initializers;
+    std::vector<ValueInfo> inputs, outputs;  // as declared (inputs may include initializers)
+    std::unordered_map<std::string, std::size_t> lastUse;  // value -> index of the last node reading it
+    std::set<std::string> outer;
 };
 
 // Inputs (nullptr for a missing optional one) -> outputs.

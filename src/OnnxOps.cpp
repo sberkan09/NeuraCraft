@@ -280,6 +280,172 @@ Outs gemmOp(const Node& n, const Ins& in, int) {
     return {r};
 }
 
+// ---- recurrent layers: RNN, GRU, LSTM ----
+
+// An activation of the recurrent operators by its ONNX name.
+std::function<float(float)> rnnActivation(const std::string& name, float alpha, float beta) {
+    if (name == "Sigmoid") return [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
+    if (name == "Tanh") return [](float x) { return std::tanh(x); };
+    if (name == "Relu") return [](float x) { return std::max(x, 0.0f); };
+    if (name == "HardSigmoid") return [=](float x) { return std::clamp(alpha * x + beta, 0.0f, 1.0f); };
+    if (name == "LeakyRelu") return [=](float x) { return x < 0 ? alpha * x : x; };
+    if (name == "Affine") return [=](float x) { return alpha * x + beta; };
+    if (name == "ScaledTanh") return [=](float x) { return alpha * std::tanh(beta * x); };
+    if (name == "Elu") return [=](float x) { return x < 0 ? alpha * (std::exp(x) - 1.0f) : x; };
+    if (name == "Softsign") return [](float x) { return x / (1.0f + std::fabs(x)); };
+    if (name == "Softplus") return [](float x) { return std::log1p(std::exp(x)); };
+    throw std::runtime_error("activation " + name + " is not supported");
+}
+
+// The shared part of RNN / GRU / LSTM: inputs X, W [dirs, G*H, I], R [dirs, G*H, H], B [dirs, 2*G*H],
+// sequence_lens, initial_h (and for LSTM initial_c, P). `kind` is 'r', 'g' or 'l'.
+Outs recurrent(const Node& n, const Ins& in, char kind) {
+    const std::size_t G = kind == 'l' ? 4 : kind == 'g' ? 3 : 1;
+    const bool batchFirst = n.i("layout", 0) != 0;
+    const Tensor& X = need(in, 0);
+    const Tensor& W = need(in, 1);
+    const Tensor& R = need(in, 2);
+    const Tensor* B = opt(in, 3);
+    const Tensor* lens = opt(in, 4);
+    const Tensor* h0 = opt(in, 5);
+    const Tensor* c0 = kind == 'l' ? opt(in, 6) : nullptr;
+    const Tensor* P = kind == 'l' ? opt(in, 7) : nullptr;
+    if (X.shape.size() != 3) throw std::runtime_error("X must have rank 3");
+    const std::size_t T = static_cast<std::size_t>(X.shape[batchFirst ? 1 : 0]), N = static_cast<std::size_t>(X.shape[batchFirst ? 0 : 1]),
+                      I = static_cast<std::size_t>(X.shape[2]);
+    const std::size_t D = static_cast<std::size_t>(W.shape.at(0)), H = static_cast<std::size_t>(n.i("hidden_size", R.shape.at(2)));
+    const std::string direction = n.s("direction", "forward");
+    if ((direction == "bidirectional") != (D == 2)) throw std::runtime_error("direction " + direction + " with " + std::to_string(D) + " weight sets");
+    if (n.i("input_forget", 0)) throw std::runtime_error("input_forget is not supported");
+    const float clip = n.attr("clip") ? n.f("clip", 0.0f) : 0.0f;
+    const bool linearBeforeReset = n.i("linear_before_reset", 0) != 0;
+    // activations: f, g (and h for LSTM) per direction
+    std::vector<std::string> names = n.attr("activations") ? n.attr("activations")->strings : std::vector<std::string>{};
+    const std::vector<float> alphas = n.attr("activation_alpha") ? n.attr("activation_alpha")->floats : std::vector<float>{},
+                             betas = n.attr("activation_beta") ? n.attr("activation_beta")->floats : std::vector<float>{};
+    const std::size_t perDir = kind == 'l' ? 3 : kind == 'g' ? 2 : 1;
+    if (names.empty()) {
+        for (std::size_t d = 0; d < D; ++d) {
+            if (kind == 'l') names.insert(names.end(), {"Sigmoid", "Tanh", "Tanh"});
+            else if (kind == 'g') names.insert(names.end(), {"Sigmoid", "Tanh"});
+            else names.push_back("Tanh");
+        }
+    }
+    if (names.size() != perDir * D) throw std::runtime_error("wrong number of activations");
+    std::vector<std::function<float(float)>> act;
+    for (std::size_t k = 0; k < names.size(); ++k) {
+        // the defaults the ONNX spec gives the parameterised activations
+        const bool hard = names[k] == "HardSigmoid";
+        const float a = k < alphas.size() ? alphas[k] : hard ? 0.2f : names[k] == "LeakyRelu" ? 0.01f : 1.0f;
+        const float b = k < betas.size() ? betas[k] : hard ? 0.5f : names[k] == "ScaledTanh" ? 1.0f : 0.0f;
+        act.push_back(rnnActivation(names[k], a, b));
+    }
+    std::vector<std::size_t> len(N, T);
+    if (lens && lens->size())
+        for (std::size_t b = 0; b < N; ++b) len[b] = static_cast<std::size_t>(std::min<std::int64_t>(asInts(*lens).at(b), static_cast<std::int64_t>(T)));
+    // X as [T, N, I]
+    std::vector<float> x(T * N * I);
+    for (std::size_t t = 0; t < T; ++t)
+        for (std::size_t b = 0; b < N; ++b)
+            std::copy_n(X.f.data() + (batchFirst ? (b * T + t) : (t * N + b)) * I, I, x.data() + (t * N + b) * I);
+    const std::size_t GH = G * H;
+    std::vector<float> Y(T * D * N * H, 0.0f), Yh(D * N * H, 0.0f), Yc(D * N * H, 0.0f);
+    for (std::size_t d = 0; d < D; ++d) {
+        const bool reverse = direction == "reverse" || d == 1;
+        const float* w = W.f.data() + d * GH * I;
+        const float* r = R.f.data() + d * GH * H;
+        const float* wb = B ? B->f.data() + d * 2 * GH : nullptr;
+        const float* rb = B ? wb + GH : nullptr;
+        const auto& f = act[d * perDir];
+        const auto& g = perDir > 1 ? act[d * perDir + 1] : act[d * perDir];
+        const auto& h = perDir > 2 ? act[d * perDir + 2] : act[d * perDir];
+        // X W^T (+ both biases, except the recurrent bias of GRU's hidden gate when it applies after the reset)
+        std::vector<float> xw(T * N * GH);
+        gemm(false, true, T * N, GH, I, x.data(), I, w, I, xw.data(), GH, false);
+        if (B)
+            for (std::size_t row = 0; row < T * N; ++row)
+                for (std::size_t c = 0; c < GH; ++c)
+                    xw[row * GH + c] += wb[c] + (kind == 'g' && c >= 2 * H ? 0.0f : rb[c]);
+        std::vector<float> hs(N * H, 0.0f), cs(N * H, 0.0f), hr(N * GH), rh(N * H), hh(N * H);
+        if (h0)
+            for (std::size_t b = 0; b < N; ++b)
+                std::copy_n(h0->f.data() + (batchFirst ? (b * D + d) : (d * N + b)) * H, H, hs.data() + b * H);
+        if (c0)
+            for (std::size_t b = 0; b < N; ++b)
+                std::copy_n(c0->f.data() + (batchFirst ? (b * D + d) : (d * N + b)) * H, H, cs.data() + b * H);
+        const float* pi = P ? P->f.data() + d * 3 * H : nullptr;
+        const float* po = pi ? pi + H : nullptr;
+        const float* pf = pi ? pi + 2 * H : nullptr;
+        auto clipped = [&](float v) { return clip > 0 ? std::clamp(v, -clip, clip) : v; };
+        for (std::size_t s = 0; s < T; ++s) {
+            // the recurrent product (GRU's hidden gate: below, when the reset comes first)
+            const std::size_t cols = kind == 'g' && !linearBeforeReset ? 2 * H : GH;
+            gemm(false, true, N, cols, H, hs.data(), H, r, H, hr.data(), GH, false);
+            if (kind == 'g' && !linearBeforeReset) {
+                for (std::size_t b = 0; b < N; ++b)
+                    for (std::size_t k = 0; k < H; ++k) {
+                        const std::size_t t = reverse ? len[b] - 1 - s : s;
+                        if (s >= len[b]) continue;
+                        const float rv = f(clipped(xw[(t * N + b) * GH + H + k] + hr[b * GH + H + k]));
+                        rh[b * H + k] = rv * hs[b * H + k];
+                    }
+                gemm(false, true, N, H, H, rh.data(), H, r + 2 * H * H, H, hh.data(), H, false);
+            }
+            for (std::size_t b = 0; b < N; ++b) {
+                if (s >= len[b]) continue;
+                const std::size_t t = reverse ? len[b] - 1 - s : s;
+                const float* xr = xw.data() + (t * N + b) * GH;
+                const float* rr = hr.data() + b * GH;
+                float* hb = hs.data() + b * H;
+                float* cb = cs.data() + b * H;
+                for (std::size_t k = 0; k < H; ++k) {
+                    if (kind == 'r') {
+                        hb[k] = f(clipped(xr[k] + rr[k]));
+                    } else if (kind == 'g') {
+                        const float z = f(clipped(xr[k] + rr[k]));
+                        float cand;
+                        if (linearBeforeReset) {
+                            const float rv = f(clipped(xr[H + k] + rr[H + k]));
+                            cand = g(clipped(xr[2 * H + k] + rv * (rr[2 * H + k] + (B ? rb[2 * H + k] : 0.0f))));
+                        } else {
+                            cand = g(clipped(xr[2 * H + k] + hh[b * H + k] + (B ? rb[2 * H + k] : 0.0f)));
+                        }
+                        hb[k] = (1.0f - z) * cand + z * hb[k];
+                    } else {  // LSTM, gates i o f c
+                        const float c = cb[k];
+                        const float ig = f(clipped(xr[k] + rr[k] + (pi ? pi[k] * c : 0.0f)));
+                        const float fg = f(clipped(xr[2 * H + k] + rr[2 * H + k] + (pf ? pf[k] * c : 0.0f)));
+                        const float cg = g(clipped(xr[3 * H + k] + rr[3 * H + k]));
+                        const float cn = fg * c + ig * cg;
+                        const float og = f(clipped(xr[H + k] + rr[H + k] + (po ? po[k] * cn : 0.0f)));
+                        cb[k] = cn;
+                        hb[k] = og * h(cn);
+                    }
+                }
+                std::copy_n(hb, H, Y.data() + ((t * D + d) * N + b) * H);
+            }
+        }
+        for (std::size_t b = 0; b < N; ++b) {
+            std::copy_n(hs.data() + b * H, H, Yh.data() + (batchFirst ? (b * D + d) : (d * N + b)) * H);
+            std::copy_n(cs.data() + b * H, H, Yc.data() + (batchFirst ? (b * D + d) : (d * N + b)) * H);
+        }
+    }
+    const auto T64 = static_cast<std::int64_t>(T), N64 = static_cast<std::int64_t>(N), D64 = static_cast<std::int64_t>(D), H64 = static_cast<std::int64_t>(H);
+    Tensor y = floatTensor(batchFirst ? Shape{N64, T64, D64, H64} : Shape{T64, D64, N64, H64});
+    if (batchFirst) {
+        for (std::size_t t = 0; t < T; ++t)
+            for (std::size_t d = 0; d < D; ++d)
+                for (std::size_t b = 0; b < N; ++b)
+                    std::copy_n(Y.data() + ((t * D + d) * N + b) * H, H, y.f.data() + ((b * T + t) * D + d) * H);
+    } else {
+        y.f = std::move(Y);
+    }
+    const Shape stateShape = batchFirst ? Shape{N64, D64, H64} : Shape{D64, N64, H64};
+    Outs out{y, Tensor::floats(stateShape, std::move(Yh))};
+    if (kind == 'l') out.push_back(Tensor::floats(stateShape, std::move(Yc)));
+    return out;
+}
+
 // ---- convolution ----
 
 struct ConvGeometry {
@@ -2261,6 +2427,9 @@ std::map<std::string, OpFn> buildTable() {
 
     t["MatMul"] = [](const Node&, const Ins& in, int) -> Outs { return {matMul(need(in, 0), need(in, 1))}; };
     t["Gemm"] = gemmOp;
+    t["RNN"] = [](const Node& n, const Ins& in, int) -> Outs { return recurrent(n, in, 'r'); };
+    t["GRU"] = [](const Node& n, const Ins& in, int) -> Outs { return recurrent(n, in, 'g'); };
+    t["LSTM"] = [](const Node& n, const Ins& in, int) -> Outs { return recurrent(n, in, 'l'); };
     t["Conv"] = convOp;
     t["ConvTranspose"] = convTransposeOp;
     t["MaxPool"] = [](const Node& n, const Ins& in, int) -> Outs { return poolOp(n, in, true); };

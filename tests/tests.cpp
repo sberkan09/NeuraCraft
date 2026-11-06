@@ -5003,7 +5003,7 @@ TEST(gemm_gpu_matches_reference_when_available) {
         return;
     }
     std::cout << "         (GPU: " << gpuName() << ")\n";
-    checkGemmImplementation(gemmGpu, gpuBackendName());
+    checkGemmImplementation(gemmGpu, gpuBackendName().c_str());
 }
 
 TEST(gpu_device_trains_same_as_cpu) {

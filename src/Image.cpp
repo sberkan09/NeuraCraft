@@ -812,6 +812,16 @@ void savePpm(const std::string& path, const Image& image) {
     if (!f) throw std::runtime_error("savePpm: write failed for " + path);
 }
 
+namespace {
+thread_local std::size_t decodeLimit = std::size_t(1) << 28;
+void checkDecodeSize(std::size_t w, std::size_t h, const std::string& path) {
+    if (w == 0 || h == 0) return;
+    if (w > decodeLimit / h) throw std::runtime_error(path + ": " + std::to_string(w) + " x " + std::to_string(h) + " is too big to decode");
+}
+} // namespace
+void setMaxDecodePixels(std::size_t pixels) { decodeLimit = pixels ? pixels : std::size_t(1) << 28; }
+std::size_t maxDecodePixels() { return decodeLimit; }
+
 Image loadPpm(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("loadPpm: cannot open " + path);
@@ -841,6 +851,7 @@ Image loadPpm(const std::string& path) {
     } catch (const std::exception&) {
         throw std::runtime_error("loadPpm: bad header in " + path);
     }
+    checkDecodeSize(image.width, image.height, path);
     image.pixels.resize(image.width * image.height * image.channels);
     f.read(reinterpret_cast<char*>(image.pixels.data()), static_cast<std::streamsize>(image.pixels.size()));
     if (!f) throw std::runtime_error("loadPpm: truncated " + path);
@@ -853,7 +864,8 @@ namespace {
 // Minimal inflate (RFC 1951): stored, fixed and dynamic Huffman blocks.
 class Inflater {
 public:
-    Inflater(const std::uint8_t* data, std::size_t size) : d_(data), n_(size) {}
+    // maxOut: the most bytes the stream may expand to (a "zip bomb" is refused).
+    Inflater(const std::uint8_t* data, std::size_t size, std::size_t maxOut = std::numeric_limits<std::size_t>::max()) : d_(data), n_(size), max_(maxOut) {}
 
     std::vector<std::uint8_t> run() {
         std::vector<std::uint8_t> out;
@@ -864,6 +876,7 @@ public:
                 bitPos_ = (bitPos_ + 7) & ~std::size_t(7);
                 const unsigned len = bits(16), nlen = bits(16);
                 if ((len ^ 0xFFFF) != nlen) throw std::runtime_error("loadPng: corrupt stored block");
+                if (out.size() + len > max_) throw std::runtime_error("loadPng: image data longer than the image");
                 for (unsigned i = 0; i < len; ++i) out.push_back(static_cast<std::uint8_t>(bits(8)));
             } else if (type == 1) {
                 std::array<unsigned, 288> lit{};
@@ -943,6 +956,7 @@ private:
         static const unsigned dextra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
         for (;;) {
             const unsigned sym = decode(lit);
+            if (out.size() >= max_) throw std::runtime_error("loadPng: image data longer than the image");
             if (sym < 256) {
                 out.push_back(static_cast<std::uint8_t>(sym));
             } else if (sym == 256) {
@@ -955,6 +969,7 @@ private:
                 if (di >= 30) throw std::runtime_error("loadPng: invalid distance code");
                 const std::size_t back = dbase[di] + bits(dextra[di]);
                 if (back > out.size()) throw std::runtime_error("loadPng: distance beyond the output");
+                if (out.size() + len > max_) throw std::runtime_error("loadPng: image data longer than the image");
                 const std::size_t from = out.size() - back;
                 for (unsigned i = 0; i < len; ++i) out.push_back(out[from + i]);
             }
@@ -962,7 +977,7 @@ private:
     }
 
     const std::uint8_t* d_;
-    std::size_t n_, bitPos_ = 0;
+    std::size_t n_, max_, bitPos_ = 0;
 };
 
 std::uint32_t be32(const std::vector<std::uint8_t>& d, std::size_t at) {
@@ -985,6 +1000,7 @@ Image loadPng(const std::string& path) {
         const std::string type(d.begin() + static_cast<long>(at + 4), d.begin() + static_cast<long>(at + 8));
         const std::uint8_t* body = d.data() + at + 8;
         if (type == "IHDR") {
+            if (len < 13) throw std::runtime_error("loadPng: short IHDR in " + path);
             width = be32(d, at + 8);
             height = be32(d, at + 12);
             depth = body[8];
@@ -1002,13 +1018,15 @@ Image loadPng(const std::string& path) {
         at += 12 + len;
     }
     if (width == 0 || height == 0) throw std::runtime_error("loadPng: no IHDR in " + path);
+    checkDecodeSize(width, height, path);
     if (interlace) throw std::runtime_error("loadPng: interlaced PNGs are not supported");
     const unsigned samples = colorType == 0 ? 1 : colorType == 2 ? 3 : colorType == 3 ? 1 : colorType == 4 ? 2 : colorType == 6 ? 4 : 0;
     if (!samples || (depth != 8 && depth != 16 && !((colorType == 0 || colorType == 3) && depth < 8)))
         throw std::runtime_error("loadPng: unsupported colour type / bit depth in " + path);
     if (idat.size() < 2 || (idat[0] & 0x0F) != 8) throw std::runtime_error("loadPng: bad zlib stream in " + path);
-    const std::vector<std::uint8_t> raw = Inflater(idat.data() + 2, idat.size() - 2).run();
     const std::size_t bitsPerPixel = samples * depth, stride = (width * bitsPerPixel + 7) / 8, bpp = std::max<std::size_t>(1, bitsPerPixel / 8);
+    // (a little slack past the pixel rows for encoders that pad)
+    const std::vector<std::uint8_t> raw = Inflater(idat.data() + 2, idat.size() - 2, height * (stride + 1) + 65536).run();
     if (raw.size() < height * (stride + 1)) throw std::runtime_error("loadPng: image data too short in " + path);
     // Undo the per-scanline filters.
     std::vector<std::uint8_t> px(height * stride), prev(stride, 0);

@@ -244,11 +244,24 @@ Tensor parseTensor(Reader r, const std::string& baseDir, std::string* nameOut = 
     if (nameOut) *nameOut = name;
     if (t.elemType == 8) throw std::runtime_error("onnx: string tensors are not supported (" + name + ")");
     if (external) {
-        const std::string file = (std::filesystem::path(baseDir) / ext["location"]).string();
+        // The data file must be next to the model or below it: a location is never absolute or "..".
+        const std::filesystem::path loc(ext["location"]);
+        if (loc.empty() || loc.is_absolute() || loc.has_root_name() || loc.has_root_directory() ||
+            std::any_of(loc.begin(), loc.end(), [](const std::filesystem::path& part) { return part == ".."; }))
+            throw std::runtime_error("onnx: external data location '" + loc.string() + "' of " + name + " is outside the model's folder");
+        const std::string file = (std::filesystem::path(baseDir) / loc).string();
         std::ifstream in(file, std::ios::binary);
         if (!in) throw std::runtime_error("onnx: cannot open external data " + file + " for " + name);
-        const std::size_t offset = ext.count("offset") ? std::stoull(ext["offset"]) : 0;
-        std::size_t length = ext.count("length") ? std::stoull(ext["length"]) : t.size() * elemBytes(t.elemType);
+        std::size_t offset = 0, length = 0;
+        try {
+            offset = ext.count("offset") ? std::stoull(ext["offset"]) : 0;
+            length = ext.count("length") ? std::stoull(ext["length"]) : t.size() * elemBytes(t.elemType);
+        } catch (const std::exception&) {
+            throw std::runtime_error("onnx: bad external data offset / length for " + name);
+        }
+        std::error_code ec;
+        const std::uintmax_t fileBytes = std::filesystem::file_size(file, ec);
+        if (ec || offset > fileBytes || length > fileBytes - offset) throw std::runtime_error("onnx: external data of " + name + " runs past the end of " + file);
         std::vector<std::uint8_t> buf(length);
         in.seekg(static_cast<std::streamoff>(offset));
         in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(length));

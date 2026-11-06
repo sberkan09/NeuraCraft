@@ -302,6 +302,7 @@ tokenizer.json files with other pre-tokenizers (e.g. Metaspace).
 | Image prompt (style / subject from a picture) | `--ip-adapter file --image-prompt pic` | IP-Adapter SD 1.5 | `download_ip_adapter.sh` |
 | Style / speed adapters | `--lora file[:scale]`, `--sampler lcm` | kohya / PEFT LoRA files | |
 | Depth map / 3D photo | `depth`, `parallax`, `--depth-model` | Depth Anything V2 Small | `download_depth_anything.sh` |
+| 3D model from a picture, turntables | workflow `depth_mesh`, `render`; `load` / `save` `.glb` `.obj` `.ply` | Depth Anything V2 Small | `download_depth_anything.sh` |
 | Upscale x4 | `upscale`, `video --upscale` | Real-ESRGAN compact | `download_upscaler.sh` |
 | Smoother motion | `interpolate`, `video --interpolate` | RIFE v4 | `download_rife.sh` |
 | Chains of the above | `workflow steps.json` | | `docs/workflows/` |
@@ -783,6 +784,31 @@ took 7 s including the depth map. `--depth-model` turns control pictures into
 depth maps for the depth ControlNet (`control_v11f1p_sd15_depth`), here
 redrawing the LCM fisherman as a bronze statue (4 LCM steps, 111 s).
 
+### 3D models: meshes from depth, turntables, glTF
+
+Workflows also carry 3D models (`Mesh.h`). `depth_mesh` raises a picture by its depth into a textured
+relief mesh (a grid over the picture; triangles across depth edges are left out, so the foreground
+comes away from the background), `render` draws a mesh - a still, or a turntable clip - with a small
+CPU rasterizer (z-buffer, perspective-correct texturing, a light near the camera, 2 x 2 supersampling),
+and `load` / `save` read and write glTF binary (`.glb`, with the texture embedded; valid under the
+Khronos glTF validator), Wavefront `.obj` (+ `.mtl` and the texture) and `.ply`. Meshes and clips share
+one set of names; the result cache keeps meshes too.
+
+```json
+{"steps": [
+  {"op": "load", "path": "fox.png", "out": "pic"},
+  {"op": "depth_mesh", "model": "data/depth-anything-v2-small", "in": "pic", "grid": 256, "out": "relief"},
+  {"op": "render", "in": "relief", "frames": 24, "turn": 60, "yaw": -30, "out": "turn"},
+  {"op": "save", "in": "relief", "path": "fox.glb"},
+  {"op": "save", "in": "turn", "path": "fox_turn.gif", "fps": 12}]}
+```
+
+<p><img src="docs/images/depth_mesh_view.jpg" width="256"> <img src="docs/images/depth_mesh_turn.gif" width="256"></p>
+
+On the 2-core machine the depth map and the 130,000-triangle mesh take 6.4 s, a 512 x 512 view a
+fraction of a second. The readers check every count, offset and index against the file (and are
+fuzzed: `fuzz/fuzz_mesh.cpp`), so meshes from users are safe to open.
+
 ### Image prompts: IP-Adapter
 
 ```
@@ -966,7 +992,7 @@ All written by the library itself: `.gif` (`saveGif`,
 256 colours, plays everywhere), `.png` (`saveApng`, animated PNG, full
 colour and lossless, plays in browsers), `.mov` (`saveMjpegMov`, a QuickTime
 movie of JPEG frames that QuickTime, Finder previews, VLC and ffmpeg play),
-plus `--frames-dir` for PNG frames. `savePng` filters each row and
+plus `--frames-dir` for PNG frames; 3D models as `.glb`, `.obj` and `.ply` (`saveMesh`). `savePng` filters each row and
 compresses with its own deflate (LZ77 + dynamic Huffman; a 512 x 512 frame
 goes from 787 KB to ~400 KB), and `saveJpeg` is a baseline encoder (4:2:0,
 standard tables; 39.6 dB at quality 90); `txt2img out.jpg` uses it.

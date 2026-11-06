@@ -11,7 +11,8 @@ const labels: Record<string, string> = {
   in: "Girdi", out: "Çıktı adı", path: "Dosya", dir: "Klasör", fps: "fps", quality: "Kalite", mask: "Maske", feather: "Kenar yumuşatma",
   prompts: "Promptlar", seeds: "Seed'ler", loop: "Döngü", zoom: "Yakınlaşma", keyframes: "Anahtar kare", shrink: "Küçülme",
   zoom_in: "İçeri doğru", low: "Alt eşik", high: "Üst eşik", size: "Ağ boyutu", amplitude: "Salınım", passes: "Geçiş", mode: "Mod",
-  weight: "Ağırlık", beta_schedule: "Beta planı",
+  weight: "Ağırlık", beta_schedule: "Beta planı", grid: "Izgara", depth: "Derinlik", edges: "Kenar kesme", turn: "Dönüş",
+  yaw: "Açı", pitch: "Yükseklik açısı", fov: "Görüş açısı", background: "Arka plan", lighting: "Işıklandırma",
 };
 export const fieldLabel = (name: string) => labels[name] ?? name;
 
@@ -91,6 +92,7 @@ export function FieldInput(props: {
       );
     }
     case "clip":
+    case "mesh":
       return (
         <div className="field">
           {label}

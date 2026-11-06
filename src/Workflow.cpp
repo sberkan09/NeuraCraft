@@ -2,6 +2,7 @@
 #include "Backend.h"
 #include "Onnx.h"
 #include "Depth.h"
+#include "Mesh.h"
 #include "Diffusion.h"
 #include "Interpolate.h"
 #include "Json.h"
@@ -105,6 +106,7 @@ struct Step {
     std::map<std::string, Clip>& clips;
     const StepProgress* progress = nullptr;
     const WorkflowLimits* limits = nullptr;
+    const std::map<std::string, std::shared_ptr<const Mesh>>* meshes = nullptr;
 
     bool has(const char* k) const { return v.find(k) != nullptr; }
     std::string str(const char* k, const std::string& fallback = "") const {
@@ -141,6 +143,15 @@ struct Step {
         return it->second;
     }
     const Image& image(const char* k) const { return clip(k).front(); }
+    const Mesh& mesh(const char* k) const {
+        const std::string name = need(k);
+        if (meshes) {
+            auto it = meshes->find(name);
+            if (it != meshes->end()) return *it->second;
+        }
+        throw std::invalid_argument(op + ": no 3D model named \"" + name + "\"");
+    }
+    bool isMesh(const char* k) const { return meshes && meshes->count(str(k)) != 0; }
     std::vector<std::string> strings(const char* k) const {
         std::vector<std::string> out;
         const json::Value* x = v.find(k);
@@ -227,7 +238,7 @@ std::set<std::string> modelsUsed(const Step& s) {
             out.insert(modelTag(ip));
             out.insert(modelTag(enc));
         }
-    } else if (op == "depth" || op == "parallax" || op == "upscale" || op == "interpolate" || op == "onnx") {
+    } else if (op == "depth" || op == "parallax" || op == "depth_mesh" || op == "upscale" || op == "interpolate" || op == "onnx") {
         out.insert(modelTag(s.path("model")));
     }
     return out;
@@ -307,7 +318,7 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
 std::shared_ptr<const Clip> WorkflowResultCache::find(const std::string& key) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = entries_.begin(); it != entries_.end(); ++it)
-        if (it->key == key) {
+        if (it->key == key && it->clip) {
             entries_.splice(entries_.begin(), entries_, it);
             ++hits_;
             return it->clip;
@@ -319,16 +330,36 @@ void WorkflowResultCache::put(const std::string& key, const Clip& clip) {
     std::size_t bytes = 0;
     for (const Image& im : clip) bytes += im.pixels.size();
     if (bytes > maxBytes_) return;
-    auto copy = std::make_shared<const Clip>(clip);
+    insert({key, std::make_shared<const Clip>(clip), nullptr, bytes});
+}
+
+std::shared_ptr<const Mesh> WorkflowResultCache::findMesh(const std::string& key) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = entries_.begin(); it != entries_.end(); ++it)
-        if (it->key == key) {
+        if (it->key == key && it->mesh) {
+            entries_.splice(entries_.begin(), entries_, it);
+            ++hits_;
+            return it->mesh;
+        }
+    return nullptr;
+}
+
+void WorkflowResultCache::putMesh(const std::string& key, std::shared_ptr<const Mesh> mesh) {
+    if (!mesh || mesh->bytes() > maxBytes_) return;
+    const std::size_t bytes = mesh->bytes();
+    insert({key, nullptr, std::move(mesh), bytes});
+}
+
+void WorkflowResultCache::insert(Entry entry) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = entries_.begin(); it != entries_.end(); ++it)
+        if (it->key == entry.key) {
             bytes_ -= it->bytes;
             entries_.erase(it);
             break;
         }
-    entries_.push_front({key, std::move(copy), bytes});
-    bytes_ += bytes;
+    bytes_ += entry.bytes;
+    entries_.push_front(std::move(entry));
     while (bytes_ > maxBytes_ && !entries_.empty()) {
         bytes_ -= entries_.back().bytes;
         entries_.pop_back();
@@ -402,7 +433,8 @@ std::string stepKey(const json::Value& v, const std::string& base, const std::ma
             for (const WorkflowField& g : op->fields)
                 if (g.name == k) f = &g;
         // Clips count by what made them, not by name, so renaming a clip keeps the results.
-        sig += k + "=" + (f && (f->type == "clip" || f->type == "clips") ? std::string() : json::dump(*x)) + "\n";
+        const bool named = f && (f->type == "clip" || f->type == "clips" || f->type == "mesh");
+        sig += k + "=" + (named ? std::string() : json::dump(*x)) + "\n";
         if (!f) continue;
         auto names = [&] {
             std::vector<std::string> out;
@@ -412,7 +444,7 @@ std::string stepKey(const json::Value& v, const std::string& base, const std::ma
                     if (e.isString()) out.push_back(e.string);
             return out;
         };
-        if (f->type == "clip" || f->type == "clips") {
+        if (named) {
             for (const std::string& n : names()) {
                 auto it = clipKeys.find(n);
                 sig += "  <" + (it == clipKeys.end() ? "?" + n : it->second) + "\n";
@@ -595,6 +627,13 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
     const json::Value doc = json::parse(text);
     const json::Value* steps = doc.find("steps");
     std::map<std::string, Clip> clips;
+    std::map<std::string, std::shared_ptr<const Mesh>> meshes;  // 3D models (one namespace with the clips)
+    // One view of a mesh, for the output event (previews and thumbnails).
+    auto meshPreview = [&](const Mesh& m) {
+        MeshRenderOptions ro;
+        ro.width = ro.height = 256;
+        return Clip{renderMesh(m, ro)};
+    };
 
     // Models stay loaded from the step that first needs them to the last one that does.
     const bool cache = doc.find("cache") ? doc.at("cache").boolean : true;
@@ -615,11 +654,25 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
         const std::string& stepOp = v.at("op").string;
         const std::string key = results ? stepKey(v, base, clipKeys) : std::string();
         const std::string outField = v.find("out") && v.at("out").isString() ? v.at("out").string : std::string();
-        if (results && stepOp != "save") {
+        const bool makesMesh = stepOp == "depth_mesh" || (stepOp == "load" && v.find("path") && v.at("path").isString() && isMeshFile(v.at("path").string));
+        if (results && makesMesh) {
+            if (std::shared_ptr<const Mesh> hit = results->findMesh(key)) {
+                progress.stage("cached");
+                const std::string name = outField.empty() ? stepOp : outField;
+                meshes[name] = hit;
+                clips.erase(name);
+                clipKeys[name] = key;
+                if (cache) releaseModelsExcept(index < needed.size() ? needed[index] : std::set<std::string>{});
+                if (events.output) events.output(index, stepOp, name, meshPreview(*hit), 0.0);
+                if (log) log("step " + std::to_string(index) + " " + stepOp + ": cached");
+                continue;
+            }
+        } else if (results && stepOp != "save") {
             if (std::shared_ptr<const Clip> hit = results->find(key); hit && !hit->empty()) {
                 progress.stage("cached");
                 const std::string clipName = outField.empty() ? stepOp : outField;
                 clips[clipName] = *hit;
+                meshes.erase(clipName);
                 clipKeys[clipName] = key;
                 if (cache) releaseModelsExcept(index < needed.size() ? needed[index] : std::set<std::string>{});
                 if (events.output) events.output(index, stepOp, clipName, clips[clipName], 0.0);
@@ -628,11 +681,14 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
             }
         }
         progress.stage("start");
-        Step s{v, v.at("op").string, base, clips, &progress, &limits};
+        Step s{v, v.at("op").string, base, clips, &progress, &limits, &meshes};
         const auto start = std::chrono::steady_clock::now();
         Clip out;
+        std::shared_ptr<const Mesh> made;  // a step that makes a 3D model
         const std::string& op = s.op;
-        if (op == "load") {
+        if (op == "load" && makesMesh) {
+            made = std::make_shared<const Mesh>(loadMesh(s.path("path")));
+        } else if (op == "load") {
             if (s.has("dir")) {
                 std::vector<std::string> files;
                 for (const auto& e : std::filesystem::directory_iterator(s.path("dir"))) {
@@ -647,7 +703,13 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
                 }
             } else out.push_back(toRgb(loadImage(s.path("path"))));
         } else if (op == "save") {
-            save(s, s.clip("in"));
+            if (s.isMesh("in")) {
+                const std::string path = s.path("path");
+                if (!isMeshFile(path)) throw std::invalid_argument("save: a 3D model is saved as .glb, .obj or .ply, not " + path);
+                const std::filesystem::path parent = std::filesystem::path(path).parent_path();
+                if (!parent.empty()) std::filesystem::create_directories(parent);
+                saveMesh(path, s.mesh("in"));
+            } else save(s, s.clip("in"));
         } else if (op == "resize" || op == "crop") {
             const Clip& in = s.clip("in");
             for (const Image& im : in) {
@@ -777,6 +839,35 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
                 po.loop = s.flag("loop", true);
                 out = parallaxAnimation(s.image("in"), de.estimate(s.image("in"), inputSize), po);
             }
+        } else if (op == "depth_mesh") {
+            const auto depthHold = smallModel<DepthEstimator>("depth", s.path("model"));
+            const Image& picture = s.image("in");
+            DepthMeshOptions mo;
+            mo.grid = s.size("grid", mo.grid);
+            mo.depth = static_cast<float>(s.num("depth", mo.depth));
+            mo.edges = static_cast<float>(s.num("edges", mo.edges));
+            const std::vector<float> depth = depthHold->estimate(picture, s.size("size", 518));
+            made = std::make_shared<const Mesh>(meshFromDepth(picture, depth, mo));
+        } else if (op == "render") {
+            const Mesh& m = s.mesh("in");
+            MeshRenderOptions ro;
+            ro.width = s.size("width", 512);
+            ro.height = s.size("height", 512);
+            ro.yaw = static_cast<float>(s.num("yaw", 0));
+            ro.pitch = static_cast<float>(s.num("pitch", ro.pitch));
+            ro.fov = static_cast<float>(s.num("fov", ro.fov));
+            ro.lighting = s.flag("lighting", true);
+            const std::string bg = s.str("background", "white");
+            const std::uint8_t level = bg == "black" ? 0 : bg == "grey" ? 128 : 255;
+            for (std::uint8_t& c : ro.background) c = level;
+            const std::size_t frames = std::max<std::size_t>(1, s.size("frames", 1));
+            const float turn = static_cast<float>(s.num("turn", 360));
+            for (std::size_t f = 0; f < frames; ++f) {
+                progress.frame(f, frames);
+                MeshRenderOptions view = ro;
+                view.yaw = ro.yaw + turn * static_cast<float>(f) / static_cast<float>(frames);
+                out.push_back(renderMesh(m, view));
+            }
         } else if (op == "upscale") {
             const auto up = smallModel<Upscaler>("upscaler", s.path("model"));
             const Clip& in = s.clip("in");
@@ -814,16 +905,25 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
         if (cache) releaseModelsExcept(index < needed.size() ? needed[index] : std::set<std::string>{});
         checkClip(limits, out, "step " + std::to_string(index) + " (" + op + ")");
         const std::string outName = s.str("out");
-        const std::string clipName = out.empty() ? std::string() : (outName.empty() ? op : outName);
-        if (!out.empty()) {
-            if (results) results->put(key, out);
+        const std::string clipName = out.empty() && !made ? std::string() : (outName.empty() ? op : outName);
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (made) {
+            if (results) results->putMesh(key, made);
             clipKeys[clipName] = key;
-            clips[clipName] = std::move(out);
-        }
-        if (events.output) {
-            static const Clip none;
-            events.output(index, op, clipName, clipName.empty() ? none : clips[clipName],
-                          std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+            clips.erase(clipName);
+            meshes[clipName] = made;
+            if (events.output) events.output(index, op, clipName, meshPreview(*made), seconds);
+        } else {
+            if (!out.empty()) {
+                if (results) results->put(key, out);
+                clipKeys[clipName] = key;
+                meshes.erase(clipName);
+                clips[clipName] = std::move(out);
+            }
+            if (events.output) {
+                static const Clip none;
+                events.output(index, op, clipName, clipName.empty() ? none : clips[clipName], seconds);
+            }
         }
         if (log) {
             std::ostringstream line;

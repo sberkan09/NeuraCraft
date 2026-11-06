@@ -13,7 +13,8 @@ export interface StepUi {
 let counter = 0;
 const newId = () => `n${Date.now().toString(36)}${(counter++).toString(36)}`;
 
-export const clipFields = (op?: WorkflowOp) => (op ? op.fields.filter((f) => f.type === "clip" || f.type === "clips") : []);
+// Fields that read what another step made: clips, and 3D models (meshes share the clips' names).
+export const clipFields = (op?: WorkflowOp) => (op ? op.fields.filter((f) => f.type === "clip" || f.type === "clips" || f.type === "mesh") : []);
 export const outName = (s: Step) => String(s.out ?? s.op);
 
 // References of step i: [field, clip name, producer index].

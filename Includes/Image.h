@@ -183,6 +183,9 @@ std::vector<std::uint8_t> deflateCompress(const std::vector<std::uint8_t>& data)
 // with its own inflate; interlaced files are refused. Returns the stored
 // channels (1, 2 -> grey kept, 3 or 4); use toRgb() for 3 channels.
 Image loadPng(const std::string& path);
+// The same from bytes in memory (name: for messages), and a PNG file's bytes.
+Image decodePng(const std::vector<std::uint8_t>& data, const std::string& name = "PNG data");
+std::vector<std::uint8_t> encodePng(const Image& image);
 
 // The largest picture (width x height) the readers decode: a bigger file is refused before anything
 // is allocated for it. Per thread; the default is 2^28 pixels.

@@ -43,6 +43,7 @@ add_library(neuracraft_lib STATIC
     src/Lora.cpp
     src/Loss.cpp
     src/Matrix.cpp
+    src/Mesh.cpp
     src/ModelCache.cpp
     src/Network.cpp
     src/Optimizer.cpp
@@ -117,7 +118,7 @@ if(NEURACRAFT_FUZZ)
     endif()
     target_compile_options(neuracraft_lib PUBLIC -fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=undefined -g)
     target_link_options(neuracraft_lib PUBLIC -fsanitize=address,undefined)
-    foreach(target json workflow png safetensors onnx tensorproto)
+    foreach(target json workflow png safetensors onnx tensorproto mesh)
         add_executable(fuzz_${target} fuzz/fuzz_${target}.cpp)
         target_link_libraries(fuzz_${target} PRIVATE neuracraft_lib)
         target_link_options(fuzz_${target} PRIVATE -fsanitize=fuzzer)

@@ -363,6 +363,66 @@ struct Model::Impl {
     std::unordered_map<std::string, std::size_t> lastUse;  // value -> index of the last node reading it
 };
 
+namespace {
+// A Conv whose output only feeds one Relu / LeakyRelu / Clip (and is not a graph output) takes the
+// activation over: it is applied in the convolution's last pass and the node goes.
+void fuseActivations(Model::Impl& m) {
+    std::unordered_map<std::string, std::vector<std::size_t>> readers;
+    for (std::size_t k = 0; k < m.nodes.size(); ++k)
+        for (const std::string& in : m.nodes[k].inputs)
+            if (!in.empty()) readers[in].push_back(k);
+    std::set<std::string> outputs;
+    for (const ValueInfo& o : m.outputs) outputs.insert(o.name);
+    std::vector<bool> drop(m.nodes.size(), false);
+    auto constant = [&](const std::string& name, float& v) {
+        if (name.empty()) return true;
+        auto it = m.initializers.find(name);
+        if (it == m.initializers.end() || it->second->size() != 1) return false;
+        v = it->second->kind == Tensor::Kind::Float ? it->second->f[0] : static_cast<float>(it->second->i[0]);
+        return true;
+    };
+    for (std::size_t k = 0; k < m.nodes.size(); ++k) {
+        Node& conv = m.nodes[k];
+        if (conv.key() != "Conv" || conv.outputs.size() != 1 || outputs.count(conv.outputs[0])) continue;
+        const auto& rd = readers[conv.outputs[0]];
+        if (rd.size() != 1) continue;
+        Node& act = m.nodes[rd[0]];
+        if (act.inputs.empty() || act.inputs[0] != conv.outputs[0] || act.outputs.size() != 1) continue;
+        auto set = [&](const char* name, float v) {
+            Attribute a;
+            a.name = name;
+            a.f = v;
+            a.has = true;
+            conv.attrs[name] = a;
+        };
+        if (act.key() == "Relu") {
+        } else if (act.key() == "LeakyRelu") {
+            set("_alpha", act.f("alpha", 0.01f));
+        } else if (act.key() == "Clip") {
+            float lo = -std::numeric_limits<float>::infinity(), hi = std::numeric_limits<float>::infinity();
+            if (const Attribute* a = act.attr("min")) lo = a->f;
+            if (const Attribute* a = act.attr("max")) hi = a->f;
+            if (!constant(act.inputs.size() > 1 ? act.inputs[1] : "", lo) || !constant(act.inputs.size() > 2 ? act.inputs[2] : "", hi)) continue;
+            set("_min", lo);
+            set("_max", hi);
+        } else {
+            continue;
+        }
+        Attribute a;
+        a.name = "_activation";
+        a.s = act.key();
+        a.has = true;
+        conv.attrs["_activation"] = a;
+        conv.outputs[0] = act.outputs[0];
+        drop[rd[0]] = true;
+    }
+    std::vector<Node> kept;
+    for (std::size_t k = 0; k < m.nodes.size(); ++k)
+        if (!drop[k]) kept.push_back(std::move(m.nodes[k]));
+    m.nodes = std::move(kept);
+}
+} // namespace
+
 Model::Model() : impl_(std::make_unique<Impl>()) {}
 Model::Model(Model&&) noexcept = default;
 Model& Model::operator=(Model&&) noexcept = default;
@@ -445,6 +505,7 @@ Model Model::load(const std::string& path) {
         }
     }
     if (!haveGraph) throw std::runtime_error("onnx: " + path + " has no graph");
+    fuseActivations(m);
     for (ValueInfo& v : declaredInputs)
         if (!m.initializers.count(v.name)) m.inputs.push_back(std::move(v));
     // Every operator must be one we run; nodes are in topological order (the ONNX rule).

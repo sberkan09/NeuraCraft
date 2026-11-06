@@ -146,6 +146,15 @@ case("tiny_net", [
     {"x": img}, inits=[("w1", f32(4, 3, 3, 3)), ("b1", f32(4)), ("s1", f32(4)), ("o1", f32(4)), ("shp", np.array([1, 4, 64], np.int64)),
                        ("wq", f32(4, 4)), ("ax", np.array([1], np.int64))], opset=18)
 
+# convolution + activation (fused by the executor)
+case("conv_leakyrelu_fused", [n("Conv", ["x", "w", "b"], ["c"], pads=[1, 1, 1, 1]), n("LeakyRelu", ["c"], ["y"], alpha=0.2)], {"x": f32(1, 16, 9, 7)},
+     inits=[("w", f32(8, 16, 3, 3)), ("b", f32(8))])
+case("conv_clip_relu_fused", [n("Conv", ["x", "w"], ["c"], pads=[2, 2, 2, 2], dilations=[2, 2]), n("Clip", ["c", "lo", "hi"], ["d"]),
+                              n("Conv", ["d", "w2", "b2"], ["e"], pads=[1, 1, 1, 1]), n("Relu", ["e"], ["y"])], {"x": f32(1, 20, 6, 8)},
+     inits=[("w", f32(18, 20, 3, 3)), ("lo", np.array(-0.2, np.float32)), ("hi", np.array(0.3, np.float32)), ("w2", f32(5, 18, 3, 3)), ("b2", f32(5))])
+case("conv_shared_output_not_fused", [n("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1]), n("Relu", ["c"], ["r"]), n("Add", ["c", "r"], ["y"])],
+     {"x": f32(1, 16, 5, 5)}, inits=[("w", f32(4, 16, 3, 3))])
+
 # quantised operators
 u8 = lambda *s: rng.integers(0, 256, s).astype(np.uint8)
 i8 = lambda *s: rng.integers(-128, 128, s).astype(np.int8)

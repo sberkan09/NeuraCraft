@@ -60,6 +60,8 @@ private:
     Matrix stripConvolution(const Matrix& input, const float* weights, bool outByPatch) const;
     // Stride-1 convolutions without im2col: k*k GEMMs on shifted views of a padded copy of the image.
     Matrix shiftedConvolution(const Matrix& input, const float* weights, bool outByPatch) const;
+    // Stride 1, 16+ channels, blocked CPU kernel: taps read in place from a padded channels-last copy.
+    Matrix directConvolution(const Matrix& input, const float* weights, bool outByPatch) const;
     Matrix forwardQuantized(const Matrix& input) const;
     QuantizedWeights quantized_;
 

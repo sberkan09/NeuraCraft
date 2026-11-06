@@ -581,11 +581,14 @@ correlate 0.9996 on a photo, each within about 2 % of the float model); the
 fp16 exports are computed in float, so they come out slightly more precise.
 
 Speed on the 2-core CPU, against onnxruntime 1.29: Real-ESRGAN 128 -> 512
-7.5 s vs 4.4 s, Depth Anything 266 x 350 0.8 s vs 0.3 s, u2netp 0.8 s vs 0.4 s.
-Convolutions write their im2col rows straight in the GEMM kernel's packed
-layout and multiply pixels by output channels, the long side first; built with
-`NEURACRAFT_NATIVE` on an AVX-512 CPU the kernel uses a 12 x 32 tile (a 1024³
-product: 150 -> 257 GFLOPS). `NEURACRAFT_ONNX_PROFILE=1` prints the time per
+5.7 s vs 4.4-5.1 s, Depth Anything 266 x 350 0.8 s vs 0.3-0.4 s, u2netp 0.8 s
+vs 0.5 s. Stride-1 convolutions copy their input once, padded and
+channels-last, and multiply with every tap read in place (an "indirect" GEMM,
+no im2col); strided ones write their im2col rows straight in the GEMM kernel's
+packed layout. A `Relu`, `LeakyRelu` or `Clip` that only reads a convolution's
+output is folded into it at load. Built with `NEURACRAFT_NATIVE` on an AVX-512
+CPU the GEMM kernel uses a 12 x 32 tile (a 1024³ product: 150 -> 257 GFLOPS).
+`NEURACRAFT_ONNX_PROFILE=1` prints the time per
 operator type. Control flow (`If` / `Loop`) and strings are not supported:
 such a model fails to load with the operator and node named.
 

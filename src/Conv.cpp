@@ -191,8 +191,59 @@ Matrix Conv2D::shiftedConvolution(const Matrix& input, const float* weights, boo
     return out;
 }
 
+Matrix Conv2D::directConvolution(const Matrix& input, const float* weights, bool outByPatch) const {
+    // The image copied once, padded and channels-last; output pixel p on a grid as wide as the
+    // padded image then finds tap (c, ky, kx) at p * C + (ky * Wp + kx) * C + c, so the product reads
+    // the taps in place (gemmIndirectA) instead of from im2col columns. The last k - 1 columns of
+    // each output row are dropped.
+    const std::size_t B = input.rows(), C = in_.channels, H = in_.height, W = in_.width, k = kernel_, kk = k * k, patch = C * kk;
+    const std::size_t Hp = H + 2 * padding_, Wp = W + 2 * padding_, P = outH_ * outW_, R = gemmPanelRows();
+    const std::size_t rows = (outH_ - 1) * Wp + outW_;
+    std::vector<std::int64_t> offs(patch);
+    for (std::size_t c = 0, q = 0; c < C; ++c)
+        for (std::size_t ky = 0; ky < k; ++ky)
+            for (std::size_t kx = 0; kx < k; ++kx) offs[q++] = static_cast<std::int64_t>((ky * Wp + kx) * C + c);
+    Matrix out(B, outChannels_ * P);
+    std::vector<float> xp((Hp * Wp + R + 1) * C), tmp(rows * outChannels_);
+    for (std::size_t b = 0; b < B; ++b) {
+        const float* img = input.data() + b * input.cols();
+        std::fill(xp.begin(), xp.end(), 0.0f);
+        parallelFor(0, H, 1, [&](std::size_t y0, std::size_t y1) {
+            for (std::size_t y = y0; y < y1; ++y) {
+                float* d = xp.data() + ((y + padding_) * Wp + padding_) * C;
+                for (std::size_t c = 0; c < C; ++c) {
+                    const float* src = img + (c * H + y) * W;
+                    for (std::size_t x = 0; x < W; ++x) d[x * C + c] = src[x];
+                }
+            }
+        });
+        // weights: patch x outC (outByPatch false) or outC x patch
+        gemmIndirectA(rows, outChannels_, patch, xp.data(), C, offs.data(), outByPatch, weights, outByPatch ? patch : outChannels_, tmp.data(),
+                      outChannels_);
+        float* dst = out.data() + b * out.cols();
+        parallelFor(0, outChannels_, 4, [&](std::size_t o0, std::size_t o1) {
+            for (std::size_t o = o0; o < o1; ++o) {
+                const float bias = bias_(0, o);
+                for (std::size_t y = 0; y < outH_; ++y) {
+                    float* d = dst + o * P + y * outW_;
+                    const float* src = tmp.data() + (y * Wp) * outChannels_ + o;
+                    for (std::size_t x = 0; x < outW_; ++x) d[x] = src[x * outChannels_] + bias;
+                }
+            }
+        });
+        (void)kk;
+    }
+    return out;
+}
+
 Matrix Conv2D::stripConvolution(const Matrix& input, const float* weights, bool outByPatch) const {
     if (weights != nullptr && stride_ == 1 && kernel_ > 1 && shiftedConvolutions()) return shiftedConvolution(input, weights, outByPatch);
+    static const bool direct = [] {  // NEURACRAFT_DIRECT_CONV=0 goes back to im2col strips
+        const char* e = std::getenv("NEURACRAFT_DIRECT_CONV");
+        return !(e && e[0] == '0');
+    }();
+    if (direct && weights != nullptr && stride_ == 1 && kernel_ > 1 && in_.channels >= 16 && gemmPackedAvailable())
+        return directConvolution(input, weights, outByPatch);
     const std::size_t B = input.rows(), P = outH_ * outW_, C = in_.channels, H = in_.height, W = in_.width;
     const std::size_t patch = C * kernel_ * kernel_;
     Matrix out(B, outChannels_ * P);

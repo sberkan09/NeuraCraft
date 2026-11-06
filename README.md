@@ -997,23 +997,28 @@ least recently used first; `NEURACRAFT_CUDA_WEIGHTS_GB` sets the budget) instead
 for every product, and their copies go as soon as the host memory holding them is freed. On a CUDA
 GPU the image models keep float weights rather than int8 (`NEURACRAFT_GPU_INT8=1` keeps int8),
 since resident float weights on cuBLAS beat expanding int8 ones on every call.
-`scripts/gpu_check.sh` builds, runs the tests on the GPU and compares SD-Turbo with the CPU;
-`scripts/gpu_pod.sh` runs it on a rented GPU machine on every push to a branch.
+A UNet step and a VAE encode or decode run as one device pass ("gpu graphs"): the activations stay
+in device memory from the first layer to the last, with group norms (SiLU fused), layer norms, GEGLU,
+token transposes, upsampling, residual adds and attention as device kernels around the cuBLAS
+products, so only the latent goes up and the result comes back. Int8 layers and layers without a
+device version fall back to the layer-by-layer path; `NEURACRAFT_GPU_GRAPH=0` turns the passes off.
+`scripts/gpu_check.sh` builds, runs the tests on the GPU and compares SD-Turbo with the CPU (and
+with the layer-by-layer GPU path); `scripts/gpu_pod.sh` runs it on a rented GPU machine on every
+push to a branch.
 
-On an RTX 4090 (8 vCPUs; SD-Turbo 512 x 512, one step, against the same machine's CPU):
+SD-Turbo 512 x 512, one step, against the same machine's CPU:
 
-| | CPU | GPU (CUDA) |
-|---|---|---|
-| GEMM 2048 x 2048 (copies included) | 150 GFLOPS | 1050 GFLOPS |
-| attention, 4096 tokens x 320, 8 heads | 630 ms | 5 ms |
-| UNet step | 9.6 s | 1.2 s |
-| VAE decode | 29 s | 5.5 s |
-| whole run (loading included) | 48 s | 15 s |
+| | CPU | GPU, layer by layer | GPU, whole passes |
+|---|---|---|---|
+| UNet step (RTX 3090, 32 vCPUs) | 9.5 s | 2.4 s | 0.6 s |
+| VAE decode (RTX 3090) | 20.2 s | 6.5 s | 0.4 s |
+| whole run, loading included (RTX 3090) | 44 s | 19 s | 11 s |
+| GEMM 2048 x 2048, copies included (RTX 4090, 8 vCPUs) | 150 GFLOPS | 1050 GFLOPS | |
+| attention, 4096 tokens x 320, 8 heads (RTX 4090) | 630 ms | 5 ms | |
 
-All 121 tests pass on the GPU; its picture matches the CPU's float32 one at 68.5 dB PSNR (exact
-FP32) and 55 dB (TF32). What remains on the CPU between GPU products - group norms, activations,
-the copies in and out - is now most of the time, so the next step is keeping whole UNet and VAE
-passes on the device.
+All tests pass on the GPU; its picture matches the CPU's float32 one at 68.5 dB PSNR (exact FP32)
+and 55 dB (TF32). Most of a single-picture run is now reading the weights from disk (about 5 s of
+the 11).
 
 `scripts/mac_benchmark.sh` times SD-Turbo on the CPU and the GPU (int8 and
 float32) and a short animation, pausing between runs so a laptop stays

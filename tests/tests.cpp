@@ -2415,6 +2415,13 @@ TEST(unet_loader_builds_and_conditions_on_text_and_time) {
     CHECK(unet.forward(z, 999.0f, ctxA).approxEquals(a, 0.0f));      // deterministic
     CHECK(!unet.forward(z, 999.0f, ctxB).approxEquals(a, 1e-4f));    // the text matters (cross-attention)
     CHECK(!unet.forward(z, 10.0f, ctxA).approxEquals(a, 1e-4f));     // the timestep matters
+    {
+        std::vector<UNetCondition> conds(2);  // a batch is one forward() per condition
+        conds[0].context = &ctxA;
+        conds[1].context = &ctxB;
+        const std::vector<Matrix> both = unet.forwardBatch(z, 999.0f, conds);
+        CHECK(both.size() == 2 && both[0].approxEquals(a, 1e-6f) && both[1].approxEquals(unet.forward(z, 999.0f, ctxB), 1e-6f));
+    }
     UNet2DCondition q = loadUNet(dir, 4, 6, true);                    // int8 weights stay close to float
     double scale = 0;
     for (std::size_t i = 0; i < a.size(); ++i) scale = std::max(scale, static_cast<double>(std::fabs(a.data()[i])));
@@ -5209,6 +5216,25 @@ TEST(gpu_graphs_match_layer_by_layer_passes) {
     CHECK(close(decGpu, decCpu));
     CHECK(close(epsGpu, epsCpu));
     CHECK(close(epsAgain, epsCpu));
+
+    // Batches: two conditions (classifier-free guidance) and frames, against the CPU.
+    const Matrix neg = Matrix::uniform(5, 6, -1, 1), frames = Matrix::uniform(3, 4 * 6 * 4, -1, 1);
+    std::vector<UNetCondition> conds(2);
+    conds[0].context = &ctx;
+    conds[1].context = &neg;
+    const Matrix negCpu = unet.forward(z, 500.0f, neg);
+    const Matrix framesCpu = unet.forwardFrames(frames, 500.0f, std::vector<Matrix>{ctx, neg, ctx});
+    setDevice(Device::GPU);
+    std::vector<Matrix> both;
+    Matrix framesGpu;
+    {
+        GpuWeightScope scope;
+        both = unet.forwardBatch(z, 500.0f, conds);
+        framesGpu = unet.forwardFrames(frames, 500.0f, std::vector<Matrix>{ctx, neg, ctx});
+    }
+    setDevice(Device::CPU);
+    CHECK(both.size() == 2 && close(both[0], epsCpu) && close(both[1], negCpu));
+    CHECK(close(framesGpu, framesCpu));
 }
 
 TEST(gpu_resident_weights_follow_their_memory) {

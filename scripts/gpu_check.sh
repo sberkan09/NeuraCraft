@@ -31,6 +31,11 @@ for dev in gpu gpu32 layers cpu; do  # layers: the GPU without device graphs (la
     echo "$dev: $(echo "$(date +%s.%N) - $s" | bc 2>/dev/null || python3 -c "print(round($(date +%s.%N)-$s,2))") s"
     grep -iE "load unet|step [0-9]|vae decode|wrote" /tmp/sd_$dev.log | tail -4
 done
+echo "--- steps: 4 unguided, 4 guided (the guided pair runs as one batch) ---"
+for g in 0 5; do
+    $NC --gpu txt2img $M "a red fox in the snow, photo" /tmp/fox_g$g.png --steps 4 --seed 7 --size 512 --guidance $g > /tmp/sd_g$g.log 2>&1 || tail -5 /tmp/sd_g$g.log
+    echo "guidance $g: $(grep -E 'step [0-9]' /tmp/sd_g$g.log | sed 's/^ *//' | tr '\n' ' ')"
+done
 echo "--- profile (gpu) ---"
 sed -n '/rofile/,$p' /tmp/sd_gpu.log | head -25
 python3 - <<'PY'

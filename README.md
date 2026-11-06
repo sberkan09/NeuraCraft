@@ -981,6 +981,39 @@ All matrix products in the library go through one `gemm()` dispatcher
 | NeuraCraft blocked kernel | default CPU path on Linux / Windows | packed, register-tiled SIMD kernel (SSE/AVX/NEON via vector extensions), multi-threaded; results don't depend on the thread count |
 | Apple Accelerate | default CPU path on macOS | uses the AMX matrix units on Apple silicon |
 | Metal | `setDevice(Device::GPU)` / `--gpu` on Apple silicon | simdgroup-matrix kernel on M1 and later, tiled fallback elsewhere; shaders compile at runtime (no full Xcode needed) |
+| CUDA | `-DNEURACRAFT_USE_CUDA=ON`, then `setDevice(Device::GPU)` / `--gpu` on NVIDIA GPUs | cuBLAS GEMMs (TF32 tensor cores on Ampere and later; `NEURACRAFT_CUDA_TF32=0` for exact FP32), whole convolutions on the device, attention as strided-batched GEMMs around a softmax kernel, int8 weights expanded on the device |
+
+### CUDA
+
+```
+cmake -S . -B build-cuda -DNEURACRAFT_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86   # 86: RTX 30xx, 89: RTX 40xx, ...
+cmake --build build-cuda -j
+bin/NeuraCraft --gpu txt2img data/sd-turbo "a red fox in the snow, photo"
+```
+
+The CUDA toolkit (12.x) provides `nvcc` and cuBLAS. Inference commands and workflows open a
+`GpuWeightScope`: layer weights are uploaded once and stay in device memory (up to 60 % of it,
+least recently used first; `NEURACRAFT_CUDA_WEIGHTS_GB` sets the budget) instead of being copied
+for every product, and their copies go as soon as the host memory holding them is freed. On a CUDA
+GPU the image models keep float weights rather than int8 (`NEURACRAFT_GPU_INT8=1` keeps int8),
+since resident float weights on cuBLAS beat expanding int8 ones on every call.
+`scripts/gpu_check.sh` builds, runs the tests on the GPU and compares SD-Turbo with the CPU;
+`scripts/gpu_pod.sh` runs it on a rented GPU machine on every push to a branch.
+
+On an RTX 4090 (8 vCPUs; SD-Turbo 512 x 512, one step, against the same machine's CPU):
+
+| | CPU | GPU (CUDA) |
+|---|---|---|
+| GEMM 2048 x 2048 (copies included) | 150 GFLOPS | 1050 GFLOPS |
+| attention, 4096 tokens x 320, 8 heads | 630 ms | 5 ms |
+| UNet step | 9.6 s | 1.2 s |
+| VAE decode | 29 s | 5.5 s |
+| whole run (loading included) | 48 s | 15 s |
+
+All 121 tests pass on the GPU; its picture matches the CPU's float32 one at 68.5 dB PSNR (exact
+FP32) and 55 dB (TF32). What remains on the CPU between GPU products - group norms, activations,
+the copies in and out - is now most of the time, so the next step is keeping whole UNet and VAE
+passes on the device.
 
 `scripts/mac_benchmark.sh` times SD-Turbo on the CPU and the GPU (int8 and
 float32) and a short animation, pausing between runs so a laptop stays

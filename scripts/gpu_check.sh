@@ -37,6 +37,4 @@ for name in ["gpu", "gpu32"]:
     a = np.asarray(Image.open("/tmp/fox_%s.png" % name).convert("RGB")).astype(np.float64)
     mse = ((a - b) ** 2).mean()
     print("%s vs cpu: mean abs %.3f, PSNR %.1f dB" % (name, np.abs(a - b).mean(), 10 * np.log10(255 ** 2 / max(mse, 1e-9))))
-buf = io.BytesIO(); Image.open("/tmp/fox_gpu.png").convert("RGB").resize((128, 128)).save(buf, "JPEG", quality=80)
-print("thumb:" + base64.b64encode(buf.getvalue()).decode())
 PY

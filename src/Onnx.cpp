@@ -403,11 +403,66 @@ struct Model::Impl {
 namespace {
 // A Conv whose output only feeds one Relu / LeakyRelu / Clip (and is not a graph output) takes the
 // activation over: it is applied in the convolution's last pass and the node goes.
-void fuseActivations(Graph& m) {
+// Every value name read anywhere inside a node's subgraphs (a superset of what they read from outside).
+void subgraphReads(const Node& n, std::set<std::string>& names) {
+    for (const auto& [_, a] : n.attrs)
+        if (a.g)
+            for (const Node& inner : a.g->nodes) {
+                names.insert(inner.inputs.begin(), inner.inputs.end());
+                for (const ValueInfo& o : a.g->outputs) names.insert(o.name);
+                subgraphReads(inner, names);
+            }
+}
+
+std::unordered_map<std::string, std::vector<std::size_t>> readersOf(const Graph& m) {
     std::unordered_map<std::string, std::vector<std::size_t>> readers;
-    for (std::size_t k = 0; k < m.nodes.size(); ++k)
-        for (const std::string& in : m.nodes[k].inputs)
+    for (std::size_t k = 0; k < m.nodes.size(); ++k) {
+        std::set<std::string> names(m.nodes[k].inputs.begin(), m.nodes[k].inputs.end());
+        subgraphReads(m.nodes[k], names);
+        for (const std::string& in : names)
             if (!in.empty()) readers[in].push_back(k);
+    }
+    return readers;
+}
+
+// A Concat along the channels whose output only feeds one Conv (as its input) is not run: the Conv
+// gets the pieces - inputs [piece 0, W, B, piece 1, ...] with "_concat" = the piece count - and reads
+// them where they are, so the concatenated copy is never made.
+void fuseConcats(Graph& m) {
+    auto readers = readersOf(m);
+    std::set<std::string> outputs;
+    for (const ValueInfo& o : m.outputs) outputs.insert(o.name);
+    std::unordered_map<std::string, std::size_t> producer;
+    for (std::size_t k = 0; k < m.nodes.size(); ++k)
+        for (const std::string& o : m.nodes[k].outputs) producer[o] = k;
+    std::vector<bool> drop(m.nodes.size(), false);
+    for (std::size_t k = 0; k < m.nodes.size(); ++k) {
+        Node& conv = m.nodes[k];
+        if (conv.key() != "Conv" || conv.inputs.size() < 2 || conv.attr("_concat")) continue;
+        auto pit = producer.find(conv.inputs[0]);
+        if (pit == producer.end()) continue;
+        const Node& cat = m.nodes[pit->second];
+        if (cat.key() != "Concat" || cat.i("axis", 0) != 1 || cat.outputs.size() != 1 || cat.inputs.size() < 2 || outputs.count(cat.outputs[0])) continue;
+        if (readers[cat.outputs[0]].size() != 1 || std::count(conv.inputs.begin(), conv.inputs.end(), cat.outputs[0]) != 1) continue;
+        if (std::any_of(cat.inputs.begin(), cat.inputs.end(), [](const std::string& s) { return s.empty(); })) continue;
+        std::vector<std::string> ins{cat.inputs[0], conv.inputs[1], conv.inputs.size() > 2 ? conv.inputs[2] : ""};
+        ins.insert(ins.end(), cat.inputs.begin() + 1, cat.inputs.end());
+        conv.inputs = std::move(ins);
+        Attribute a;
+        a.name = "_concat";
+        a.i = static_cast<std::int64_t>(cat.inputs.size());
+        a.has = true;
+        conv.attrs["_concat"] = a;
+        drop[pit->second] = true;
+    }
+    std::vector<Node> kept;
+    for (std::size_t k = 0; k < m.nodes.size(); ++k)
+        if (!drop[k]) kept.push_back(std::move(m.nodes[k]));
+    m.nodes = std::move(kept);
+}
+
+void fuseActivations(Graph& m) {
+    auto readers = readersOf(m);
     std::set<std::string> outputs;
     for (const ValueInfo& o : m.outputs) outputs.insert(o.name);
     std::vector<bool> drop(m.nodes.size(), false);
@@ -502,7 +557,12 @@ bool controlFlow(const std::string& key) { return key == "If" || key == "Loop" |
 // graphs around it and when each value is read for the last time (a node with subgraphs reads what
 // they read from outside).
 void prepare(Graph& g, const std::string& path) {
+    static const bool fuseCat = [] {
+        const char* e = std::getenv("NEURACRAFT_ONNX_FUSE_CONCAT");
+        return !e || std::string(e) != "0";
+    }();
     fuseActivations(g);
+    if (fuseCat) fuseConcats(g);
     const auto& ops = operatorTable();
     std::set<std::string> local;
     for (const ValueInfo& v : g.inputs) local.insert(v.name);

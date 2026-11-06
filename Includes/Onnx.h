@@ -10,14 +10,15 @@
 // run image models with the "onnx" step, whose pre- and post-processing come from a manifest next
 // to the model (OnnxPipeline below).
 //
-// Supported: opsets 7-21 of the default domain for about 110 operators (elementwise maths and
-// activations, MatMul / Gemm / Conv / ConvTranspose on the library's GEMM, pooling, Resize, the
+// Supported: opsets 7-21 of the default domain for about 115 operators (elementwise maths and
+// activations, MatMul / Gemm / Conv / ConvTranspose / LSTM / GRU / RNN on the library's GEMM, pooling, Resize, the
 // normalisations, Softmax, shape operators, reductions, comparisons, Where, Einsum's common forms),
 // float / float16 / bfloat16 / double values (computed in float) and integer / bool tensors, and the
 // quantised operators (QuantizeLinear / DequantizeLinear, DynamicQuantizeLinear, MatMulInteger,
 // ConvInteger, QLinearMatMul, QLinearConv; com.microsoft MatMulNBits and MatMulBnb4 for 4-bit
-// weights). Not supported: control flow (If / Loop / Scan), sequences and strings - a model using
-// one fails to load with the operator and node named. tests/onnx/make_cases.py writes the operator
+// weights), and control flow: If, Loop and Scan, whose subgraphs may read the values of the graphs
+// around them. Not supported: sequences and strings - a model using one fails to load with the
+// operator and node named. tests/onnx/make_cases.py writes the operator
 // cases the tests compare with onnxruntime; mobilenet v2, u2netp, Depth Anything v2 small (float,
 // q4, bnb4) and Real-ESRGAN x4plus match it to about 1e-6.
 

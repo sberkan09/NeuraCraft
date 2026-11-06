@@ -44,9 +44,15 @@ public:
     // Converted to float. Shape: 1-D -> 1 x n; otherwise all leading dimensions
     // are flattened into rows and the last dimension becomes the columns.
     Matrix load(const std::string& name) const;
+    // load(name) seen as rows x cols (rows * cols elements), transposed: cols x rows. Converts and
+    // transposes in one pass, without a float copy in storage order (PyTorch weights -> ours).
+    Matrix loadTransposed(const std::string& name, std::size_t rows, std::size_t cols) const;
 
 private:
     SafeTensors() = default;
+    const Tensor& loadable(const std::string& name) const;
+    // Bytes [from, from + bytes) of a tensor's data, read in parallel chunks.
+    void readBytes(const Tensor& t, std::size_t from, std::size_t bytes, void* dst, const std::string& name) const;
     std::string path_;
     std::size_t dataStart_ = 0;
     std::size_t fileSize_ = 0;

@@ -1286,6 +1286,33 @@ TEST(safetensors_roundtrip_and_half_precision) {
     CHECK_NEAR(h(0, 3), 5.9604645e-8, 1e-12);
     CHECK_NEAR(g(0, 0), 1.0, 0);
     CHECK_NEAR(g(0, 1), 3.140625, 0);
+
+    // Every half there is: the bulk conversion must agree with the definition bit for bit.
+    {
+        const std::string all = R"({"all":{"dtype":"F16","shape":[65536],"data_offsets":[0,131072]}})";
+        std::ofstream out(path, std::ios::binary);
+        const std::uint64_t n = all.size();
+        for (int i = 0; i < 8; ++i) out.put(static_cast<char>((n >> (8 * i)) & 0xFF));
+        out << all;
+        for (std::uint32_t v = 0; v < 65536; ++v) {
+            const std::uint16_t h = static_cast<std::uint16_t>(v);
+            out.write(reinterpret_cast<const char*>(&h), 2);
+        }
+    }
+    const Matrix every = SafeTensors(path).load("all");
+    std::size_t wrong = 0;
+    for (std::uint32_t v = 0; v < 65536; ++v) {
+        const int e = static_cast<int>((v >> 10) & 0x1F), m = static_cast<int>(v & 0x3FF);
+        const double sign = (v & 0x8000) ? -1.0 : 1.0;
+        const float got = every(0, v);
+        if (e == 0x1F) {
+            if (m == 0 ? !(std::isinf(got) && (got < 0) == (sign < 0)) : !std::isnan(got)) ++wrong;
+            continue;
+        }
+        const double want = sign * (e == 0 ? std::ldexp(m, -24) : std::ldexp(1024 + m, e - 25));
+        if (static_cast<double>(got) != want || std::signbit(got) != (sign < 0)) ++wrong;
+    }
+    CHECK(wrong == 0);
     std::remove(path.c_str());
 }
 

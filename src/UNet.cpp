@@ -146,10 +146,18 @@ struct Weights {
                                      std::to_string(rows * cols));
         return Matrix(rows, cols, std::move(m.values()));
     }
+    // take(name, rows, cols).transpose(), in one pass when no LoRA has to see the weight first.
+    Matrix takeTransposed(const std::string& name, std::size_t rows, std::size_t cols) {
+        if (lora) return take(name, rows, cols).transpose();
+        if (st.info(name).elements() != rows * cols)
+            throw std::runtime_error("loadUNet: " + name + " in " + file + " has " + std::to_string(st.info(name).elements()) +
+                                     " values, expected " + std::to_string(rows * cols));
+        return st.loadTransposed(name, rows, cols);
+    }
     bool has(const std::string& name) const { return st.has(name); }
     void conv(Conv2D& c, const std::string& p) {
         const std::size_t out = c.outputShape().channels, patch = c.inputShape().channels * c.kernelSize() * c.kernelSize();
-        c.weights() = take(p + ".weight", out, patch).transpose();
+        c.weights() = takeTransposed(p + ".weight", out, patch);
         c.bias() = take(p + ".bias", 1, out);
         if (int8 && !preferFloatWeights()) c.quantize();
     }
@@ -163,7 +171,7 @@ struct Weights {
     }
     // PyTorch Linear (out x in, or out x in x 1 x 1) -> Dense (in x out); a missing bias is zero.
     void linear(Dense& d, const std::string& p) {
-        d.weights() = take(p + ".weight", d.outputSize(), d.inputSize()).transpose();
+        d.weights() = takeTransposed(p + ".weight", d.outputSize(), d.inputSize());
         d.bias() = has(p + ".bias") ? take(p + ".bias", 1, d.outputSize()) : Matrix(1, d.outputSize());
         if (int8 && !preferFloatWeights()) d.quantize();
     }

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <cmath>
 #include <limits>
 #include <sstream>
@@ -24,31 +25,31 @@ std::uint64_t readLe64(const unsigned char* b) {
     return v;
 }
 
-float halfToFloat(std::uint16_t h) {
-    const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16;
-    std::uint32_t exponent = (h >> 10) & 0x1Fu;
-    std::uint32_t mantissa = h & 0x3FFu;
-    std::uint32_t bits;
-    if (exponent == 0) {
-        if (mantissa == 0) {
-            bits = sign;
-        } else {  // subnormal: normalize
-            exponent = 127 - 15 + 1;
-            while ((mantissa & 0x400u) == 0) {
-                mantissa <<= 1;
-                --exponent;
-            }
-            mantissa &= 0x3FFu;
-            bits = sign | (exponent << 23) | (mantissa << 13);
-        }
-    } else if (exponent == 0x1F) {
-        bits = sign | 0x7F800000u | (mantissa << 13);  // inf / nan
-    } else {
-        bits = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+// fp16 -> float for a whole array, without branches, so the compiler vectorizes it (the per-value
+// version normalizes subnormals in a loop). Normal values get their exponent rebased; infinities and
+// NaNs keep an all-ones exponent; subnormals come out of a float subtraction, exactly:
+// (2^-14 + m 2^-24) - 2^-14 = m 2^-24.
+void halvesToFloats(const std::uint16_t* in, float* out, std::size_t n) {
+    constexpr std::uint32_t kMagic = 113u << 23;  // 2^-14 as a float's bits
+    float magic;
+    std::memcpy(&magic, &kMagic, sizeof(magic));
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::uint32_t h = in[i];
+        const std::uint32_t em = (h & 0x7FFFu) << 13;  // exponent and mantissa in a float's place
+        const std::uint32_t exponent = em & 0x0F800000u;
+        const std::uint32_t normal = em + ((127u - 15u) << 23);
+        const std::uint32_t special = normal + ((128u - 16u) << 23);
+        const std::uint32_t subBits = em + kMagic;
+        float sub;
+        std::memcpy(&sub, &subBits, sizeof(sub));
+        sub -= magic;
+        std::uint32_t subnormal;
+        std::memcpy(&subnormal, &sub, sizeof(subnormal));
+        std::uint32_t bits = exponent == 0x0F800000u ? special : normal;
+        bits = exponent == 0 ? subnormal : bits;
+        bits |= (h & 0x8000u) << 16;
+        std::memcpy(out + i, &bits, sizeof(float));
     }
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
 }
 
 float bf16ToFloat(std::uint16_t h) {
@@ -170,48 +171,98 @@ std::vector<std::string> SafeTensors::names() const {
     return out;
 }
 
-Matrix SafeTensors::load(const std::string& name) const {
-    NC_PROFILE("load: read tensors");
+const SafeTensors::Tensor& SafeTensors::loadable(const std::string& name) const {
     const Tensor& t = info(name);
     if (t.dtype != "F32" && t.dtype != "F16" && t.dtype != "BF16")
         throw std::runtime_error("SafeTensors: tensor " + name + " has unsupported dtype " + t.dtype);
+    return t;
+}
+
+void SafeTensors::readBytes(const Tensor& t, std::size_t from, std::size_t bytes, void* dst, const std::string& name) const {
+    // Parallel chunks, each thread with its own stream: storage serves several reads at once.
+    const std::size_t chunk = std::size_t(16) << 20;
+    std::atomic<bool> truncated{false};
+    parallelFor(0, (bytes + chunk - 1) / chunk, 1, [&](std::size_t c0, std::size_t c1) {
+        std::ifstream in(path_, std::ios::binary);
+        for (std::size_t c = c0; c < c1 && in; ++c) {
+            const std::size_t b0 = c * chunk, count = std::min(chunk, bytes - b0);
+            in.seekg(static_cast<std::streamoff>(dataStart_ + t.begin + from + b0));
+            in.read(static_cast<char*>(dst) + b0, static_cast<std::streamsize>(count));
+        }
+        if (!in) truncated = true;
+    });
+    if (truncated) throw std::runtime_error("SafeTensors: truncated data for " + name + " in " + path_);
+}
+
+Matrix SafeTensors::load(const std::string& name) const {
+    NC_PROFILE("load: read tensors");
+    const Tensor& t = loadable(name);
     const std::size_t n = t.elements();
     const std::size_t cols = t.shape.empty() ? 1 : t.shape.back();
     const std::size_t rows = cols ? n / cols : 0;
 
     Matrix m(t.shape.size() <= 1 ? 1 : rows, t.shape.size() <= 1 ? n : cols);
-    const bool f32 = t.dtype == "F32", half = t.dtype == "F16";
-    const std::size_t width = f32 ? 4 : 2;
-    // Large tensors are read in parallel chunks (each thread with its own stream), converting
-    // fp16 / bf16 as they arrive: storage serves several reads at once, and the conversion
-    // runs on every core.
+    if (t.dtype == "F32") {
+        // Little-endian float32: straight into the matrix (all supported hosts are little-endian).
+        readBytes(t, 0, n * 4, m.data(), name);
+        return m;
+    }
+    const bool half = t.dtype == "F16";
+    // fp16 / bf16 in chunks, converted as they arrive (on every core).
     const std::size_t chunk = std::size_t(1) << 22;  // elements
-    std::atomic<bool> truncated{false};
     parallelFor(0, (n + chunk - 1) / chunk, 1, [&](std::size_t c0, std::size_t c1) {
-        std::ifstream in(path_, std::ios::binary);
         std::vector<std::uint16_t> raw;
         for (std::size_t c = c0; c < c1; ++c) {
             const std::size_t i0 = c * chunk, count = std::min(chunk, n - i0);
-            if (!in) break;
-            in.seekg(static_cast<std::streamoff>(dataStart_ + t.begin + i0 * width));
-            if (f32) {
-                // Little-endian float32: straight into the matrix (all supported hosts are little-endian).
-                in.read(reinterpret_cast<char*>(m.data() + i0), static_cast<std::streamsize>(count * 4));
-            } else {
-                raw.resize(count);
-                if (in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(count * 2))) {
-                    float* dst = m.data() + i0;
-                    if (half)
-                        for (std::size_t i = 0; i < count; ++i) dst[i] = halfToFloat(raw[i]);
-                    else
-                        for (std::size_t i = 0; i < count; ++i) dst[i] = bf16ToFloat(raw[i]);
+            raw.resize(count);
+            readBytes(t, i0 * 2, count * 2, raw.data(), name);
+            float* dst = m.data() + i0;
+            if (half) halvesToFloats(raw.data(), dst, count);
+            else
+                for (std::size_t i = 0; i < count; ++i) dst[i] = bf16ToFloat(raw[i]);
+        }
+    });
+    return m;
+}
+
+Matrix SafeTensors::loadTransposed(const std::string& name, std::size_t rows, std::size_t cols) const {
+    NC_PROFILE("load: read tensors");
+    const Tensor& t = loadable(name);
+    const std::size_t n = t.elements();
+    if (n != rows * cols)
+        throw std::runtime_error("SafeTensors: " + name + " has " + std::to_string(n) + " values, not " + std::to_string(rows) + " x " +
+                                 std::to_string(cols));
+    const std::size_t width = t.dtype == "F32" ? 4 : 2;
+    std::unique_ptr<unsigned char[]> raw(new unsigned char[n * width]);  // (not zeroed: every byte is read into)
+    readBytes(t, 0, n * width, raw.get(), name);
+    Matrix out(cols, rows);
+    // Bands of 32 source rows: converted in bulk into a buffer that stays in cache, then written out
+    // as 32 x 32 tiles.
+    constexpr std::size_t B = 32;
+    const bool f32 = width == 4, half = t.dtype == "F16";
+    parallelFor(0, (rows + B - 1) / B, 1, [&](std::size_t b0, std::size_t b1) {
+        std::vector<float> band(B * cols);
+        for (std::size_t bi = b0; bi < b1; ++bi) {
+            const std::size_t i0 = bi * B, i1 = std::min(rows, i0 + B), count = (i1 - i0) * cols;
+            const unsigned char* src = raw.get() + i0 * cols * width;
+            if (f32) std::memcpy(band.data(), src, count * 4);
+            else {
+                const auto* h = reinterpret_cast<const std::uint16_t*>(src);
+                if (half) halvesToFloats(h, band.data(), count);
+                else
+                    for (std::size_t k = 0; k < count; ++k) band[k] = bf16ToFloat(h[k]);
+            }
+            for (std::size_t j0 = 0; j0 < cols; j0 += B) {
+                const std::size_t j1 = std::min(cols, j0 + B);
+                for (std::size_t j = j0; j < j1; ++j) {
+                    float* o = out.data() + j * rows;
+                    const float* in = band.data() + j;
+                    for (std::size_t i = i0; i < i1; ++i) o[i] = in[(i - i0) * cols];
                 }
             }
         }
-        if (!in) truncated = true;
     });
-    if (truncated) throw std::runtime_error("SafeTensors: truncated data for " + name + " in " + path_);
-    return m;
+    return out;
 }
 
 void saveSafeTensors(const std::string& path, const std::vector<std::pair<std::string, const Matrix*>>& tensors) {

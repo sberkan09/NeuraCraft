@@ -43,17 +43,17 @@ public:
     void conv(Conv2D& c, const std::string& prefix) {
         const ImageShape in = c.inputShape();
         const std::size_t out = c.outputShape().channels, patch = in.channels * c.kernelSize() * c.kernelSize();
-        Matrix w = st_.load(prefix + ".weight");
-        if (w.size() != out * patch) fail(prefix + ".weight", w.size(), out * patch);
-        c.weights() = Matrix(out, patch, std::move(w.values())).transpose();
+        const std::size_t have = st_.info(prefix + ".weight").elements();
+        if (have != out * patch) fail(prefix + ".weight", have, out * patch);
+        c.weights() = st_.loadTransposed(prefix + ".weight", out, patch);
         c.bias() = vector(prefix + ".bias", out);
     }
     void convNoBias(Conv2D& c, const std::string& prefix) {
         const ImageShape in = c.inputShape();
         const std::size_t out = c.outputShape().channels, patch = in.channels * c.kernelSize() * c.kernelSize();
-        Matrix w = st_.load(prefix + ".weight");
-        if (w.size() != out * patch) fail(prefix + ".weight", w.size(), out * patch);
-        c.weights() = Matrix(out, patch, std::move(w.values())).transpose();
+        const std::size_t have = st_.info(prefix + ".weight").elements();
+        if (have != out * patch) fail(prefix + ".weight", have, out * patch);
+        c.weights() = st_.loadTransposed(prefix + ".weight", out, patch);
         c.bias() = Matrix(1, out);
     }
     void norm(GroupNorm& g, const std::string& prefix, std::size_t channels) {

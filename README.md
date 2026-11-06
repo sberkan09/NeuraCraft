@@ -1231,3 +1231,11 @@ scripts/    download_{mnist,shakespeare,gpt2,tinyllama,llama32,sd_turbo}.sh, gpt
             vae_reference.py, clip_reference.py, unet_reference.py, taesd_reference.py,
             gen_unicode_tables.py (src/UnicodeTables.cpp)
 ```
+
+## License
+
+NeuraCraft is licensed under the [Apache License 2.0](LICENSE) (see also
+[NOTICE](NOTICE)). Model weights are not part of the library: every model you
+download comes under its own license (CreativeML OpenRAIL, the Stability AI
+Community License, Apache-2.0, non-commercial research licenses, ...), and that
+license decides what you may do with the model and its outputs.

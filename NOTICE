@@ -1,0 +1,9 @@
+NeuraCraft
+Copyright 2025-2026 Sami Berkan Akkaya
+
+This product includes software developed as part of the NeuraCraft project
+(https://github.com/sberkan09/NeuraCraft).
+
+Model weights are not part of this distribution. Each model you download
+(scripts/download_*.sh, Hugging Face, ...) comes under its own license, which
+governs how it may be used.

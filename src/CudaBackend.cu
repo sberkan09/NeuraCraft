@@ -612,7 +612,7 @@ Session::Session() {
         std::size_t freeBytes = 0, total = 0;
         if (cudaGetDevice(&device) == cudaSuccess && cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess &&
             cudaMemGetInfo(&freeBytes, &total) == cudaSuccess) {
-            cuuint64_t keep = total / 5;
+            unsigned long long keep = total / 5;  // the attribute is a 64-bit unsigned value
             cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
         }
         cudaGetLastError();

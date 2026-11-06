@@ -357,8 +357,51 @@ Outs convOp(const Node& n, const Ins& in, int) {
     // Output rows per pass so the column buffer (Kc x rows * OW) stays near 1 M floats: it is then
     // still in cache when the product reads it.
     const std::size_t rowsPerPass = std::max<std::size_t>(1, std::min(OH, (std::size_t(1) << 20) / std::max<std::size_t>(1, Kc * OW)));
-    // With the blocked CPU kernel: pixels as the long side of the product, their im2col rows written
-    // straight in the kernel's packed layout (no packing pass), the few output channels as columns.
+    // Stride 1 with the blocked CPU kernel: no im2col at all. The input is copied once, padded and
+    // channels-last; then every output pixel's taps are fixed offsets from its own position, so the
+    // product reads them in place (gemmIndirectA). Pixels are computed over the padded width and the
+    // few columns past the right edge dropped.
+    if (!pointwise && gemmPackedAvailable() && g.sh == 1 && g.sw == 1 && Cg >= 16) {
+        const std::size_t R = gemmPanelRows();
+        const std::size_t Hp = H + static_cast<std::size_t>(g.padTop + g.padBottom), Wp = Wd + static_cast<std::size_t>(g.padLeft + g.padRight);
+        const std::size_t rows = (OH - 1) * Wp + OW;
+        std::vector<float> xp, tmp(rows * Mg);
+        std::vector<std::int64_t> offs(Kc);
+        {
+            std::size_t k = 0;
+            for (std::size_t c = 0; c < Cg; ++c)
+                for (std::size_t ki = 0; ki < g.kh; ++ki)
+                    for (std::size_t kj = 0; kj < g.kw; ++kj)
+                        offs[k++] = static_cast<std::int64_t>(((ki * g.dh) * Wp + kj * g.dw) * Cg + c);
+        }
+        for (std::size_t b = 0; b < N; ++b)
+            for (std::size_t gr = 0; gr < group; ++gr) {
+                const float* x = X.f.data() + (b * C + gr * Cg) * H * Wd;
+                const float* w = W.f.data() + gr * Mg * Kc;
+                float* y = r.f.data() + (b * M + gr * Mg) * OH * OW;
+                xp.assign((Hp * Wp + R + 1) * Cg, 0.0f);
+                parallelFor(0, H, 1, [&](std::size_t y0, std::size_t y1) {
+                    for (std::size_t iy = y0; iy < y1; ++iy) {
+                        float* dst = xp.data() + ((iy + static_cast<std::size_t>(g.padTop)) * Wp + static_cast<std::size_t>(g.padLeft)) * Cg;
+                        for (std::size_t c = 0; c < Cg; ++c) {
+                            const float* src = x + (c * H + iy) * Wd;
+                            for (std::size_t ix = 0; ix < Wd; ++ix) dst[ix * Cg + c] = src[ix];
+                        }
+                    }
+                });
+                gemmIndirectA(rows, Mg, Kc, xp.data(), Cg, offs.data(), true, w, Kc, tmp.data(), Mg);
+                parallelFor(0, Mg, 1, [&](std::size_t m0, std::size_t m1) {
+                    for (std::size_t m = m0; m < m1; ++m)
+                        for (std::size_t oy = 0; oy < OH; ++oy) {
+                            float* dst = y + (m * OH + oy) * OW;
+                            const float* src = tmp.data() + (oy * Wp) * Mg + m;
+                            for (std::size_t ox = 0; ox < OW; ++ox) dst[ox] = src[ox * Mg];
+                        }
+                });
+            }
+    } else
+    // Otherwise (strided) with the blocked CPU kernel: pixels as the long side of the product, their
+    // im2col rows written straight in the kernel's packed layout, the few output channels as columns.
     if (!pointwise && gemmPackedAvailable()) {
         const std::size_t R = gemmPanelRows(), P = OH * OW;
         // Up to 4 M floats of rows per product: bigger products split better over the threads.
@@ -486,13 +529,24 @@ Outs convOp(const Node& n, const Ins& in, int) {
         }
     }
     }
-    if (B) {
+    // Bias and a fused activation (Model::load folds a Relu / LeakyRelu / Clip that only reads this
+    // output into the convolution) in one pass.
+    const std::string act = n.s("_activation", "");
+    if (B || !act.empty()) {
         const std::size_t plane = OH * OW;
+        const float alpha = n.f("_alpha", 0.01f), lo = n.f("_min", -std::numeric_limits<float>::infinity()),
+                    hi = n.f("_max", std::numeric_limits<float>::infinity());
+        const int kind = act == "Relu" ? 1 : act == "LeakyRelu" ? 2 : act == "Clip" ? 3 : 0;
         parallelFor(0, N * M, 4, [&](std::size_t p0, std::size_t p1) {
             for (std::size_t p = p0; p < p1; ++p) {
-                const float bias = B->f[p % M];
+                const float bias = B ? B->f[p % M] : 0.0f;
                 float* y = r.f.data() + p * plane;
-                for (std::size_t k = 0; k < plane; ++k) y[k] += bias;
+                switch (kind) {
+                case 1: for (std::size_t k = 0; k < plane; ++k) y[k] = std::max(y[k] + bias, 0.0f); break;
+                case 2: for (std::size_t k = 0; k < plane; ++k) { const float v = y[k] + bias; y[k] = v >= 0 ? v : alpha * v; } break;
+                case 3: for (std::size_t k = 0; k < plane; ++k) y[k] = std::min(std::max(y[k] + bias, lo), hi); break;
+                default: for (std::size_t k = 0; k < plane; ++k) y[k] += bias;
+                }
             }
         });
     }
@@ -925,20 +979,42 @@ Outs concatOp(const Node& n, const Ins& in, int) {
     Shape os = first.shape;
     os[axis] = 0;
     for (const Tensor* t : parts) os[axis] += t->shape[axis];
-    Tensor r = tensorLike(first, os);
     std::size_t outer = 1, inner = 1;
     for (std::size_t k = 0; k < axis; ++k) outer *= static_cast<std::size_t>(os[k]);
     for (std::size_t k = axis + 1; k < rank; ++k) inner *= static_cast<std::size_t>(os[k]);
-    std::size_t offset = 0;
-    const std::size_t outRow = static_cast<std::size_t>(os[axis]) * inner;
-    for (const Tensor* t : parts) {
-        const std::size_t row = static_cast<std::size_t>(t->shape[axis]) * inner;
-        for (std::size_t o = 0; o < outer; ++o) {
-            if (r.kind == Tensor::Kind::Float) std::copy(t->f.begin() + o * row, t->f.begin() + (o + 1) * row, r.f.begin() + o * outRow + offset);
-            else std::copy(t->i.begin() + o * row, t->i.begin() + (o + 1) * row, r.i.begin() + o * outRow + offset);
+    if (outer == 1) {  // the parts one after another: appended, no zero fill first
+        Tensor r;
+        r.kind = first.kind;
+        r.elemType = first.elemType;
+        r.shape = os;
+        if (r.kind == Tensor::Kind::Float) {
+            r.f.reserve(numel(os));
+            for (const Tensor* t : parts) r.f.insert(r.f.end(), t->f.begin(), t->f.end());
+        } else {
+            r.i.reserve(numel(os));
+            for (const Tensor* t : parts) r.i.insert(r.i.end(), t->i.begin(), t->i.end());
         }
-        offset += row;
+        return {r};
     }
+    Tensor r = tensorLike(first, os);
+    const std::size_t outRow = static_cast<std::size_t>(os[axis]) * inner;
+    std::vector<std::size_t> offsets;
+    std::size_t offset = 0;
+    for (const Tensor* t : parts) {
+        offsets.push_back(offset);
+        offset += static_cast<std::size_t>(t->shape[axis]) * inner;
+    }
+    // Every (outer index, part) is one contiguous copy; big ones are split over the threads.
+    const std::size_t jobs = outer * parts.size();
+    parallelFor(0, jobs, std::max<std::size_t>(1, jobs / 64), [&](std::size_t j0, std::size_t j1) {
+        for (std::size_t j = j0; j < j1; ++j) {
+            const std::size_t o = j / parts.size(), q = j % parts.size();
+            const Tensor* t = parts[q];
+            const std::size_t row = static_cast<std::size_t>(t->shape[axis]) * inner;
+            if (r.kind == Tensor::Kind::Float) std::copy(t->f.begin() + o * row, t->f.begin() + (o + 1) * row, r.f.begin() + o * outRow + offsets[q]);
+            else std::copy(t->i.begin() + o * row, t->i.begin() + (o + 1) * row, r.i.begin() + o * outRow + offsets[q]);
+        }
+    });
     return {r};
 }
 

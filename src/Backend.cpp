@@ -152,12 +152,38 @@ inline void microKernel(std::size_t kc, const float* NC_RESTRICT a, const float*
     for (std::size_t i = 0; i < MR; ++i)
         for (std::size_t v = 0; v < NV; ++v) std::memcpy(&out[i][v * VW], &acc[i][v], sizeof(vfloat));
 }
+// The same with A read in place: row i, column k at a[i * stride + off[k]].
+inline void microKernelIndirect(std::size_t kc, const float* NC_RESTRICT a, std::size_t stride, const std::int64_t* NC_RESTRICT off,
+                                const float* NC_RESTRICT b, float (&out)[MR][NR]) {
+    vfloat acc[MR][NV];
+    for (std::size_t i = 0; i < MR; ++i)
+        for (std::size_t v = 0; v < NV; ++v) acc[i][v] = vfloat{};
+    for (std::size_t k = 0; k < kc; ++k) {
+        vfloat bv[NV];
+        for (std::size_t v = 0; v < NV; ++v) bv[v] = loadv(b + k * NR + v * VW);
+        const float* ak = a + off[k];
+        for (std::size_t i = 0; i < MR; ++i) {
+            const float ai = ak[i * stride];
+            for (std::size_t v = 0; v < NV; ++v) acc[i][v] += ai * bv[v];
+        }
+    }
+    for (std::size_t i = 0; i < MR; ++i)
+        for (std::size_t v = 0; v < NV; ++v) std::memcpy(&out[i][v * VW], &acc[i][v], sizeof(vfloat));
+}
 #else
 inline void microKernel(std::size_t kc, const float* a, const float* b, float (&out)[MR][NR]) {
     float acc[MR][NR] = {};
     for (std::size_t k = 0; k < kc; ++k)
         for (std::size_t i = 0; i < MR; ++i)
             for (std::size_t j = 0; j < NR; ++j) acc[i][j] += a[k * MR + i] * b[k * NR + j];
+    for (std::size_t i = 0; i < MR; ++i)
+        for (std::size_t j = 0; j < NR; ++j) out[i][j] = acc[i][j];
+}
+inline void microKernelIndirect(std::size_t kc, const float* a, std::size_t stride, const std::int64_t* off, const float* b, float (&out)[MR][NR]) {
+    float acc[MR][NR] = {};
+    for (std::size_t k = 0; k < kc; ++k)
+        for (std::size_t i = 0; i < MR; ++i)
+            for (std::size_t j = 0; j < NR; ++j) acc[i][j] += a[i * stride + off[k]] * b[k * NR + j];
     for (std::size_t i = 0; i < MR; ++i)
         for (std::size_t j = 0; j < NR; ++j) out[i][j] = acc[i][j];
 }
@@ -289,6 +315,35 @@ void gemmBlocked(bool transA, bool transB, std::size_t M, std::size_t N, std::si
 }
 
 std::size_t gemmPanelRows() { return MR; }
+
+void gemmIndirectA(std::size_t M, std::size_t N, std::size_t K, const float* A, std::size_t aStride, const std::int64_t* aOffsets, bool transB,
+                   const float* B, std::size_t ldb, float* C, std::size_t ldc) {
+    if (M == 0 || N == 0) return;
+    for (std::size_t i = 0; i < M; ++i) std::fill(C + i * ldc, C + i * ldc + N, 0.0f);
+    if (K == 0) return;
+    const std::size_t aPanels = (M + MR - 1) / MR, bPanels = (N + NR - 1) / NR;
+    std::vector<float> packedB(bPanels * NR * K);
+    packB(transB, N, K, B, ldb, packedB.data());
+    const std::size_t grain = std::max<std::size_t>(1, (std::size_t(1) << 18) / std::max<std::size_t>(1, MR * N * K));
+    parallelFor(0, aPanels, grain, [&](std::size_t ap0, std::size_t ap1) {
+        float acc[MR][NR];
+        for (std::size_t k0 = 0; k0 < K; k0 += KC) {
+            const std::size_t kc = std::min(KC, K - k0);
+            for (std::size_t bp = 0; bp < bPanels; ++bp) {
+                const float* bPanel = packedB.data() + (bp * K + k0) * NR;
+                const std::size_t c0 = bp * NR, width = std::min(NR, N - c0);
+                for (std::size_t ap = ap0; ap < ap1; ++ap) {
+                    const std::size_t r0 = ap * MR, height = std::min(MR, M - r0);
+                    microKernelIndirect(kc, A + r0 * aStride, aStride, aOffsets + k0, bPanel, acc);
+                    for (std::size_t i = 0; i < height; ++i) {
+                        float* c = C + (r0 + i) * ldc + c0;
+                        for (std::size_t j = 0; j < width; ++j) c[j] += acc[i][j];
+                    }
+                }
+            }
+        }
+    });
+}
 
 bool gemmPackedAvailable() {
 #ifdef NEURACRAFT_HAS_ACCELERATE

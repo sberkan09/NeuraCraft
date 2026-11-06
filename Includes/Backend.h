@@ -4,6 +4,7 @@
 #include "Matrix.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace nc {
@@ -74,6 +75,13 @@ std::size_t gemmPanelRows();
 bool gemmPackedAvailable();
 void gemmPackedA(std::size_t M, std::size_t N, std::size_t K, const float* packedA, bool transB, const float* B, std::size_t ldb, float* C,
                  std::size_t ldc);
+
+// "Indirect" left operand, read in place: A(p, k) = A[p * aStride + aOffsets[k]] for p < M. The
+// taps of a stride-1 convolution over a padded channels-last picture are such a matrix (row p a
+// pixel, column k a channel of one tap), so it multiplies with no im2col copy. A must be readable
+// for every row up to the next multiple of gemmPanelRows(). Same availability as gemmPackedA.
+void gemmIndirectA(std::size_t M, std::size_t N, std::size_t K, const float* A, std::size_t aStride, const std::int64_t* aOffsets, bool transB,
+                   const float* B, std::size_t ldb, float* C, std::size_t ldc);
 
 // Direct access to each implementation (used by tests and benchmarks).
 void gemmCpu(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,

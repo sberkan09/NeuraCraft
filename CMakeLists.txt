@@ -24,6 +24,8 @@ add_library(neuracraft_lib STATIC
     src/Activations.cpp
     src/Backend.cpp
     src/Checkpoint.cpp
+    src/Onnx.cpp
+    src/OnnxOps.cpp
     src/Conv.cpp
     src/Data.cpp
     src/Dense.cpp
@@ -102,6 +104,7 @@ if(NEURACRAFT_BUILD_TESTS)
     enable_testing()
     add_executable(neuracraft_tests tests/tests.cpp)
     target_link_libraries(neuracraft_tests PRIVATE neuracraft_lib)
+    target_compile_definitions(neuracraft_tests PRIVATE NEURACRAFT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME unit_tests COMMAND neuracraft_tests)
     add_test(NAME demo_xor COMMAND NeuraCraft xor)
     add_test(NAME demo_spiral COMMAND NeuraCraft spiral)

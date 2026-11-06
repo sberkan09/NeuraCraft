@@ -1,6 +1,7 @@
 // NeuraCraft unit tests. Dependency-free: a tiny TEST/CHECK harness below.
 #include "NeuraCraft.h"
 #include "Checkpoint.h"
+#include "Onnx.h"
 
 #include <algorithm>
 #include <atomic>
@@ -3569,6 +3570,54 @@ TEST(sdxl_pipeline_with_two_text_encoders_and_added_conditions) {
     CHECK(listed);
     std::filesystem::remove_all(ckdir);
     std::filesystem::remove_all(dir);
+}
+
+// Every case in tests/onnx/cases (written by tests/onnx/make_cases.py with onnxruntime's outputs).
+TEST(onnx_operators_match_onnxruntime) {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::path(NEURACRAFT_SOURCE_DIR) / "tests" / "onnx" / "cases";
+    std::size_t cases = 0;
+    std::vector<std::string> failed;
+    std::vector<fs::path> dirs;
+    for (const auto& e : fs::directory_iterator(root)) dirs.push_back(e.path());
+    std::sort(dirs.begin(), dirs.end());
+    for (const fs::path& dir : dirs) {
+        ++cases;
+        try {
+            const onnx::Model model = onnx::Model::load((dir / "model.onnx").string());
+            std::map<std::string, onnx::Tensor> feeds;
+            for (int k = 0; fs::exists(dir / ("input_" + std::to_string(k) + ".pb")); ++k) {
+                std::string name;
+                onnx::Tensor t = onnx::loadTensorProto((dir / ("input_" + std::to_string(k) + ".pb")).string(), &name);
+                feeds[name] = std::move(t);
+            }
+            std::vector<std::pair<std::string, onnx::Tensor>> expected;
+            std::vector<std::string> names;
+            for (int k = 0; fs::exists(dir / ("output_" + std::to_string(k) + ".pb")); ++k) {
+                std::string name;
+                onnx::Tensor t = onnx::loadTensorProto((dir / ("output_" + std::to_string(k) + ".pb")).string(), &name);
+                names.push_back(name);
+                expected.emplace_back(name, std::move(t));
+            }
+            const auto got = model.run(feeds, names);
+            for (const auto& [name, want] : expected) {
+                const onnx::Tensor& g = got.at(name);
+                if (g.shape != want.shape) throw std::runtime_error(name + ": shape differs");
+                if (want.kind == onnx::Tensor::Kind::Int) {
+                    if (g.i != want.i) throw std::runtime_error(name + ": integer values differ");
+                } else {
+                    for (std::size_t k = 0; k < want.f.size(); ++k)
+                        if (!(std::fabs(g.f[k] - want.f[k]) <= 1e-4f + 1e-4f * std::fabs(want.f[k])))
+                            throw std::runtime_error(name + "[" + std::to_string(k) + "] = " + std::to_string(g.f[k]) + ", onnxruntime " + std::to_string(want.f[k]));
+                }
+            }
+        } catch (const std::exception& e) {
+            failed.push_back(dir.filename().string() + ": " + e.what());
+        }
+    }
+    for (const std::string& f : failed) std::cerr << "  onnx case " << f << "\n";
+    CHECK(cases >= 100);
+    CHECK(failed.empty());
 }
 
 TEST(lora_merging_and_lcm_sampler) {

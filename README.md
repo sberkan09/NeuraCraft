@@ -547,6 +547,33 @@ File names with "turbo" or "lightning" get the "trailing" schedule few-step
 models need. AnimateDiff, morph / zoom / outpaint and IP-Adapter stay SD 1.x /
 2.x for now.
 
+
+### ONNX models
+
+A network NeuraCraft has no code for — exported from PyTorch or TensorFlow as a
+`.onnx` file — runs on its own executor (`Onnx.h`): a small protobuf reader (no
+dependency; inline or external weights, fp32 / fp16 / bf16 / int / bool) and a
+graph executor for about 110 operators of opsets 7-21, with `MatMul`, `Gemm`
+and the convolutions on the library's GEMM.
+
+```
+$ ./bin/NeuraCraft onnx depth_anything_v2_small.onnx
+depth_anything_v2_small.onnx: opset 14, 823 nodes, 24711136 parameters (loaded in 0.2 s)
+  input  pixel_values [batch_size,3,height,width] type 1
+  output predicted_depth [floor(1.0*batch_size),14*floor(height/14),14*floor(width/14)] type 1
+  operators: Addx150 Concatx42 Convx31 ConvTransposex2 Divx39 ...
+$ ./bin/NeuraCraft onnx model.onnx out/ input_0.pb      # run on TensorProto inputs
+```
+
+`tests/onnx/make_cases.py` writes 114 operator cases with onnxruntime's
+outputs, and the tests check every one. Real models match onnxruntime to about
+1e-6 (max abs): MobileNet v2, u2netp (background masks), Depth Anything v2
+small and Real-ESRGAN x4plus. On the 2-core CPU the executor takes 1-3x
+onnxruntime's time (Real-ESRGAN 128 -> 512: 14.8 s vs 4.7 s);
+`NEURACRAFT_ONNX_PROFILE=1` prints the time per operator type. Control flow
+(`If` / `Loop`), quantised operators and strings are not supported: such a
+model fails to load with the operator and node named.
+
 ### LoRA and the LCM sampler
 
 `--lora file.safetensors[:scale]` merges LoRA adapters

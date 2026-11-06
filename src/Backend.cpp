@@ -218,6 +218,20 @@ void gemmBlocked(bool transA, bool transB, std::size_t M, std::size_t N, std::si
                  float* C, std::size_t ldc, bool accumulate) {
     checkDims(M, N, K, transA, transB, lda, ldb, ldc);
     if (M == 0 || N == 0) return;
+    // Large products go in blocks of at most 2048 columns / rows, so the packed panels stay a few MB
+    // (packing all of a 16384 x 1440 operand at once ran at a third of the speed). Each element's
+    // sum is formed in the same order either way, so results do not change.
+    constexpr std::size_t kBlock = 2048;
+    if (N > 2 * kBlock && K > KC) {
+        for (std::size_t n0 = 0; n0 < N; n0 += kBlock)
+            gemmBlocked(transA, transB, M, std::min(kBlock, N - n0), K, A, lda, transB ? B + n0 * ldb : B + n0, ldb, C + n0, ldc, accumulate);
+        return;
+    }
+    if (M > 2 * kBlock && K > KC) {
+        for (std::size_t m0 = 0; m0 < M; m0 += kBlock)
+            gemmBlocked(transA, transB, std::min(kBlock, M - m0), N, K, transA ? A + m0 : A + m0 * lda, lda, B, ldb, C + m0 * ldc, ldc, accumulate);
+        return;
+    }
     if (!accumulate)
         for (std::size_t i = 0; i < M; ++i) std::fill(C + i * ldc, C + i * ldc + N, 0.0f);
     if (K == 0) return;

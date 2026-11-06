@@ -31,7 +31,6 @@ std::string readFile(const std::string& path) {
     ss << in.rdbuf();
     return ss.str();
 }
-bool exists(const std::string& path) { return static_cast<bool>(std::ifstream(path)); }
 
 void siluInPlace(Matrix& m) {
     float* x = m.data();

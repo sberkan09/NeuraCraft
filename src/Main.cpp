@@ -29,6 +29,7 @@
 // Global options: --gpu (Metal on Apple silicon), --cpu-attention / --gpu-attention, --threads N, --profile
 
 #include "NeuraCraft.h"
+#include "Onnx.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1078,7 +1079,8 @@ void usage() {
               << "  NeuraCraft depth <depth-anything dir> in.png depth.png [--size 518]   (control images: --depth-model dir)\n"
               << "  NeuraCraft parallax <depth-anything dir> in.png out.gif [--frames 48] [--amplitude 0.03] [--zoom 0.06] [--fps 24]\n"
               << "  NeuraCraft workflow steps.json [--check]               (image / video steps in JSON, see Workflow.h)\n"
-              << "  NeuraCraft studio [--port 8188] [--no-open] [--cache-mb 1024]   (NeuraCraft Studio: engine + web UI in the browser)\n"
+              << "  NeuraCraft onnx model.onnx [out_dir input_0.pb ...]   (what an ONNX model holds; or run it on TensorProto inputs)\n"
+        "  NeuraCraft studio [--port 8188] [--no-open] [--cache-mb 1024]   (NeuraCraft Studio: engine + web UI in the browser)\n"
               << "  NeuraCraft serve [--port 8188] [--host IP] [--data DIR] [--ui DIR]   (Studio engine: HTTP API, see Server.h)\n"
               << "  NeuraCraft ops                                         (the workflow operations and fields, JSON)\n"
               << "  NeuraCraft models [folder] [--json]                    (models found under data/ or folder)\n"
@@ -1152,7 +1154,7 @@ int main(int argc, char** argv) {
     }
     const std::string cmd = args.empty() ? "all" : args[0];
     // Commands whose output is data (JSON for tools such as the Studio UI) print nothing else.
-    const bool quiet = cmd == "ops" || cmd == "models" || cmd == "serve" || cmd == "studio";
+    const bool quiet = cmd == "ops" || cmd == "models" || cmd == "serve" || cmd == "studio" || cmd == "onnx";
     if (!quiet)
         std::cout << "device: " << deviceDescription() << (gpuAttentionEnabled() && currentDevice() != Device::GPU ? " + GPU attention" : "")
                   << '\n';
@@ -1601,6 +1603,45 @@ int main(int argc, char** argv) {
             for (const ModelInfo& m : models)
                 std::cout << std::left << std::setw(14) << m.kind << std::right << std::setw(8) << std::fixed << std::setprecision(0)
                           << static_cast<double>(m.bytes) / 1048576.0 << " MB  " << m.path << std::defaultfloat << '\n';
+            return 0;
+        }
+        if (cmd == "onnx") {  // model.onnx: what it holds; model.onnx out_dir input_0.pb ...: run it (outputs as output_k.pb)
+            if (args.size() < 2) {
+                usage();
+                return 2;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            const onnx::Model model = onnx::Model::load(args[1]);
+            const double loadS = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            auto dims = [](const onnx::ValueInfo& v) {
+                std::string s = "[";
+                for (std::size_t k = 0; k < v.shape.size(); ++k)
+                    s += (k ? "," : "") + (v.shape[k] >= 0 ? std::to_string(v.shape[k]) : (v.dimNames[k].empty() ? "?" : v.dimNames[k]));
+                return s + "]";
+            };
+            if (args.size() < 3) {
+                std::cout << args[1] << ": opset " << model.opset() << ", " << model.nodeCount() << " nodes, " << model.parameterCount()
+                          << " parameters (loaded in " << std::fixed << std::setprecision(1) << loadS << std::defaultfloat << " s)\n";
+                for (const auto& v : model.inputs()) std::cout << "  input  " << v.name << " " << dims(v) << " type " << v.elemType << "\n";
+                for (const auto& v : model.outputs()) std::cout << "  output " << v.name << " " << dims(v) << " type " << v.elemType << "\n";
+                std::cout << "  operators:";
+                for (const auto& [op, n] : model.operatorCounts()) std::cout << " " << op << "x" << n;
+                std::cout << "\n";
+                return 0;
+            }
+            std::map<std::string, onnx::Tensor> feeds;
+            for (std::size_t k = 3; k < args.size(); ++k) {
+                std::string name;
+                onnx::Tensor t = onnx::loadTensorProto(args[k], &name);
+                if (name.empty()) name = model.inputs().at(k - 3).name;
+                feeds[name] = std::move(t);
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            const auto outs = model.run(feeds);
+            std::cerr << "ran in " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count() << " s\n";
+            std::filesystem::create_directories(args[2]);
+            std::size_t k = 0;
+            for (const auto& o : model.outputs()) onnx::saveTensorProto(args[2] + "/output_" + std::to_string(k++) + ".pb", outs.at(o.name), o.name);
             return 0;
         }
         if (cmd == "workflow") {  // file.json [--check]

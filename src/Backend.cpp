@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -569,6 +570,18 @@ GpuWeightScope::GpuWeightScope() {
 GpuWeightScope::~GpuWeightScope() {
 #ifdef NEURACRAFT_HAS_CUDA
     if (cuda::available()) cuda::endWeightScope();
+#endif
+}
+
+bool preferFloatWeights() {
+#ifdef NEURACRAFT_HAS_CUDA
+    static const bool int8 = [] {
+        const char* e = std::getenv("NEURACRAFT_GPU_INT8");
+        return e && std::string(e) == "1";
+    }();
+    return !int8 && currentDevice() == Device::GPU && cuda::available();
+#else
+    return false;
 #endif
 }
 

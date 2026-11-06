@@ -88,6 +88,11 @@ void gemmConst(bool constA, bool transA, bool transB, std::size_t M, std::size_t
 bool gpuConvolution(const float* in, std::size_t batch, std::size_t C, std::size_t H, std::size_t W, const float* weights, bool outByPatch,
                     const float* bias, std::size_t outC, std::size_t k, std::size_t stride, std::size_t pad, float* out);
 
+// Whether image models should keep float weights instead of int8 ones: on a CUDA GPU the float
+// weights stay resident in device memory and run on cuBLAS, which beats expanding int8 weights on
+// every product. NEURACRAFT_GPU_INT8=1 keeps int8 anyway (to save memory).
+bool preferFloatWeights();
+
 // Called by the matrix storage when it frees a block (drops GPU copies made from it).
 void gpuHostMemoryFreed(const void* p, std::size_t bytes);
 

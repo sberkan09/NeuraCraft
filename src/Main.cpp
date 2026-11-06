@@ -49,6 +49,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -1167,6 +1168,11 @@ int main(int argc, char** argv) {
             if (profiling()) printProfile(std::cout);
         }
     } profileReport;
+    // Inference commands keep layer weights on the GPU for the whole run (Backend.h, GpuWeightScope).
+    static const std::set<std::string> inference{"txt2img", "img2img", "video", "serve", "studio", "onnx", "workflow", "depth",
+                                                 "interpolate", "upscale", "inpaint", "vae", "llama", "generate", "gpt2", "eval"};
+    std::unique_ptr<GpuWeightScope> weightScope;
+    if (inference.count(cmd)) weightScope = std::make_unique<GpuWeightScope>();
     try {
         if (cmd == "all") {
             int failed = 0;

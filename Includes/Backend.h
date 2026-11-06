@@ -64,6 +64,32 @@ std::string gpuAttentionKernel(std::size_t headSize);
 void setGpuAttentionKernel(const std::string& name);
 bool gpuAttentionEnabled();
 
+// GPU weight residency. While at least one GpuWeightScope is alive, the constant operands of
+// gemmConst() and gpuConvolution() (layer weights in inference) are uploaded to the GPU once and
+// reused, instead of being copied on every product; the copies go when their host memory is freed
+// and when the last scope closes. Inside a scope those weights must not be changed in place
+// (inference never does; training should not open one). No effect on the CPU or without CUDA.
+class GpuWeightScope {
+public:
+    GpuWeightScope();
+    ~GpuWeightScope();
+    GpuWeightScope(const GpuWeightScope&) = delete;
+    GpuWeightScope& operator=(const GpuWeightScope&) = delete;
+};
+
+// gemm() where one operand (constA: A, else B) is a constant weight matrix (see GpuWeightScope).
+void gemmConst(bool constA, bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K, const float* A, std::size_t lda,
+               const float* B, std::size_t ldb, float* C, std::size_t ldc, bool accumulate = false);
+
+// A whole convolution on the GPU when one is active and supports it: `batch` NCHW pictures
+// (C x H x W) -> batch x outC x OH x OW. weights: patch x outC (outByPatch false) or outC x patch,
+// patch = C * k * k; bias may be null. Returns false (out untouched) when it does not run there.
+bool gpuConvolution(const float* in, std::size_t batch, std::size_t C, std::size_t H, std::size_t W, const float* weights, bool outByPatch,
+                    const float* bias, std::size_t outC, std::size_t k, std::size_t stride, std::size_t pad, float* out);
+
+// Called by the matrix storage when it frees a block (drops GPU copies made from it).
+void gpuHostMemoryFreed(const void* p, std::size_t bytes);
+
 // Vectorized dot product of two float arrays.
 float dot(const float* a, const float* b, std::size_t n);
 

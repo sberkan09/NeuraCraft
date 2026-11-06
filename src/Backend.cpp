@@ -561,6 +561,55 @@ void matmul(const Matrix& a, bool transA, const Matrix& b, bool transB, Matrix& 
     gemm(transA, transB, M, N, K, a.data(), a.cols(), b.data(), b.cols(), c.data(), N, false);
 }
 
+GpuWeightScope::GpuWeightScope() {
+#ifdef NEURACRAFT_HAS_CUDA
+    if (cuda::available()) cuda::beginWeightScope();
+#endif
+}
+GpuWeightScope::~GpuWeightScope() {
+#ifdef NEURACRAFT_HAS_CUDA
+    if (cuda::available()) cuda::endWeightScope();
+#endif
+}
+
+void gpuHostMemoryFreed(const void* p, std::size_t bytes) {
+#ifdef NEURACRAFT_HAS_CUDA
+    cuda::forgetHost(p, bytes);
+#else
+    (void)p;
+    (void)bytes;
+#endif
+}
+
+void gemmConst(bool constA, bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K, const float* A, std::size_t lda,
+               const float* B, std::size_t ldb, float* C, std::size_t ldc, bool accumulate) {
+#ifdef NEURACRAFT_HAS_CUDA
+    if (currentDevice() == Device::GPU && M * N * K >= gpuMinWork() && cuda::available()) {
+        checkDims(M, N, K, transA, transB, lda, ldb, ldc);
+        NC_PROFILE("gemm gpu");
+        cuda::gemmConst(constA, transA, transB, M, N, K, A, lda, B, ldb, C, ldc, accumulate);
+        return;
+    }
+#endif
+    (void)constA;
+    gemm(transA, transB, M, N, K, A, lda, B, ldb, C, ldc, accumulate);
+}
+
+bool gpuConvolution(const float* in, std::size_t batch, std::size_t C, std::size_t H, std::size_t W, const float* weights, bool outByPatch,
+                    const float* bias, std::size_t outC, std::size_t k, std::size_t stride, std::size_t pad, float* out) {
+#ifdef NEURACRAFT_HAS_CUDA
+    if (currentDevice() != Device::GPU || !cuda::available() || k == 0 || stride == 0 || H + 2 * pad < k || W + 2 * pad < k) return false;
+    const std::size_t OH = (H + 2 * pad - k) / stride + 1, OW = (W + 2 * pad - k) / stride + 1;
+    if (batch * OH * OW * outC * C * k * k < gpuMinWork()) return false;
+    NC_PROFILE("conv gpu");
+    cuda::conv2d(in, batch, C, H, W, weights, outByPatch, bias, outC, k, stride, pad, out);
+    return true;
+#else
+    (void)in; (void)batch; (void)C; (void)H; (void)W; (void)weights; (void)outByPatch; (void)bias; (void)outC; (void)k; (void)stride; (void)pad; (void)out;
+    return false;
+#endif
+}
+
 void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
           const float* A, std::size_t lda, const float* B, std::size_t ldb,
           float* C, std::size_t ldc, bool accumulate) {

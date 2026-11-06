@@ -5118,6 +5118,52 @@ TEST(gpu_int8_products_match_cpu) {
     setGpuMinWork(saved);
 }
 
+TEST(gpu_resident_weights_follow_their_memory) {
+    // Inside a weight scope the GPU keeps constant operands; a freed and reused buffer (a model
+    // swapped for another of the same shape) must not be served from the old copy.
+    if (!gpuAvailable()) return;
+    setSeed(5);
+    const std::size_t saved = gpuMinWork();
+    setGpuMinWork(1);
+    setDevice(Device::GPU);
+    {
+        GpuWeightScope scope;
+        const Matrix x = Matrix::uniform(64, 96, -1, 1);
+        for (int round = 0; round < 3; ++round) {
+            const Matrix w = Matrix::uniform(96, 80, -1, 1);  // likely the same address each round
+            Matrix gpu(64, 80), cpu(64, 80);
+            gemmConst(false, false, false, 64, 80, 96, x.data(), 96, w.data(), 80, gpu.data(), 80);
+            gemmConst(false, false, false, 64, 80, 96, x.data(), 96, w.data(), 80, gpu.data(), 80);  // from the resident copy
+            gemmReference(false, false, 64, 80, 96, x.data(), 96, w.data(), 80, cpu.data(), 80);
+            CHECK(gpu.approxEquals(cpu, 1e-3f));
+        }
+        // A convolution against the CPU one, weights resident.
+        const std::size_t C = 24, H = 13, W = 11, O = 16, k = 3;
+        const Matrix img = Matrix::uniform(2, C * H * W, -1, 1), wt = Matrix::uniform(C * k * k, O, -1, 1), bias = Matrix::uniform(1, O, -1, 1);
+        Matrix out(2, O * H * W);
+        CHECK(gpuConvolution(img.data(), 2, C, H, W, wt.data(), false, bias.data(), O, k, 1, 1, out.data()));
+        CHECK(gpuConvolution(img.data(), 2, C, H, W, wt.data(), false, bias.data(), O, k, 1, 1, out.data()));
+        float worst = 0;
+        for (std::size_t b = 0; b < 2; ++b)
+            for (std::size_t o = 0; o < O; ++o)
+                for (std::size_t y = 0; y < H; ++y)
+                    for (std::size_t xx = 0; xx < W; ++xx) {
+                        double acc = bias(0, o);
+                        for (std::size_t c = 0; c < C; ++c)
+                            for (std::size_t ky = 0; ky < k; ++ky)
+                                for (std::size_t kx = 0; kx < k; ++kx) {
+                                    const long iy = static_cast<long>(y + ky) - 1, ix = static_cast<long>(xx + kx) - 1;
+                                    if (iy < 0 || ix < 0 || iy >= static_cast<long>(H) || ix >= static_cast<long>(W)) continue;
+                                    acc += img(b, (c * H + iy) * W + ix) * wt((c * k + ky) * k + kx, o);
+                                }
+                        worst = std::max(worst, std::fabs(static_cast<float>(acc) - out(b, (o * H + y) * W + xx)));
+                    }
+        CHECK(worst < 1e-3f);
+    }
+    setDevice(Device::CPU);
+    setGpuMinWork(saved);
+}
+
 TEST(gpu_fused_attention_matches_cpu) {
     if (!gpuAvailable()) return;
     std::cout << "         (attention kernels: head 40 " << gpuAttentionKernel(40) << ", head 64 " << gpuAttentionKernel(64)

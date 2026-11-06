@@ -6,8 +6,11 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <list>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -43,6 +46,13 @@ struct Buffer {
     }
 };
 
+// A constant operand kept on the device (weight scopes).
+struct Resident {
+    float* dev = nullptr;
+    std::size_t rows = 0, cols = 0, ld = 0, bytes = 0;  // host shape: rows x cols floats, row stride ld
+    std::list<const float*>::iterator use;              // position in the LRU list
+};
+
 struct State {
     bool ok = false;
     std::string name;
@@ -50,7 +60,12 @@ struct State {
     cublasHandle_t blas = nullptr;
     cudaStream_t stream = nullptr;
     Buffer a, b, c, s, q8, scales;
-    std::mutex mutex;  // one caller at a time: the buffers are shared
+    std::recursive_mutex mutex;  // one caller at a time: the buffers are shared
+    // Resident weights by host address; least recently used first in `lru`.
+    std::map<const float*, Resident> resident;
+    std::list<const float*> lru;
+    std::size_t residentBytes = 0, residentBudget = 0;
+    int scopes = 0;
 
     State() {
         int n = 0;
@@ -71,6 +86,9 @@ struct State {
         cublasSetMathMode(blas, tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
         name = std::string(prop.name) + " (sm_" + std::to_string(prop.major) + std::to_string(prop.minor) + ", " +
                std::to_string((prop.totalGlobalMem + (1ull << 29)) >> 30) + " GB)";
+        // Resident weights may use up to 60 % of the device (NEURACRAFT_CUDA_WEIGHTS_GB overrides).
+        residentBudget = prop.totalGlobalMem / 10 * 6;
+        if (const char* g = std::getenv("NEURACRAFT_CUDA_WEIGHTS_GB")) residentBudget = static_cast<std::size_t>(std::atof(g) * (1ull << 30));
         ok = true;
     }
 };
@@ -145,6 +163,70 @@ __global__ void softmaxRows(float* s, std::size_t cols, float scale) {
     for (std::size_t j = threadIdx.x; j < cols; j += blockDim.x) row[j] *= inv;
 }
 
+std::atomic<std::size_t> gResidentCount{0};
+
+void dropResident(State& st, std::map<const float*, Resident>::iterator it) {
+    cudaFree(it->second.dev);
+    st.residentBytes -= it->second.bytes;
+    st.lru.erase(it->second.use);
+    st.resident.erase(it);
+    gResidentCount = st.resident.size();
+}
+
+// The device copy of a constant host operand (rows x cols, stride ld), made if missing; null outside
+// a weight scope or when it cannot fit (the caller then copies it as usual).
+const float* residentCopy(State& st, const float* host, std::size_t rows, std::size_t cols, std::size_t ld) {
+    if (st.scopes == 0) return nullptr;
+    auto it = st.resident.find(host);
+    if (it != st.resident.end()) {
+        Resident& r = it->second;
+        if (r.rows == rows && r.cols == cols && r.ld == ld) {
+            st.lru.splice(st.lru.end(), st.lru, r.use);
+            return r.dev;
+        }
+        dropResident(st, it);
+    }
+    const std::size_t bytes = rows * cols * sizeof(float);
+    if (bytes > st.residentBudget) return nullptr;
+    while (st.residentBytes + bytes > st.residentBudget && !st.lru.empty()) dropResident(st, st.resident.find(st.lru.front()));
+    Resident r;
+    if (cudaMalloc(reinterpret_cast<void**>(&r.dev), bytes) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    check(cudaMemcpy2DAsync(r.dev, cols * sizeof(float), host, ld * sizeof(float), cols * sizeof(float), rows, cudaMemcpyHostToDevice, st.stream),
+          "upload weights");
+    r.rows = rows;
+    r.cols = cols;
+    r.ld = ld;
+    r.bytes = bytes;
+    r.use = st.lru.insert(st.lru.end(), host);
+    st.resident[host] = r;
+    st.residentBytes += bytes;
+    gResidentCount = st.resident.size();
+    return r.dev;
+}
+
+__global__ void im2col(const float* in, std::size_t C, std::size_t H, std::size_t W, std::size_t k, std::size_t stride, std::size_t pad,
+                       std::size_t OW, std::size_t p0, std::size_t n, float* cols) {
+    // cols (C*k*k x n): row r = (c, ky, kx), column j = output position p0 + j
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    const std::size_t kk = k * k;
+    if (i >= C * kk * n) return;
+    const std::size_t r = i / n, j = i % n, p = p0 + j;
+    const std::size_t c = r / kk, ky = r / k % k, kx = r % k, oy = p / OW, ox = p % OW;
+    const long iy = static_cast<long>(oy * stride + ky) - static_cast<long>(pad), ix = static_cast<long>(ox * stride + kx) - static_cast<long>(pad);
+    cols[i] = iy >= 0 && ix >= 0 && iy < static_cast<long>(H) && ix < static_cast<long>(W) ? in[(c * H + iy) * W + ix] : 0.0f;
+}
+
+__global__ void addBias(float* out, const float* bias, std::size_t channels, std::size_t plane) {
+    const std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (i >= channels * plane) return;
+    out[i] += bias[i / plane];
+}
+
+unsigned blocks(std::size_t n) { return static_cast<unsigned>((n + 255) / 256); }
+
 } // namespace
 
 bool available() { return state().ok; }
@@ -155,7 +237,112 @@ bool attentionSupported(std::size_t headSize) { return state().ok && headSize > 
 
 std::size_t deviceBytesInUse() {
     State& st = state();
-    return st.a.bytes + st.b.bytes + st.c.bytes + st.s.bytes + st.q8.bytes + st.scales.bytes;
+    std::lock_guard<std::recursive_mutex> lock(st.mutex);
+    return st.a.bytes + st.b.bytes + st.c.bytes + st.s.bytes + st.q8.bytes + st.scales.bytes + st.residentBytes;
+}
+
+void beginWeightScope() {
+    State& st = state();
+    std::lock_guard<std::recursive_mutex> lock(st.mutex);
+    ++st.scopes;
+}
+
+void endWeightScope() {
+    State& st = state();
+    std::lock_guard<std::recursive_mutex> lock(st.mutex);
+    if (st.scopes > 0 && --st.scopes == 0)
+        while (!st.resident.empty()) dropResident(st, st.resident.begin());
+}
+
+void forgetHost(const void* p, std::size_t bytes) {
+    if (gResidentCount.load(std::memory_order_relaxed) == 0) return;
+    State& st = state();
+    std::lock_guard<std::recursive_mutex> lock(st.mutex);
+    const float* lo = static_cast<const float*>(p);
+    const float* hi = reinterpret_cast<const float*>(static_cast<const char*>(p) + bytes);
+    for (auto it = st.resident.lower_bound(lo); it != st.resident.end() && it->first < hi;) {
+        auto next = std::next(it);
+        dropResident(st, it);
+        it = next;
+    }
+}
+
+void gemmConst(bool constA, bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K, const float* A, std::size_t lda,
+               const float* B, std::size_t ldb, float* C, std::size_t ldc, bool accumulate) {
+    State& st = state();
+    if (!st.ok) throw std::runtime_error("cuda: no device");
+    if (M == 0 || N == 0) return;
+    std::lock_guard<std::recursive_mutex> lock(st.mutex);
+    const std::size_t aRows = transA ? K : M, aCols = transA ? M : K, bRows = transB ? N : K, bCols = transB ? K : N;
+    const float* dA = constA ? residentCopy(st, A, aRows, aCols, lda) : nullptr;
+    const float* dB = !constA ? residentCopy(st, B, bRows, bCols, ldb) : nullptr;
+    if (!dA) {
+        float* p = st.a.get<float>(aRows * aCols);
+        upload(st, p, A, aRows, aCols, lda);
+        dA = p;
+    }
+    if (!dB) {
+        float* p = st.b.get<float>(bRows * bCols);
+        upload(st, p, B, bRows, bCols, ldb);
+        dB = p;
+    }
+    float* dC = st.c.get<float>(M * N);
+    if (accumulate) upload(st, dC, C, M, N, ldc);
+    if (K == 0) check(cudaMemsetAsync(dC, 0, M * N * sizeof(float), st.stream), "memset");
+    else deviceGemm(st, transA, transB, M, N, K, dA, aCols, dB, bCols, dC, N, accumulate ? 1.0f : 0.0f);
+    download(st, C, ldc, dC, M, N);
+    check(cudaStreamSynchronize(st.stream), "gemm");
+}
+
+void conv2d(const float* in, std::size_t batch, std::size_t C, std::size_t H, std::size_t W, const float* weights, bool outByPatch,
+            const float* bias, std::size_t outC, std::size_t k, std::size_t stride, std::size_t pad, float* out) {
+    State& st = state();
+    if (!st.ok) throw std::runtime_error("cuda: no device");
+    std::lock_guard<std::recursive_mutex> lock(st.mutex);
+    const std::size_t OH = (H + 2 * pad - k) / stride + 1, OW = (W + 2 * pad - k) / stride + 1, P = OH * OW, patch = C * k * k;
+    const std::size_t wRows = outByPatch ? outC : patch, wCols = outByPatch ? patch : outC;
+    const float* dW = residentCopy(st, weights, wRows, wCols, wCols);
+    if (!dW) {
+        float* p = st.b.get<float>(wRows * wCols);
+        upload(st, p, weights, wRows, wCols, wCols);
+        dW = p;
+    }
+    // (bias: a small upload each call, appended to the weights buffer when not resident)
+    float* dBias = nullptr;
+    if (bias) {
+        dBias = st.scales.get<float>(outC);
+        check(cudaMemcpyAsync(dBias, bias, outC * sizeof(float), cudaMemcpyHostToDevice, st.stream), "upload bias");
+    }
+    float* dIn = st.a.get<float>(batch * C * H * W);
+    float* dOut = st.c.get<float>(batch * outC * P);
+    check(cudaMemcpyAsync(dIn, in, batch * C * H * W * sizeof(float), cudaMemcpyHostToDevice, st.stream), "upload picture");
+    const bool plain = k == 1 && stride == 1 && pad == 0;
+    // Column strips of at most ~256 MB.
+    const std::size_t strip = plain ? P : std::max<std::size_t>(1, std::min(P, (std::size_t(1) << 26) / std::max<std::size_t>(1, patch)));
+    float* dCols = plain ? nullptr : st.s.get<float>(patch * strip);
+    for (std::size_t b = 0; b < batch; ++b) {
+        const float* img = dIn + b * C * H * W;
+        float* dst = dOut + b * outC * P;
+        for (std::size_t p0 = 0; p0 < P; p0 += strip) {
+            const std::size_t n = std::min(strip, P - p0);
+            const float* cols = img;
+            std::size_t ldCols = P;
+            if (!plain) {
+                im2col<<<blocks(patch * n), 256, 0, st.stream>>>(img, C, H, W, k, stride, pad, OW, p0, n, dCols);
+                check(cudaGetLastError(), "im2col");
+                cols = dCols;
+                ldCols = n;
+            }
+            // dst[:, p0 .. p0 + n) (outC x n, row stride P) = op(W) (outC x patch) * cols (patch x n)
+            deviceGemm(st, !outByPatch, false, outC, n, patch, dW, wCols, cols, ldCols, dst + p0, P, 0.0f);
+        }
+        if (dBias) {
+            addBias<<<blocks(outC * P), 256, 0, st.stream>>>(dst, dBias, outC, P);
+            check(cudaGetLastError(), "bias");
+        }
+    }
+    check(cudaMemcpyAsync(out, dOut, batch * outC * P * sizeof(float), cudaMemcpyDeviceToHost, st.stream), "download");
+    check(cudaStreamSynchronize(st.stream), "conv2d");
 }
 
 void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K, const float* A, std::size_t lda, const float* B,
@@ -163,7 +350,7 @@ void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,
     State& st = state();
     if (!st.ok) throw std::runtime_error("cuda: no device");
     if (M == 0 || N == 0) return;
-    std::lock_guard<std::mutex> lock(st.mutex);
+    std::lock_guard<std::recursive_mutex> lock(st.mutex);
     const std::size_t aRows = transA ? K : M, aCols = transA ? M : K, bRows = transB ? N : K, bCols = transB ? K : N;
     float* dA = st.a.get<float>(aRows * aCols);
     float* dB = st.b.get<float>(bRows * bCols);
@@ -182,7 +369,7 @@ void gemmQ8(bool quantLeft, std::size_t M, std::size_t N, std::size_t K, const s
     State& st = state();
     if (!st.ok) throw std::runtime_error("cuda: no device");
     if (M == 0 || N == 0) return;
-    std::lock_guard<std::mutex> lock(st.mutex);
+    std::lock_guard<std::recursive_mutex> lock(st.mutex);
     const std::size_t qRows = quantLeft ? M : N;
     signed char* dq = st.q8.get<signed char>(qRows * K);
     float* ds = st.scales.get<float>(qRows * groupsPerRow);
@@ -205,7 +392,7 @@ void gemmQ8(bool quantLeft, std::size_t M, std::size_t N, std::size_t K, const s
 void attention(std::size_t N, std::size_t M, std::size_t C, std::size_t heads, const float* q, const float* k, const float* v, float* out) {
     State& st = state();
     if (!st.ok) throw std::runtime_error("cuda: no device");
-    std::lock_guard<std::mutex> lock(st.mutex);
+    std::lock_guard<std::recursive_mutex> lock(st.mutex);
     const std::size_t dh = C / heads;
     float* dQ = st.a.get<float>(N * C);
     float* dKV = st.b.get<float>(2 * M * C);

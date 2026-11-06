@@ -1,4 +1,5 @@
 #include "Workflow.h"
+#include "Backend.h"
 #include "Onnx.h"
 #include "Depth.h"
 #include "Diffusion.h"
@@ -587,6 +588,7 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
         throw WorkflowLimitExceeded(message);
     }
     const DecodeLimit decodeLimit(limits.maxPixels);
+    const GpuWeightScope weightScope;  // layer weights stay on the GPU for the run
     const auto deadline = limits.maxSeconds > 0
                               ? std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(limits.maxSeconds))
                               : std::chrono::steady_clock::time_point::max();

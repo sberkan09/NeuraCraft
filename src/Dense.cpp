@@ -1,4 +1,5 @@
 #include "Dense.h"
+#include "Backend.h"
 
 #include <cmath>
 #include <iostream>
@@ -41,7 +42,10 @@ Matrix Dense::forward(const Matrix& input, bool training) {
     }
     // Inference keeps nothing for backward (large models would hold every activation).
     input_ = training ? input : Matrix();
-    Matrix out = input * weights_;
+    Matrix out(input.rows(), outputSize_);
+    if (training) out = input * weights_;
+    else gemmConst(false, false, false, input.rows(), outputSize_, inputSize_, input.data(), inputSize_, weights_.data(), outputSize_, out.data(),
+                   outputSize_);  // inference: the weights may stay on the GPU
     out.addRowVectorInPlace(bias_);
     return out;
 }

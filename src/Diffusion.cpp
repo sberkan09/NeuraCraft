@@ -1,4 +1,5 @@
 #include "Diffusion.h"
+#include "Backend.h"
 #include "Checkpoint.h"
 #include "Profile.h"
 #include "Activations.h"
@@ -432,7 +433,7 @@ ClipTextEncoder loadClipTextEncoder(const std::string& directory, bool int8, con
         }
     }
     enc.net.releaseGradients();
-    if (int8) enc.net.quantize();
+    if (int8 && !preferFloatWeights()) enc.net.quantize();
     return enc;
 }
 

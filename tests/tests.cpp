@@ -3692,6 +3692,22 @@ TEST(onnx_picture_pipeline_and_workflow_step) {
 
 // Running other people's workflows: files only inside the allowed folders, bounded sizes and time,
 // files renamed for a service, and the readers' guards against hostile files.
+TEST(model_cache_keeps_recent_models_when_asked) {
+    ModelCacheScope scope;
+    auto load = [](int v) { return [v] { return std::make_shared<int>(v); }; };
+    cachedModel<int>("a", "A", load(1));
+    cachedModel<int>("b", "B", load(2));
+    cachedModel<int>("c", "C", load(3));
+    cachedModel<int>("a", "A", load(9));  // a used again: the most recent
+    setModelCacheKeep(1);
+    releaseModelsExcept({"C"});
+    CHECK(modelCacheEntries() == 2);  // C (kept) and A (most recent of the rest)
+    CHECK(*cachedModel<int>("a", "A", load(7)) == 1);
+    setModelCacheKeep(0);
+    releaseModelsExcept({});
+    CHECK(modelCacheEntries() == 0);
+}
+
 TEST(workflow_sandbox_and_limits) {
     namespace fs = std::filesystem;
     const std::string dir = tempPath("sandbox");
@@ -5003,7 +5019,7 @@ TEST(gemm_gpu_matches_reference_when_available) {
         return;
     }
     std::cout << "         (GPU: " << gpuName() << ")\n";
-    checkGemmImplementation(gemmGpu, "metal");
+    checkGemmImplementation(gemmGpu, gpuBackendName().c_str());
 }
 
 TEST(gpu_device_trains_same_as_cpu) {
@@ -5118,11 +5134,67 @@ TEST(gpu_int8_products_match_cpu) {
     setGpuMinWork(saved);
 }
 
+TEST(gpu_resident_weights_follow_their_memory) {
+    // Inside a weight scope the GPU keeps constant operands; a freed and reused buffer (a model
+    // swapped for another of the same shape) must not be served from the old copy.
+    if (!gpuAvailable()) return;
+    setSeed(5);
+    const std::size_t saved = gpuMinWork();
+    setGpuMinWork(1);
+    setDevice(Device::GPU);
+    {
+        GpuWeightScope scope;
+        for (const std::size_t n : {std::size_t(80), std::size_t(256)}) {  // 30 KB (not kept) and 96 KB (kept) weights
+            const Matrix x = Matrix::uniform(64, 96, -1, 1);
+            for (int round = 0; round < 3; ++round) {
+                const Matrix w = Matrix::uniform(96, n, -1, 1);  // likely the same address each round
+                Matrix gpu(64, n), cpu(64, n);
+                gemmConst(false, false, false, 64, n, 96, x.data(), 96, w.data(), n, gpu.data(), n);
+                gemmConst(false, false, false, 64, n, 96, x.data(), 96, w.data(), n, gpu.data(), n);  // from the resident copy
+                gemmReference(false, false, 64, n, 96, x.data(), 96, w.data(), n, cpu.data(), n);
+                if (!gpu.approxEquals(cpu, 1e-3f)) std::cout << "         resident gemm " << n << " round " << round << " differs\n";
+                CHECK(gpu.approxEquals(cpu, 1e-3f));
+            }
+        }
+        // A convolution against the CPU one, weights resident (whole convolutions: CUDA only).
+        if (gpuBackendName() != "CUDA") {
+            setDevice(Device::CPU);
+            setGpuMinWork(saved);
+            return;
+        }
+        const std::size_t C = 24, H = 13, W = 11, O = 16, k = 3;
+        const Matrix img = Matrix::uniform(2, C * H * W, -1, 1), wt = Matrix::uniform(C * k * k, O, -1, 1), bias = Matrix::uniform(1, O, -1, 1);
+        Matrix out(2, O * H * W);
+        CHECK(gpuConvolution(img.data(), 2, C, H, W, wt.data(), false, bias.data(), O, k, 1, 1, out.data()));
+        CHECK(gpuConvolution(img.data(), 2, C, H, W, wt.data(), false, bias.data(), O, k, 1, 1, out.data()));
+        float worst = 0;
+        for (std::size_t b = 0; b < 2; ++b)
+            for (std::size_t o = 0; o < O; ++o)
+                for (std::size_t y = 0; y < H; ++y)
+                    for (std::size_t xx = 0; xx < W; ++xx) {
+                        double acc = bias(0, o);
+                        for (std::size_t c = 0; c < C; ++c)
+                            for (std::size_t ky = 0; ky < k; ++ky)
+                                for (std::size_t kx = 0; kx < k; ++kx) {
+                                    const long iy = static_cast<long>(y + ky) - 1, ix = static_cast<long>(xx + kx) - 1;
+                                    if (iy < 0 || ix < 0 || iy >= static_cast<long>(H) || ix >= static_cast<long>(W)) continue;
+                                    acc += img(b, (c * H + iy) * W + ix) * wt((c * k + ky) * k + kx, o);
+                                }
+                        worst = std::max(worst, std::fabs(static_cast<float>(acc) - out(b, (o * H + y) * W + xx)));
+                    }
+        if (worst >= 1e-3f) std::cout << "         gpu convolution max diff " << worst << "\n";
+        CHECK(worst < 1e-3f);
+    }
+    setDevice(Device::CPU);
+    setGpuMinWork(saved);
+}
+
 TEST(gpu_fused_attention_matches_cpu) {
     if (!gpuAvailable()) return;
     std::cout << "         (attention kernels: head 40 " << gpuAttentionKernel(40) << ", head 64 " << gpuAttentionKernel(64)
               << ", head 36 " << gpuAttentionKernel(36) << ")\n";
-    CHECK(gpuAttentionKernel(36) == "scalar" && gpuAttentionKernel(512).empty());
+    if (gpuBackendName() == "Metal") CHECK(gpuAttentionKernel(36) == "scalar" && gpuAttentionKernel(512).empty());
+    else CHECK(!gpuAttentionKernel(36).empty() && gpuAttentionKernel(512).empty());
     setSeed(91);
     const std::size_t saved = gpuMinWork();
     setGpuMinWork(1);

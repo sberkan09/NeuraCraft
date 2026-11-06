@@ -14,6 +14,9 @@
 #ifdef NEURACRAFT_HAS_METAL
 #include "MetalBackend.h"
 #endif
+#ifdef NEURACRAFT_HAS_CUDA
+#include "CudaBackend.h"
+#endif
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -286,6 +289,13 @@ Matrix QuantizedWeights::multiply(const Matrix& x) const {
                       x.pageBacked() ? x.storageBytes() : 0, out.data(), out_, out.pageBacked() ? out.storageBytes() : 0);
         return out;
     }
+#elif defined(NEURACRAFT_HAS_CUDA)
+    if (gpuProducts(n)) {
+        NC_PROFILE("int8 gemm gpu");
+        Matrix out(n, out_);
+        cuda::gemmQ8(false, n, out_, in_, q_.data(), scale_.data(), groupsPerRow_, group_, x.data(), in_, out.data(), out_);
+        return out;
+    }
 #endif
     if (n >= kGemmRows) {
         // Many rows: expand tiles of weight rows (at most ~2M floats each) and use the float GEMM.
@@ -351,9 +361,11 @@ Matrix QuantizedWeights::multiply(const Matrix& x) const {
 }
 
 bool QuantizedWeights::gpuProducts(std::size_t n) const {
-#ifdef NEURACRAFT_HAS_METAL
+#if defined(NEURACRAFT_HAS_METAL)
     return n >= kGemmRows && currentDevice() == Device::GPU && n * out_ * in_ >= gpuMinWork() && !q_.empty() &&
            metal::int8Available();
+#elif defined(NEURACRAFT_HAS_CUDA)
+    return n >= kGemmRows && currentDevice() == Device::GPU && n * out_ * in_ >= gpuMinWork() && !q_.empty() && cuda::int8Available();
 #else
     (void)n;
     return false;
@@ -369,6 +381,12 @@ void QuantizedWeights::multiplyLeft(std::size_t n, const float* b, std::size_t l
         metal::gemmQ8(true, out_, n, in_, q_.data(), mapBytes(q_.capacity()), scale_.data(),
                       mapBytes(scale_.capacity() * sizeof(float)), groupsPerRow_, group_, b, ldb, bMapBytes, c, ldc,
                       cMapBytes);
+        return;
+    }
+#elif defined(NEURACRAFT_HAS_CUDA)
+    if (gpuProducts(n)) {
+        NC_PROFILE("int8 gemm gpu");
+        cuda::gemmQ8(true, out_, n, in_, q_.data(), scale_.data(), groupsPerRow_, group_, b, ldb, c, ldc);
         return;
     }
 #endif

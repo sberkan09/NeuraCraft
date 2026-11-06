@@ -1,6 +1,8 @@
 #include "ModelCache.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -12,8 +14,11 @@ namespace {
 struct Entry {
     std::string tag;
     std::shared_ptr<void> value;
+    std::uint64_t used = 0;  // last use (gClock)
 };
 std::atomic<bool> gEnabled{false};
+std::atomic<std::size_t> gKeep{0};
+std::uint64_t gClock = 0;  // under gMutex
 std::mutex gMutex;
 std::map<std::string, Entry>& entries() {
     static std::map<std::string, Entry> e;
@@ -38,11 +43,26 @@ std::size_t modelCacheEntries() {
     return entries().size();
 }
 
+void setModelCacheKeep(std::size_t models) { gKeep = models; }
+std::size_t modelCacheKeep() { return gKeep.load(); }
+
 void releaseModelsExcept(const std::set<std::string>& keep) {
     std::vector<std::shared_ptr<void>> dropped;
     std::lock_guard<std::mutex> lock(gMutex);
+    // The most recently used tags outside `keep` that stay anyway.
+    std::set<std::string> recent;
+    if (gKeep.load()) {
+        std::vector<std::pair<std::uint64_t, std::string>> uses;
+        for (const auto& [_, e] : entries())
+            if (!keep.count(e.tag)) uses.push_back({e.used, e.tag});
+        std::sort(uses.rbegin(), uses.rend());
+        for (const auto& [_, tag] : uses) {
+            if (recent.size() >= gKeep.load()) break;
+            recent.insert(tag);
+        }
+    }
     for (auto it = entries().begin(); it != entries().end();) {
-        if (keep.count(it->second.tag)) {
+        if (keep.count(it->second.tag) || recent.count(it->second.tag)) {
             ++it;
         } else {
             dropped.push_back(std::move(it->second.value));
@@ -62,11 +82,13 @@ namespace detail {
 std::shared_ptr<void> cacheFind(const std::string& key) {
     std::lock_guard<std::mutex> lock(gMutex);
     auto it = entries().find(key);
-    return it == entries().end() ? nullptr : it->second.value;
+    if (it == entries().end()) return nullptr;
+    it->second.used = ++gClock;
+    return it->second.value;
 }
 void cacheStore(const std::string& key, const std::string& tag, std::shared_ptr<void> value) {
     std::lock_guard<std::mutex> lock(gMutex);
-    entries()[key] = Entry{tag, std::move(value)};
+    entries()[key] = Entry{tag, std::move(value), ++gClock};
 }
 } // namespace detail
 

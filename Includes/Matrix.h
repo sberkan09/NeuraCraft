@@ -17,7 +17,7 @@ constexpr std::size_t kPageBackedBytes = 64 * 1024;
 
 namespace detail {
 void* allocateStorage(std::size_t bytes);
-void freeStorage(void* p) noexcept;
+void freeStorage(void* p, std::size_t bytes) noexcept;  // bytes: what was asked of allocateStorage
 std::size_t storageBytesFor(std::size_t bytes);  // bytes actually reserved for a request
 } // namespace detail
 
@@ -28,7 +28,7 @@ struct StorageAllocator {
     template <typename U>
     StorageAllocator(const StorageAllocator<U>&) noexcept {}
     T* allocate(std::size_t n) { return static_cast<T*>(detail::allocateStorage(n * sizeof(T))); }
-    void deallocate(T* p, std::size_t) noexcept { detail::freeStorage(p); }
+    void deallocate(T* p, std::size_t n) noexcept { detail::freeStorage(p, n * sizeof(T)); }
 };
 template <typename T, typename U>
 bool operator==(const StorageAllocator<T>&, const StorageAllocator<U>&) noexcept { return true; }

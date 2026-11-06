@@ -23,6 +23,7 @@ Device currentDevice();
 std::string deviceDescription();
 std::string cpuBackendName();  // "Accelerate" or "NeuraCraft blocked kernel"
 std::string gpuName();         // empty if no GPU
+std::string gpuBackendName();  // "Metal", "CUDA", or empty without a GPU backend
 // Whether int8 layers (QuantizedWeights) multiply on the GPU straight from
 // their int8 weights; otherwise they expand them to float for the GPU GEMM.
 bool gpuInt8Available();
@@ -62,6 +63,38 @@ std::string gpuAttentionKernel(std::size_t headSize);
 // divisible by 8) or "scalar"; "" goes back to the default / NEURACRAFT_METAL_ATTENTION.
 void setGpuAttentionKernel(const std::string& name);
 bool gpuAttentionEnabled();
+
+// GPU weight residency. While at least one GpuWeightScope is alive, the constant operands of
+// gemmConst() and gpuConvolution() (layer weights in inference) are uploaded to the GPU once and
+// reused, instead of being copied on every product; the copies go when their host memory is freed
+// and when the last scope closes. Inside a scope those weights must not be changed in place
+// (inference never does; training should not open one). Only operands of 64 KB or more are kept,
+// and they must live in Matrix storage (whose frees are tracked). No effect on the CPU or without CUDA.
+class GpuWeightScope {
+public:
+    GpuWeightScope();
+    ~GpuWeightScope();
+    GpuWeightScope(const GpuWeightScope&) = delete;
+    GpuWeightScope& operator=(const GpuWeightScope&) = delete;
+};
+
+// gemm() where one operand (constA: A, else B) is a constant weight matrix (see GpuWeightScope).
+void gemmConst(bool constA, bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K, const float* A, std::size_t lda,
+               const float* B, std::size_t ldb, float* C, std::size_t ldc, bool accumulate = false);
+
+// A whole convolution on the GPU when one is active and supports it: `batch` NCHW pictures
+// (C x H x W) -> batch x outC x OH x OW. weights: patch x outC (outByPatch false) or outC x patch,
+// patch = C * k * k; bias may be null. Returns false (out untouched) when it does not run there.
+bool gpuConvolution(const float* in, std::size_t batch, std::size_t C, std::size_t H, std::size_t W, const float* weights, bool outByPatch,
+                    const float* bias, std::size_t outC, std::size_t k, std::size_t stride, std::size_t pad, float* out);
+
+// Whether image models should keep float weights instead of int8 ones: on a CUDA GPU the float
+// weights stay resident in device memory and run on cuBLAS, which beats expanding int8 weights on
+// every product. NEURACRAFT_GPU_INT8=1 keeps int8 anyway (to save memory).
+bool preferFloatWeights();
+
+// Called by the matrix storage when it frees a block (drops GPU copies made from it).
+void gpuHostMemoryFreed(const void* p, std::size_t bytes);
 
 // Vectorized dot product of two float arrays.
 float dot(const float* a, const float* b, std::size_t n);

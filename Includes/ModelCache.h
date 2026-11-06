@@ -23,8 +23,14 @@ void setModelCaching(bool enabled);
 bool modelCaching();
 void clearModelCache();
 std::size_t modelCacheEntries();
-// Drops every entry whose tag is not in `keep`.
+// Drops every entry whose tag is not in `keep` - except the setModelCacheKeep() most recently used
+// ones, which stay loaded for later runs.
 void releaseModelsExcept(const std::set<std::string>& keep);
+// How many recently used models survive releaseModelsExcept (default 0). A long-running process
+// that serves workflows one after another (a worker) keeps an outer ModelCacheScope open and a
+// small count here, so a model the next job uses again is not read from disk again.
+void setModelCacheKeep(std::size_t models);
+std::size_t modelCacheKeep();
 // "data/sd/../sd" and "data/sd/" -> "data/sd"; width / height > 0 append "@WxH".
 std::string modelTag(const std::string& path, std::size_t width = 0, std::size_t height = 0);
 

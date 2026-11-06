@@ -123,6 +123,12 @@ Matrix Conv2D::forwardQuantized(const Matrix& input) const {
 
 Matrix Conv2D::forwardInference(const Matrix& input) const {
     NC_PROFILE("conv (im2col, bias)");
+    if (!quantized()) {
+        Matrix out(input.rows(), outChannels_ * outH_ * outW_);
+        if (gpuConvolution(input.data(), input.rows(), in_.channels, in_.height, in_.width, weights_.data(), false, bias_.data(), outChannels_, kernel_,
+                           stride_, padding_, out.data()))
+            return out;
+    }
     if (quantized()) return forwardQuantized(input);
     return stripConvolution(input, weights_.data(), false);
 }

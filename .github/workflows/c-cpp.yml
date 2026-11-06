@@ -44,6 +44,19 @@ jobs:
     - name: Train on the GPU (falls back to CPU without one)
       run: ./bin/NeuraCraft --gpu spiral
 
+  cuda-build:
+    # Builds the CUDA backend (no GPU on the runner: compile and link only, then the CPU tests).
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+    - name: Tools
+      run: apt-get update -qq && apt-get install -y -qq git cmake g++ make > /dev/null
+    - uses: actions/checkout@v4
+    - name: Build with CUDA
+      run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNEURACRAFT_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 && cmake --build build --parallel
+    - name: Tests (no GPU, so the CPU paths)
+      run: ./build/neuracraft_tests
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

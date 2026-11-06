@@ -59,7 +59,9 @@ void* allocateStorage(std::size_t bytes) {
     return p;
 }
 
-void freeStorage(void* p) noexcept {
+void freeStorage(void* p, std::size_t bytes) noexcept {
+    // Large blocks may hold weights the GPU keeps a copy of.
+    if (p && bytes >= kPageBackedBytes) gpuHostMemoryFreed(p, bytes);
 #ifdef _WIN32
     _aligned_free(p);
 #else

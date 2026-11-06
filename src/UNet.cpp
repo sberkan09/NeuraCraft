@@ -150,7 +150,7 @@ struct Weights {
         const std::size_t out = c.outputShape().channels, patch = c.inputShape().channels * c.kernelSize() * c.kernelSize();
         c.weights() = take(p + ".weight", out, patch).transpose();
         c.bias() = take(p + ".bias", 1, out);
-        if (int8) c.quantize();
+        if (int8 && !preferFloatWeights()) c.quantize();
     }
     void norm(GroupNorm& g, const std::string& p, std::size_t ch) {
         g.gamma() = take(p + ".weight", 1, ch);
@@ -164,7 +164,7 @@ struct Weights {
     void linear(Dense& d, const std::string& p) {
         d.weights() = take(p + ".weight", d.outputSize(), d.inputSize()).transpose();
         d.bias() = has(p + ".bias") ? take(p + ".bias", 1, d.outputSize()) : Matrix(1, d.outputSize());
-        if (int8) d.quantize();
+        if (int8 && !preferFloatWeights()) d.quantize();
     }
     std::string file;
     SafeTensors st;

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -16,6 +17,9 @@
 
 #ifdef NEURACRAFT_HAS_METAL
 #include "MetalBackend.h"
+#endif
+#ifdef NEURACRAFT_HAS_CUDA
+#include "CudaBackend.h"
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -374,14 +378,16 @@ bool gpuAttentionEnabled() { return gGpuAttention.load(); }
 void setGpuAttentionKernel(const std::string& name) {
 #ifdef NEURACRAFT_HAS_METAL
     if (metal::available()) metal::setAttentionKernel(name);
-#else
+#else  // (CUDA has one attention implementation)
     (void)name;
 #endif
 }
 
 std::string gpuAttentionKernel(std::size_t headSize) {
-#ifdef NEURACRAFT_HAS_METAL
+#if defined(NEURACRAFT_HAS_METAL)
     return metal::available() ? metal::attentionKernelName(headSize) : std::string();
+#elif defined(NEURACRAFT_HAS_CUDA)
+    return cuda::attentionSupported(headSize) ? "cublas" : std::string();
 #else
     (void)headSize;
     return std::string();
@@ -398,6 +404,14 @@ bool gpuAttention(const Matrix& q, const Matrix& k, const Matrix& v, std::size_t
     auto map = [](const Matrix& m) { return m.pageBacked() ? m.storageBytes() : std::size_t(0); };
     metal::attention(N, M, C, heads, q.data(), map(q), k.data(), map(k), v.data(), map(v), out.data(), map(out));
     return true;
+#elif defined(NEURACRAFT_HAS_CUDA)
+    const std::size_t N = q.rows(), M = k.rows(), C = q.cols();
+    if ((currentDevice() != Device::GPU && !gpuAttentionEnabled()) || heads == 0 || C % heads != 0 || M == 0 || N == 0) return false;
+    if (k.cols() != C || v.cols() != C || v.rows() != M || out.rows() != N || out.cols() != C) return false;
+    if (2 * N * M * C < gpuMinWork() || !cuda::attentionSupported(C / heads)) return false;
+    NC_PROFILE("attention gpu");
+    cuda::attention(N, M, C, heads, q.data(), k.data(), v.data(), out.data());
+    return true;
 #else
     (void)q; (void)k; (void)v; (void)heads; (void)out;
     return false;
@@ -405,8 +419,10 @@ bool gpuAttention(const Matrix& q, const Matrix& k, const Matrix& v, std::size_t
 }
 
 bool gpuAvailable() {
-#ifdef NEURACRAFT_HAS_METAL
+#if defined(NEURACRAFT_HAS_METAL)
     return metal::available();
+#elif defined(NEURACRAFT_HAS_CUDA)
+    return cuda::available();
 #else
     return false;
 #endif
@@ -432,23 +448,37 @@ std::string cpuBackendName() {
 }
 
 std::string gpuName() {
-#ifdef NEURACRAFT_HAS_METAL
+#if defined(NEURACRAFT_HAS_METAL)
     return metal::available() ? metal::deviceName() + ", " + metal::kernelName() + " kernel" : std::string();
+#elif defined(NEURACRAFT_HAS_CUDA)
+    return cuda::available() ? cuda::deviceName() + ", " + cuda::kernelName() : std::string();
+#else
+    return std::string();
+#endif
+}
+
+std::string gpuBackendName() {
+#if defined(NEURACRAFT_HAS_METAL)
+    return "Metal";
+#elif defined(NEURACRAFT_HAS_CUDA)
+    return "CUDA";
 #else
     return std::string();
 #endif
 }
 
 bool gpuInt8Available() {
-#ifdef NEURACRAFT_HAS_METAL
+#if defined(NEURACRAFT_HAS_METAL)
     return metal::int8Available();
+#elif defined(NEURACRAFT_HAS_CUDA)
+    return cuda::int8Available();
 #else
     return false;
 #endif
 }
 
 std::string deviceDescription() {
-    if (currentDevice() == Device::GPU) return "GPU (" + gpuName() + ", Metal)";
+    if (currentDevice() == Device::GPU) return "GPU (" + gpuName() + ", " + gpuBackendName() + ")";
     return "CPU (" + cpuBackendName() + ", " + std::to_string(threadCount()) + " threads)";
 }
 
@@ -501,6 +531,11 @@ void gemmGpu(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t
     if (M == 0 || N == 0) return;
     NC_PROFILE("gemm gpu");
     metal::gemm(transA, transB, M, N, K, A, lda, B, ldb, C, ldc, accumulate);
+#elif defined(NEURACRAFT_HAS_CUDA)
+    if (!cuda::available()) throw std::runtime_error("gemmGpu: no CUDA device available");
+    if (M == 0 || N == 0) return;
+    NC_PROFILE("gemm gpu");
+    cuda::gemm(transA, transB, M, N, K, A, lda, B, ldb, C, ldc, accumulate);
 #else
     (void)transA; (void)transB; (void)M; (void)N; (void)K; (void)A; (void)lda; (void)B; (void)ldb;
     (void)C; (void)ldc; (void)accumulate;
@@ -525,6 +560,67 @@ void matmul(const Matrix& a, bool transA, const Matrix& b, bool transB, Matrix& 
     }
 #endif
     gemm(transA, transB, M, N, K, a.data(), a.cols(), b.data(), b.cols(), c.data(), N, false);
+}
+
+GpuWeightScope::GpuWeightScope() {
+#ifdef NEURACRAFT_HAS_CUDA
+    if (cuda::available()) cuda::beginWeightScope();
+#endif
+}
+GpuWeightScope::~GpuWeightScope() {
+#ifdef NEURACRAFT_HAS_CUDA
+    if (cuda::available()) cuda::endWeightScope();
+#endif
+}
+
+bool preferFloatWeights() {
+#ifdef NEURACRAFT_HAS_CUDA
+    static const bool int8 = [] {
+        const char* e = std::getenv("NEURACRAFT_GPU_INT8");
+        return e && std::string(e) == "1";
+    }();
+    return !int8 && currentDevice() == Device::GPU && cuda::available();
+#else
+    return false;
+#endif
+}
+
+void gpuHostMemoryFreed(const void* p, std::size_t bytes) {
+#ifdef NEURACRAFT_HAS_CUDA
+    cuda::forgetHost(p, bytes);
+#else
+    (void)p;
+    (void)bytes;
+#endif
+}
+
+void gemmConst(bool constA, bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K, const float* A, std::size_t lda,
+               const float* B, std::size_t ldb, float* C, std::size_t ldc, bool accumulate) {
+#ifdef NEURACRAFT_HAS_CUDA
+    if (currentDevice() == Device::GPU && M * N * K >= gpuMinWork() && cuda::available()) {
+        checkDims(M, N, K, transA, transB, lda, ldb, ldc);
+        NC_PROFILE("gemm gpu");
+        cuda::gemmConst(constA, transA, transB, M, N, K, A, lda, B, ldb, C, ldc, accumulate);
+        return;
+    }
+#endif
+    (void)constA;
+    gemm(transA, transB, M, N, K, A, lda, B, ldb, C, ldc, accumulate);
+}
+
+bool gpuConvolution(const float* in, std::size_t batch, std::size_t C, std::size_t H, std::size_t W, const float* weights, bool outByPatch,
+                    const float* bias, std::size_t outC, std::size_t k, std::size_t stride, std::size_t pad, float* out) {
+#ifdef NEURACRAFT_HAS_CUDA
+    if (currentDevice() != Device::GPU || !cuda::available() || k == 0 || stride == 0 || H + 2 * pad < k || W + 2 * pad < k) return false;
+    const std::size_t OH = (H + 2 * pad - k) / stride + 1, OW = (W + 2 * pad - k) / stride + 1;
+    if (batch * OH * OW * outC * C * k * k < gpuMinWork()) return false;
+    NC_PROFILE("conv gpu");
+    cuda::conv2d(in, batch, C, H, W, weights, outByPatch, bias, outC, k, stride, pad, out);
+    return true;
+#else
+    (void)in; (void)batch; (void)C; (void)H; (void)W; (void)weights; (void)outByPatch; (void)bias; (void)outC; (void)k; (void)stride; (void)pad; (void)out;
+    return false;
+#endif
 }
 
 void gemm(bool transA, bool transB, std::size_t M, std::size_t N, std::size_t K,

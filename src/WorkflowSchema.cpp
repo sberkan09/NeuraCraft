@@ -84,15 +84,17 @@ std::vector<WorkflowOp> buildOps() {
         op.doc = doc;
         op.output = output;
         op.fields = std::move(fields);
-        if (output) op.fields.push_back(field("out", "string", "", "Name of the clip this step makes (default: the op's name)"));
+        if (output) op.fields.push_back(field("out", "string", "", "Name of what this step makes (default: the op's name)"));
         ops.push_back(std::move(op));
     };
 
-    add("load", "Load", "input", "Pictures from a file or a folder of frames", true,
-        {field("path", "file", "", "Picture file (.png, .ppm)"), field("dir", "dir", "", "Folder of frames, in name order")});
-    add("save", "Save", "input", "Writes a clip: .png / .jpg for one frame, .gif / .png / .mov for a clip, a folder ending in / for frames",
+    add("load", "Load", "input", "Pictures from a file or a folder of frames, or a 3D model (.glb, .obj, .ply)", true,
+        {field("path", "file", "", "Picture (.png, .ppm) or 3D model (.glb, .obj, .ply) file"), field("dir", "dir", "", "Folder of frames, in name order")});
+    ops.back().makes = "any";
+    add("save", "Save", "input",
+        "Writes a clip: .png / .jpg for one frame, .gif / .png / .mov for a clip, a folder ending in / for frames; a 3D model: .glb, .obj, .ply",
         false,
-        {field("in", "clip", "", "Clip to write", true), field("path", "file", "", "Output file", true),
+        {field("in", "clip", "", "Clip or 3D model to write", true), field("path", "file", "", "Output file", true),
          number("fps", "float", "8", "Frames per second", 1, 120), number("quality", "int", "90", "JPEG / MJPEG quality", 1, 100)});
     add("resize", "Resize", "edit", "Scales every frame", true,
         {field("in", "clip", "", "Input", true), number("width", "int", "", "Width (default: unchanged)", 1, 16384),
@@ -164,6 +166,18 @@ std::vector<WorkflowOp> buildOps() {
     add("interpolate", "Interpolate", "enhance", "RIFE in-between frames (each pass doubles the frame rate)", true,
         {model("model", "rife", "RIFE weights", true), field("in", "clip", "", "Clip", true),
          number("passes", "int", "1", "Doublings", 1, 4), field("loop", "bool", "false", "Also between the last and first frame")});
+    add("depth_mesh", "Depth to 3D", "3d", "A 3D relief of a picture, raised by its depth and textured with it", true,
+        {model("model", "depth", "Depth Anything V2 folder", true), field("in", "clip", "", "Picture", true),
+         number("grid", "int", "256", "Vertices along the longer side", 16, 1024), number("depth", "float", "0.4", "Relief height (fraction of the height)", 0, 2),
+         number("edges", "float", "0.08", "Largest depth step inside a triangle (0..1; 0 keeps all, joining foreground and background)", 0, 1),
+         number("size", "int", "518", "Depth network input size", 14, 2044)});
+    ops.back().makes = "mesh";
+    add("render", "Render 3D", "3d", "Pictures of a 3D model: a still, or a turntable clip", true,
+        {field("in", "mesh", "", "3D model", true), number("width", "int", "512", "Width", 16, 4096), number("height", "int", "512", "Height", 16, 4096),
+         number("frames", "int", "1", "Frames (more than 1: a turntable)", 1, 720), number("turn", "float", "360", "Degrees turned over the frames", -1080, 1080),
+         number("yaw", "float", "0", "Starting angle around the model (degrees)", -360, 360), number("pitch", "float", "15", "Camera height (degrees)", -89, 89),
+         number("fov", "float", "35", "Field of view (degrees)", 5, 120), choice("background", {"white", "grey", "black"}, "\"white\"", "Background"),
+         field("lighting", "bool", "true", "Shade by a light (off: flat colours)")});
     return ops;
 }
 
@@ -300,6 +314,7 @@ std::string workflowSchemaJson() {
                                         {"group", json::makeString(op.group)},
                                         {"doc", json::makeString(op.doc)},
                                         {"output", json::makeBool(op.output)},
+                                        {"makes", json::makeString(op.output ? op.makes : std::string())},
                                         {"fields", json::makeArray(fields)}}));
     }
     return json::dump(json::makeObject({{"version", json::makeNumber(1)}, {"ops", json::makeArray(ops)}}));

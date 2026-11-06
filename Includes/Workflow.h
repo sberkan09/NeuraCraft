@@ -14,6 +14,7 @@
 // See runWorkflow for the operations and their fields.
 
 #include "Image.h"
+#include "Mesh.h"
 
 #include <cstddef>
 #include <functional>
@@ -43,6 +44,9 @@ using Clip = std::vector<Image>;
 //   - upscale {model, in} - interpolate {model, in, passes, loop} - concat {in: [clips]}
 //   - blend {in: [a, b], mode: mix | add | multiply | difference, weight (0.5), mask (clip)}: b over a frame by
 //   frame (b resized to a; a one-frame clip is used for every frame), e.g. a skip connection from an earlier step.
+//   - depth_mesh {model, in, grid, depth, edges, size}: a 3D relief mesh of a picture (Mesh.h) - render {in (mesh),
+//   width, height, frames, turn, yaw, pitch, fov, background, lighting}: a still or a turntable clip of a mesh. load
+//   reads a mesh from .glb / .obj / .ply, save writes one to those; meshes and clips share one namespace.
 // Any step can read any clip made before it, so a workflow is a graph run in the listed order.
 // Models are cached between steps ("cache": false at the top level turns it off): each one is loaded by the
 // first step that needs it and released after the last one (ModelCache.h).
@@ -60,7 +64,7 @@ struct WorkflowEvents {
     std::function<void(std::size_t step, std::size_t steps, const std::string& op, const std::string& stage, double fraction)> progress;
     // Live preview of a denoising step (half size; needs a TAESD in the step).
     std::function<void(std::size_t step, const Image& picture)> preview;
-    // A step finished; clip is the name of what it made ("" for save).
+    // A step finished; clip is the name of what it made ("" for save); for a mesh, frames is one rendered view.
     std::function<void(std::size_t step, const std::string& op, const std::string& clip, const Clip& frames, double seconds)> output;
     // Polled between denoising steps and frames; true stops the run with WorkflowCancelled.
     std::function<bool()> cancelled;
@@ -82,6 +86,8 @@ public:
     explicit WorkflowResultCache(std::size_t maxBytes = std::size_t(1) << 30) : maxBytes_(maxBytes) {}
     std::shared_ptr<const Clip> find(const std::string& key);
     void put(const std::string& key, const Clip& clip);
+    std::shared_ptr<const Mesh> findMesh(const std::string& key);
+    void putMesh(const std::string& key, std::shared_ptr<const Mesh> mesh);
     void clear();
     std::size_t bytes() const;
     std::size_t size() const;
@@ -90,9 +96,11 @@ public:
 private:
     struct Entry {
         std::string key;
-        std::shared_ptr<const Clip> clip;
+        std::shared_ptr<const Clip> clip;  // one of these two
+        std::shared_ptr<const Mesh> mesh;
         std::size_t bytes;
     };
+    void insert(Entry entry);
     mutable std::mutex mutex_;
     std::list<Entry> entries_;  // most recently used first
     std::size_t maxBytes_, bytes_ = 0, hits_ = 0;
@@ -143,7 +151,7 @@ std::string mapWorkflowFiles(const std::string& json, const std::function<std::s
 
 struct WorkflowField {
     std::string name;
-    // int, float, bool, string, text (a prompt), enum (see options), clip (a clip name), clips (names),
+    // int, float, bool, string, text (a prompt), enum (see options), clip (a clip name), clips (names), mesh (a 3D model's name),
     // model (see model), loras ("file" / "file:scale" list), file, dir, strings, ints, keyframes ([[frame, "prompt"]])
     std::string type;
     std::string defaultJson;            // JSON text of the default, "" = none
@@ -156,14 +164,15 @@ struct WorkflowField {
 };
 
 struct WorkflowOp {
-    std::string name, title, group, doc;  // group: input, edit, image, video, analysis, enhance
-    bool output = true;                   // makes a clip (named by "out")
+    std::string name, title, group, doc;  // group: input, edit, image, video, analysis, enhance, 3d
+    bool output = true;                   // makes a clip or a mesh (named by "out")
+    std::string makes = "clip";           // what it makes: "clip", "mesh", or "any" (load: by the file)
     std::vector<WorkflowField> fields;
 };
 
 const std::vector<WorkflowOp>& workflowOps();
 const WorkflowOp* findWorkflowOp(const std::string& name);  // nullptr if unknown
-// {"version": 1, "ops": [{name, title, group, doc, output, fields: [{name, type, doc, required, default?,
+// {"version": 1, "ops": [{name, title, group, doc, output, makes, fields: [{name, type, doc, required, default?,
 // model?, options?, min?, max?}]}]}
 std::string workflowSchemaJson();
 

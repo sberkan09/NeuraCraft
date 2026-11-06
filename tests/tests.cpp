@@ -4365,6 +4365,108 @@ TEST(depth_anything_and_parallax) {
     const auto frames = parallaxAnimation(img, depth, po);
     CHECK(frames.size() == 8 && frames[0].pixels == img.pixels && frames[2].pixels != img.pixels);
     CHECK_THROWS(parallaxAnimation(img, std::vector<float>(10), po), std::invalid_argument);
+
+    // depth_mesh and render in a workflow: picture -> 3D relief -> .glb / .ply and a turntable clip.
+    const std::string out = tempPath("depth_mesh_out");
+    std::filesystem::create_directories(out);
+    savePng(out + "/in.png", img);
+    std::vector<std::string> seen;
+    WorkflowEvents ev;
+    ev.output = [&](std::size_t, const std::string& op, const std::string& name, const Clip& frames, double) {
+        if (op == "depth_mesh") CHECK(name == "relief" && frames.size() == 1 && frames[0].width == 256);  // a preview view
+        seen.push_back(op);
+    };
+    const std::string wf = R"({"steps":[{"op":"load","path":"in.png","out":"pic"},)"
+                           R"({"op":"depth_mesh","model":")" + dir + R"(","in":"pic","grid":24,"size":28,"edges":0,"out":"relief"},)"
+                           R"({"op":"render","in":"relief","width":64,"height":48,"frames":3,"out":"turn"},)"
+                           R"({"op":"save","in":"relief","path":"relief.glb"},{"op":"save","in":"relief","path":"relief.ply"},)"
+                           R"({"op":"save","in":"turn","path":"turn.gif"}]})";
+    WorkflowResultCache results;
+    const auto clips = runWorkflow(wf, out, ev, &results);
+    CHECK(clips.count("turn") && clips.at("turn").size() == 3 && clips.at("turn")[0].width == 64 && !clips.count("relief"));
+    const Mesh glb = loadMesh(out + "/relief.glb"), ply = loadMesh(out + "/relief.ply");
+    CHECK(glb.vertexCount() > 100 && glb.triangleCount() == ply.triangleCount() && glb.texture.width == 50 && !ply.colors.empty());
+    CHECK(seen.size() == 6);
+    // Run again: the mesh comes from the result cache.
+    const std::size_t hits = results.hits();
+    runWorkflow(wf, out, ev, &results);
+    CHECK(results.hits() > hits);
+    // A clip is not a mesh, and a mesh is not saved as a picture.
+    CHECK_THROWS(runWorkflow(R"({"steps":[{"op":"load","path":"in.png","out":"pic"},{"op":"render","in":"pic"}]})", out), std::invalid_argument);
+    CHECK_THROWS(runWorkflow(R"({"steps":[{"op":"load","path":"relief.glb","out":"m"},{"op":"save","in":"m","path":"m.png"}]})", out), std::invalid_argument);
+    CHECK(checkWorkflow(R"({"steps":[{"op":"render","in":"x","background":"pink"}]})").size() == 1);
+    std::filesystem::remove_all(out);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(meshes_round_trip_render_and_come_from_depth) {
+    // A textured quad leaning back, and a coloured triangle.
+    Mesh q;
+    q.positions = {-1, -1, 0, 1, -1, 0, 1, 1, -0.5f, -1, 1, -0.5f};
+    q.uvs = {0, 1, 1, 1, 1, 0, 0, 0};
+    q.indices = {0, 1, 2, 0, 2, 3};
+    q.texture.width = 4;
+    q.texture.height = 4;
+    for (std::size_t i = 0; i < 16; ++i) q.texture.pixels.insert(q.texture.pixels.end(), {static_cast<std::uint8_t>(i * 16), 40, 200});
+    computeNormals(q);
+    const std::string dir = tempPath("meshes");
+    std::filesystem::create_directories(dir);
+    for (const char* ext : {".glb", ".obj", ".ply"}) {
+        saveMesh(dir + "/q" + ext, q);
+        const Mesh r = loadMesh(dir + "/q" + ext);
+        CHECK(r.triangleCount() == 2);
+        // Positions survive (OBJ / PLY may re-index; compare as sets of corners).
+        std::vector<float> a = q.positions, b = r.positions;
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        bool same = a.size() == b.size();
+        for (std::size_t i = 0; same && i < a.size(); ++i) same = std::fabs(a[i] - b[i]) < 1e-5f;
+        if (!same) std::cout << "         " << ext << " positions differ\n";
+        CHECK(same);
+        CHECK(r.normals.size() == r.positions.size());
+    }
+    const Mesh g = loadMesh(dir + "/q.glb");
+    CHECK(g.texture.width == 4 && g.texture.pixels == q.texture.pixels && g.uvs == q.uvs);
+    CHECK(!loadMesh(dir + "/q.ply").colors.empty() && std::filesystem::exists(dir + "/q_albedo.png") && std::filesystem::exists(dir + "/q.mtl"));
+    // Broken files are refused, not trusted.
+    std::vector<std::uint8_t> bad = encodeGlb(q);
+    bad.resize(bad.size() / 2);
+    CHECK_THROWS(decodeGlb(bad), std::runtime_error);
+    CHECK_THROWS(parseObj("v 0 0 0\nf 1 2 3\n"), std::runtime_error);
+    CHECK_THROWS(decodePly(std::vector<std::uint8_t>{'p', 'l', 'y', '\n'}), std::runtime_error);
+    Mesh wrong = q;
+    wrong.indices.push_back(9);
+    CHECK_THROWS(checkMesh(wrong), std::invalid_argument);
+
+    // Rendering: the quad covers the middle, the corners keep the background; a turn changes the view.
+    MeshRenderOptions ro;
+    ro.width = ro.height = 48;
+    ro.pitch = 0;
+    ro.background[0] = ro.background[1] = ro.background[2] = 0;
+    const Image front = renderMesh(q, ro);
+    auto at = [](const Image& im, std::size_t x, std::size_t y, int c) { return im.pixels[3 * (y * im.width + x) + c]; };
+    CHECK(at(front, 24, 24, 2) > 60 && at(front, 0, 0, 0) == 0 && at(front, 0, 0, 2) == 0);
+    const auto turn = renderTurntable(q, 4, 360, ro);
+    CHECK(turn.size() == 4 && turn[0].pixels == front.pixels && turn[1].pixels != front.pixels);
+
+    // From depth: a near square on a far background; edges split them apart unless edges = 0.
+    Image pic;
+    pic.width = 40;
+    pic.height = 30;
+    pic.pixels.assign(40 * 30 * 3, 128);
+    std::vector<float> depth(40 * 30, 0.0f);
+    for (std::size_t y = 10; y < 20; ++y)
+        for (std::size_t x = 15; x < 25; ++x) depth[y * 40 + x] = 1.0f;
+    DepthMeshOptions mo;
+    mo.grid = 40;
+    const Mesh cut = meshFromDepth(pic, depth, mo);
+    mo.edges = 0;
+    const Mesh whole = meshFromDepth(pic, depth, mo);
+    CHECK(whole.triangleCount() == 2 * 39 * 29 && cut.triangleCount() < whole.triangleCount() && cut.texture.width == 40);
+    float zmax = 0;
+    for (std::size_t i = 0; i < whole.vertexCount(); ++i) zmax = std::max(zmax, whole.positions[3 * i + 2]);
+    CHECK(std::fabs(zmax - mo.depth) < 1e-6f);
+    CHECK_THROWS(meshFromDepth(pic, std::vector<float>(5), mo), std::invalid_argument);
     std::filesystem::remove_all(dir);
 }
 

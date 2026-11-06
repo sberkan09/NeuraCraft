@@ -390,7 +390,7 @@ void putBE32(std::vector<std::uint8_t>& out, std::uint32_t v) {
     for (int s = 24; s >= 0; s -= 8) out.push_back(static_cast<std::uint8_t>(v >> s));
 }
 
-void writeChunk(std::ofstream& f, const char* type, const std::vector<std::uint8_t>& data) {
+void writeChunk(std::ostream& f, const char* type, const std::vector<std::uint8_t>& data) {
     std::vector<std::uint8_t> chunk;
     putBE32(chunk, static_cast<std::uint32_t>(data.size()));
     chunk.insert(chunk.end(), type, type + 4);
@@ -736,7 +736,7 @@ std::uint8_t pngColorType(const Image& image, const char* who) {
     }
 }
 
-void writePngHeader(std::ofstream& f, const Image& image, std::uint8_t colorType) {
+void writePngHeader(std::ostream& f, const Image& image, std::uint8_t colorType) {
     const std::uint8_t signature[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
     f.write(reinterpret_cast<const char*>(signature), 8);
     std::vector<std::uint8_t> ihdr;
@@ -748,6 +748,17 @@ void writePngHeader(std::ofstream& f, const Image& image, std::uint8_t colorType
 } // namespace
 
 std::vector<std::uint8_t> deflateCompress(const std::vector<std::uint8_t>& data) { return zlibCompress(data); }
+
+std::vector<std::uint8_t> encodePng(const Image& image) {
+    checkImage(image, "encodePng");
+    const std::uint8_t colorType = pngColorType(image, "encodePng");
+    std::ostringstream f(std::ios::binary);
+    writePngHeader(f, image, colorType);
+    writeChunk(f, "IDAT", pngImageData(image));
+    writeChunk(f, "IEND", {});
+    const std::string bytes = f.str();
+    return std::vector<std::uint8_t>(bytes.begin(), bytes.end());
+}
 
 void savePng(const std::string& path, const Image& image) {
     checkImage(image, "savePng");
@@ -989,6 +1000,10 @@ Image loadPng(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("loadPng: cannot open " + path);
     const std::vector<std::uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return decodePng(d, path);
+}
+
+Image decodePng(const std::vector<std::uint8_t>& d, const std::string& path) {
     static const std::uint8_t sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
     if (d.size() < 8 || !std::equal(sig, sig + 8, d.begin())) throw std::runtime_error("loadPng: " + path + " is not a PNG");
     std::size_t width = 0, height = 0;

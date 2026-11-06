@@ -32,6 +32,7 @@
 #include "Transformer.h"
 #include "Upscale.h"
 #include "VectorMath.h"
+#include "Mesh.h"
 #include "Workflow.h"
 
 #define NEURACRAFT_VERSION "1.11.0"

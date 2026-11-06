@@ -10,8 +10,8 @@ import { MaskPainter } from "./MaskPainter";
 import { PromptTimeline } from "./PromptTimeline";
 import { overallFraction } from "./Results";
 
-const groupNames: Record<string, string> = { image: "Resim", video: "Video", analysis: "Analiz", enhance: "İyileştirme", edit: "Düzenle", input: "Giriş / çıkış" };
-const groupOrder = ["image", "video", "analysis", "enhance", "edit", "input"];
+const groupNames: Record<string, string> = { image: "Resim", video: "Video", "3d": "3D", analysis: "Analiz", enhance: "İyileştirme", edit: "Düzenle", input: "Giriş / çıkış" };
+const groupOrder = ["image", "video", "3d", "analysis", "enhance", "edit", "input"];
 
 // Inputs a step reads (clip fields), for the connection summary.
 function inputsOf(step: Step, op?: WorkflowOp): string[] {
@@ -19,7 +19,7 @@ function inputsOf(step: Step, op?: WorkflowOp): string[] {
   const out: string[] = [];
   for (const f of op.fields) {
     const v = step[f.name];
-    if (f.type === "clip" && typeof v === "string") out.push(`${fieldLabel(f.name)}: ${v}`);
+    if ((f.type === "clip" || f.type === "mesh") && typeof v === "string") out.push(`${fieldLabel(f.name)}: ${v}`);
     if (f.type === "clips" && Array.isArray(v)) out.push(`${fieldLabel(f.name)}: ${v.join(", ")}`);
   }
   return out;
@@ -99,7 +99,7 @@ export function GraphMode(props: { engine: Engine; workflow: Workflow; title: st
     const lastClip = [...steps].reverse().find((x) => ops.get(x.op)?.output);
     for (const f of op.fields) {
       if (f.type === "model" && f.required) s[f.name] = pickModel(engine.models, f.model ?? "", f.model === "sd" ? ["turbo", "animatediff"] : []);
-      if (f.name === "in" && f.type === "clip" && lastClip) s.in = String(lastClip.out ?? lastClip.op);
+      if (f.name === "in" && (f.type === "clip" || f.type === "mesh") && lastClip) s.in = String(lastClip.out ?? lastClip.op);
       if (f.name === "prompt" && f.required) s.prompt = "";
     }
     if (opName === "save") s.path = `outputs/${String(s.in ?? "out")}.png`;

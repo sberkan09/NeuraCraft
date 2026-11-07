@@ -877,6 +877,54 @@ DeviceCondition deviceCondition(const Matrix& temb, const Matrix& context, const
     c.residuals = residuals;
     return c;
 }
+
+// A ControlNet's residuals on the device: the down blocks and the mid block of control() below as one
+// pass, the zero convolutions too; only the residuals (scaled) come back. One condition.
+ControlResiduals deviceControl(UNet2DCondition::Impl& m, const Matrix& latent, const Matrix& embedding, const std::vector<DeviceCondition>& conds,
+                               float scale) {
+    NC_PROFILE("controlnet (gpu graph)");
+    const std::size_t n = latent.cols();
+    const DeviceTensor in = DeviceTensor::upload(latent.data(), n);
+    DeviceTensor h = deviceConv(*m.convIn, in.get(), 1);
+    {
+        const DeviceTensor e = DeviceTensor::upload(embedding);
+        dv::add(h.get(), e.get(), embedding.size());
+    }
+    std::vector<DeviceTensor> skips;
+    std::vector<std::size_t> skipSizes;
+    auto keep = [&](const DeviceTensor& x, std::size_t k) {
+        DeviceTensor c(k);
+        dv::copy(c.get(), x.get(), k);
+        skips.push_back(std::move(c));
+        skipSizes.push_back(k);
+    };
+    keep(h, m.convIn->outputShape().size());
+    for (auto& d : m.downs) {
+        for (std::size_t j = 0; j < d.resnets.size(); ++j) {
+            h = deviceResnet(*d.resnets[j], h.get(), conds);
+            if (!d.attentions.empty()) h = deviceTransformer(*d.attentions[j], h.get(), conds);
+            keep(h, d.resnets[j]->out * d.resnets[j]->in.height * d.resnets[j]->in.width);
+        }
+        if (d.downsample) {
+            h = deviceConv(*d.downsample, h.get(), 1);
+            keep(h, d.downsample->outputShape().size());
+        }
+    }
+    h = deviceResnet(*m.mid1, h.get(), conds);
+    h = deviceTransformer(*m.midAttention, h.get(), conds);
+    h = deviceResnet(*m.mid2, h.get(), conds);
+    if (m.zeroConvs.size() != skips.size()) throw std::logic_error("UNet2DCondition::control: zero convolutions do not match the skips");
+    ControlResiduals r;
+    for (std::size_t k = 0; k < skips.size(); ++k) {
+        const DeviceTensor z = deviceConv(*m.zeroConvs[k], skips[k].get(), 1);
+        r.down.push_back(z.download(1, m.zeroConvs[k]->outputShape().size()));
+        for (float& v : r.down.back().values()) v *= scale;
+    }
+    const DeviceTensor z = deviceConv(*m.midZero, h.get(), 1);
+    r.mid = z.download(1, m.midZero->outputShape().size());
+    for (float& v : r.mid.values()) v *= scale;
+    return r;
+}
 } // namespace
 #endif
 
@@ -1096,6 +1144,14 @@ ControlResiduals UNet2DCondition::control(const Matrix& latent, float timestep, 
     if (latent.rows() != 1 || latent.cols() != m.latent.size())
         throw std::invalid_argument("UNet2DCondition::control: expected a 1 x " + std::to_string(m.latent.size()) + " latent");
     const Matrix temb = timeEmbedding(m, timestep);  // SiLU applied: every resnet starts with it
+#ifdef NEURACRAFT_HAS_CUDA
+    if (!m.quantized && gpugraph::enabled() && embedding.rows() == 1 && embedding.cols() == m.convIn->outputShape().size()) {
+        dv::Session session;
+        std::vector<DeviceCondition> conds;
+        conds.push_back(deviceCondition(temb, context, nullptr, 0.0f, nullptr));
+        return deviceControl(m, latent, embedding, conds, scale);
+    }
+#endif
     Matrix h = m.convIn->forward(latent, false);
     if (!embedding.sameShape(h)) throw std::invalid_argument("UNet2DCondition::control: embedding does not match (use controlEmbedding)");
     addInPlace(h, embedding);

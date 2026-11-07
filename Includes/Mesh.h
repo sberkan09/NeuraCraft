@@ -13,6 +13,27 @@
 
 namespace nc {
 
+// A rigged model's skeleton, skin and animation (from a glTF with a skin). The mesh's positions hold its
+// rest pose; poseMesh (Animation.h) moves them to any moment of the animation.
+struct MeshRig {
+    std::vector<std::string> names;        // per joint
+    std::vector<int> parents;              // per joint: index of the parent joint, -1 for roots (parents come first)
+    std::vector<int> nodes;                // per joint: its glTF node
+    std::vector<float> rest;               // per joint: translation (3), rotation (x, y, z, w), scale (3)
+    std::vector<float> rootParent;         // 16, column-major: where the roots' parent node puts them
+    std::vector<float> inverseBind;        // 16 per joint, column-major
+    std::vector<std::uint16_t> joints;     // 4 per vertex
+    std::vector<float> weights;            // 4 per vertex (all 0: a part that does not move with the skeleton)
+    std::vector<float> bindPositions;      // 3 per vertex: before skinning (unmoved parts: where they are)
+    double fps = 30;                       // animation: local transforms of every joint (10 floats, as rest)
+    std::vector<float> frames;             // per frame and joint (empty: no animation)
+
+    std::size_t jointCount() const { return parents.size(); }
+    std::size_t frameCount() const { return parents.empty() ? 0 : frames.size() / (10 * parents.size()); }
+    double duration() const { return frameCount() > 1 ? static_cast<double>(frameCount() - 1) / fps : 0.0; }
+    bool empty() const { return parents.empty(); }
+};
+
 struct Mesh {
     std::vector<float> positions;         // x, y, z per vertex (y up, the front faces +z)
     std::vector<float> normals;           // x, y, z per vertex, or empty
@@ -23,6 +44,7 @@ struct Mesh {
     // The glTF binary this mesh was read from, when it came from one: saveMesh(.glb) writes it as it is,
     // so materials this struct does not hold (metallic / roughness / normal maps) survive.
     std::vector<std::uint8_t> glb;
+    MeshRig rig;                          // rigged models (empty: none)
 
     std::size_t vertexCount() const { return positions.size() / 3; }
     std::size_t triangleCount() const { return indices.size() / 3; }
@@ -62,6 +84,10 @@ struct MeshRenderOptions {
     bool lighting = true;       // shade by a light near the camera; false: flat colours
     std::uint8_t background[3] = {255, 255, 255};
     std::size_t supersample = 2;  // rendered this many times larger, then averaged
+    // Frame this sphere instead of the mesh's own bounds (so the camera holds still through an animation).
+    bool fixedFrame = false;
+    float frameCentre[3] = {0, 0, 0};
+    float frameRadius = 1;
 };
 Image renderMesh(const Mesh& mesh, const MeshRenderOptions& options = {});
 // frames views turning `degrees` around the vertical axis from options.yaw.

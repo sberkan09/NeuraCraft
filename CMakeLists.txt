@@ -56,6 +56,7 @@ add_library(neuracraft_lib STATIC
     src/Random.cpp
     src/SafeTensors.cpp
     src/Stereo.cpp
+    src/Animation.cpp
     src/Server.cpp
     src/Text.cpp
     src/Transformer.cpp

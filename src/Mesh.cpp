@@ -1,5 +1,8 @@
 #include "Mesh.h"
 
+#include "Animation.h"
+#include "Transform.h"
+
 #include "Json.h"
 #include "Parallel.h"
 
@@ -80,7 +83,9 @@ std::vector<std::uint8_t> vertexColours(const Mesh& m) {
 } // namespace
 
 std::size_t Mesh::bytes() const {
-    return positions.size() * 4 + normals.size() * 4 + uvs.size() * 4 + colors.size() + indices.size() * 4 + texture.pixels.size() + glb.size();
+    return positions.size() * 4 + normals.size() * 4 + uvs.size() * 4 + colors.size() + indices.size() * 4 + texture.pixels.size() + glb.size() +
+           (rig.rest.size() + rig.rootParent.size() + rig.inverseBind.size() + rig.weights.size() + rig.bindPositions.size() + rig.frames.size()) * 4 +
+           rig.joints.size() * 2;
 }
 
 void setMaxMeshElements(std::size_t elements) { gMaxElements = elements ? elements : std::size_t(1) << 24; }
@@ -275,7 +280,7 @@ struct GlbReader {
         const json::Value& a = item("accessors", index);
         if (a.find("sparse")) fail("sparse accessors are not supported");
         const std::string type = a.find("type") && a.at("type").isString() ? a.at("type").string : "";
-        comps = type == "SCALAR" ? 1 : type == "VEC2" ? 2 : type == "VEC3" ? 3 : type == "VEC4" ? 4 : 0;
+        comps = type == "SCALAR" ? 1 : type == "VEC2" ? 2 : type == "VEC3" ? 3 : type == "VEC4" ? 4 : type == "MAT4" ? 16 : 0;
         if (!comps) fail("unsupported accessor type " + type);
         const double countD = a.numberOr("count", -1);
         if (countD < 0 || countD != std::floor(countD) || countD > static_cast<double>(gMaxElements)) fail("bad accessor count");
@@ -320,6 +325,168 @@ struct GlbReader {
         return out;
     }
 };
+
+// A node's local transform as translation, rotation, scale (10 floats).
+void nodeTrs(const json::Value& node, float* out) {
+    double t[3] = {0, 0, 0}, s[3] = {1, 1, 1};
+    xf::Quat q{0, 0, 0, 1};
+    if (const json::Value* mtx = node.find("matrix"); mtx && mtx->isArray() && mtx->array.size() == 16) {
+        xf::Mat4 m;
+        for (int k = 0; k < 16; ++k) m[static_cast<std::size_t>(k)] = mtx->array[static_cast<std::size_t>(k)].number;
+        xf::decompose(m, t, q, s);
+    } else {
+        if (const json::Value* v = node.find("translation"); v && v->isArray() && v->array.size() == 3)
+            for (int k = 0; k < 3; ++k) t[k] = v->array[static_cast<std::size_t>(k)].number;
+        if (const json::Value* v = node.find("rotation"); v && v->isArray() && v->array.size() == 4)
+            q = xf::normalized({v->array[0].number, v->array[1].number, v->array[2].number, v->array[3].number});
+        if (const json::Value* v = node.find("scale"); v && v->isArray() && v->array.size() == 3)
+            for (int k = 0; k < 3; ++k) s[k] = v->array[static_cast<std::size_t>(k)].number;
+    }
+    for (int k = 0; k < 3; ++k) {
+        out[k] = static_cast<float>(t[k]);
+        out[7 + k] = static_cast<float>(s[k]);
+    }
+    for (int k = 0; k < 4; ++k) out[3 + k] = static_cast<float>(q[static_cast<std::size_t>(k)]);
+    for (int k = 0; k < 10; ++k)
+        if (!std::isfinite(out[k]) || std::fabs(out[k]) > 1e15f) throw std::runtime_error("loadMesh: a joint's transform is not finite");
+}
+
+// The skeleton, skin and first animation of a model whose primitives were read with their joints and
+// weights; positions become the rest pose.
+void readRig(Mesh& out, const GlbReader& r, const json::Value& doc, const std::vector<int>& jointNodes, const std::vector<int>& jointOfNode,
+             const std::vector<int>& parentOfNode, const std::vector<xf::Mat4>& world, const std::vector<bool>& seen) {
+    const std::size_t J = jointNodes.size();
+    std::vector<int> parentJoint(J, -1);
+    for (std::size_t j = 0; j < J; ++j) {
+        int p = parentOfNode[static_cast<std::size_t>(jointNodes[j])];
+        for (std::size_t guard = 0; p >= 0 && jointOfNode[static_cast<std::size_t>(p)] < 0 && guard < jointOfNode.size(); ++guard)
+            p = parentOfNode[static_cast<std::size_t>(p)];
+        parentJoint[j] = p >= 0 ? jointOfNode[static_cast<std::size_t>(p)] : -1;
+    }
+    // Parents before children.
+    std::vector<int> order, newIndex(J, -1);
+    while (order.size() < J) {
+        const std::size_t before = order.size();
+        for (std::size_t j = 0; j < J; ++j)
+            if (newIndex[j] < 0 && (parentJoint[j] < 0 || newIndex[static_cast<std::size_t>(parentJoint[j])] >= 0)) {
+                newIndex[j] = static_cast<int>(order.size());
+                order.push_back(static_cast<int>(j));
+            }
+        if (order.size() == before) r.fail("the joints form a cycle");
+    }
+    MeshRig& g = out.rig;
+    g.names.resize(J);
+    g.parents.resize(J);
+    g.nodes.resize(J);
+    g.rest.resize(10 * J);
+    for (std::size_t i = 0; i < J; ++i) {
+        const auto old = static_cast<std::size_t>(order[i]);
+        const json::Value& node = r.item("nodes", jointNodes[old]);
+        g.names[i] = node.find("name") && node.at("name").isString() ? node.at("name").string : "joint_" + std::to_string(i);
+        g.parents[i] = parentJoint[old] < 0 ? -1 : newIndex[static_cast<std::size_t>(parentJoint[old])];
+        g.nodes[i] = jointNodes[old];
+        nodeTrs(node, g.rest.data() + 10 * i);
+    }
+    const int rootParentNode = parentOfNode[static_cast<std::size_t>(g.nodes[0])];
+    const xf::Mat4 rp = rootParentNode >= 0 && seen[static_cast<std::size_t>(rootParentNode)] ? world[static_cast<std::size_t>(rootParentNode)] : xf::identity();
+    g.rootParent.assign(rp.begin(), rp.end());
+    g.inverseBind.assign(16 * J, 0.0f);
+    for (std::size_t i = 0; i < J; ++i)
+        for (int k = 0; k < 4; ++k) g.inverseBind[16 * i + 5 * static_cast<std::size_t>(k)] = 1.0f;
+    const json::Value& skin = doc.at("skins").array[0];
+    if (const json::Value* ib = skin.find("inverseBindMatrices"); ib && ib->isNumber()) {
+        std::size_t n = 0, comps = 0;
+        const std::vector<double> m = r.read(ib->number, n, comps);
+        if (n != J || comps != 16) r.fail("inverseBindMatrices do not match the joints");
+        for (std::size_t old = 0; old < J; ++old)
+            for (int k = 0; k < 16; ++k) {
+                const double v = m[16 * old + static_cast<std::size_t>(k)];
+                if (!std::isfinite(v) || std::fabs(v) > 1e15) r.fail("inverseBindMatrices are not finite");
+                g.inverseBind[16 * static_cast<std::size_t>(newIndex[old]) + static_cast<std::size_t>(k)] = static_cast<float>(v);
+            }
+    }
+    for (std::uint16_t& j : g.joints) j = static_cast<std::uint16_t>(newIndex[j]);
+    for (std::size_t v = 0; 4 * v < g.weights.size(); ++v) {
+        float* w = g.weights.data() + 4 * v;
+        const float sum = w[0] + w[1] + w[2] + w[3];
+        if (sum > 0)
+            for (int k = 0; k < 4; ++k) w[k] /= sum;
+    }
+    g.bindPositions = out.positions;
+
+    // The first animation, sampled at the rate of its keyframes (1..60 a second; rotations by slerp, the
+    // rest linearly).
+    if (const json::Value* anims = doc.find("animations"); anims && anims->isArray() && !anims->array.empty()) {
+        const json::Value& a = anims->array[0];
+        const json::Value* channels = a.find("channels");
+        const json::Value* samplers = a.find("samplers");
+        struct Track {
+            std::size_t joint, offset, comps;
+            std::vector<double> times, values;
+            int mode;  // 0 linear, 1 step, 2 cubic spline (values only, tangents skipped)
+        };
+        std::vector<Track> tracks;
+        double duration = 0, minStep = 1e30;
+        if (channels && channels->isArray() && samplers && samplers->isArray())
+            for (const json::Value& c : channels->array) {
+                const json::Value* target = c.find("target");
+                if (!target || !target->find("node") || !target->find("path") || !c.find("sampler")) continue;
+                const double nodeD = target->at("node").number;
+                if (!(nodeD >= 0 && nodeD < static_cast<double>(jointOfNode.size()))) continue;
+                const int old = jointOfNode[static_cast<std::size_t>(nodeD)];
+                const std::string path = target->at("path").isString() ? target->at("path").string : "";
+                if (old < 0 || (path != "translation" && path != "rotation" && path != "scale")) continue;
+                const double si = c.at("sampler").number;
+                if (!(si >= 0 && si < static_cast<double>(samplers->array.size()))) r.fail("bad animation sampler");
+                const json::Value& s = samplers->array[static_cast<std::size_t>(si)];
+                if (!s.find("input") || !s.find("output")) r.fail("animation sampler without input or output");
+                Track t;
+                t.joint = static_cast<std::size_t>(newIndex[static_cast<std::size_t>(old)]);
+                t.offset = path == "translation" ? 0 : path == "rotation" ? 3 : 7;
+                const std::string interp = s.find("interpolation") && s.at("interpolation").isString() ? s.at("interpolation").string : "LINEAR";
+                t.mode = interp == "STEP" ? 1 : interp == "CUBICSPLINE" ? 2 : 0;
+                std::size_t tn = 0, tc = 0, vn = 0;
+                t.times = r.read(s.at("input").number, tn, tc);
+                t.values = r.read(s.at("output").number, vn, t.comps);
+                if (tc != 1 || tn == 0 || t.comps != (path == "rotation" ? 4u : 3u) || vn != tn * (t.mode == 2 ? 3 : 1)) r.fail("animation sampler sizes do not match");
+                for (std::size_t k = 0; k < tn; ++k)
+                    if (!std::isfinite(t.times[k]) || t.times[k] < 0 || t.times[k] > 3600 || (k && t.times[k] < t.times[k - 1])) r.fail("bad animation times");
+                for (double v : t.values)
+                    if (!std::isfinite(v) || std::fabs(v) > 1e15) r.fail("animation values are not finite");
+                duration = std::max(duration, t.times.back());
+                for (std::size_t k = 1; k < tn; ++k)
+                    if (t.times[k] - t.times[k - 1] > 1e-6) minStep = std::min(minStep, t.times[k] - t.times[k - 1]);
+                tracks.push_back(std::move(t));
+            }
+        if (!tracks.empty()) {
+            g.fps = minStep < 1e29 ? std::clamp(std::round(1.0 / minStep), 1.0, 60.0) : 30.0;
+            const std::size_t frames = std::min<std::size_t>(static_cast<std::size_t>(std::floor(duration * g.fps + 0.5)) + 1, 18000);
+            if (frames * J * 10 > 4 * gMaxElements) r.fail("the animation is too long");
+            g.frames.resize(frames * J * 10);
+            for (std::size_t f = 0; f < frames; ++f) std::copy(g.rest.begin(), g.rest.end(), g.frames.begin() + static_cast<long>(f * J * 10));
+            for (const Track& t : tracks) {
+                const std::size_t n = t.times.size(), step = t.mode == 2 ? 3 : 1, shift = t.mode == 2 ? 1 : 0;
+                auto value = [&](std::size_t k, std::size_t c) { return t.values[(k * step + shift) * t.comps + c]; };
+                for (std::size_t f = 0; f < frames; ++f) {
+                    const double time = static_cast<double>(f) / g.fps;
+                    const std::size_t hi = static_cast<std::size_t>(std::upper_bound(t.times.begin(), t.times.end(), time) - t.times.begin());
+                    const std::size_t k0 = hi == 0 ? 0 : hi - 1, k1 = std::min(hi, n - 1);
+                    double u = 0;
+                    if (t.mode != 1 && k1 != k0 && t.times[k1] > t.times[k0]) u = std::clamp((time - t.times[k0]) / (t.times[k1] - t.times[k0]), 0.0, 1.0);
+                    float* out10 = g.frames.data() + (f * J + t.joint) * 10;
+                    if (t.comps == 4) {
+                        const xf::Quat q = xf::slerp(xf::normalized({value(k0, 0), value(k0, 1), value(k0, 2), value(k0, 3)}),
+                                                     xf::normalized({value(k1, 0), value(k1, 1), value(k1, 2), value(k1, 3)}), u);
+                        for (int c = 0; c < 4; ++c) out10[3 + c] = static_cast<float>(q[static_cast<std::size_t>(c)]);
+                    } else {
+                        for (std::size_t c = 0; c < 3; ++c) out10[t.offset + c] = static_cast<float>(value(k0, c) + u * (value(k1, c) - value(k0, c)));
+                    }
+                }
+            }
+        }
+    }
+    out.positions = skinnedPositions(g, g.rest.data());
+}
 } // namespace
 
 Mesh decodeGlb(const std::vector<std::uint8_t>& d, const std::string& name) {
@@ -341,9 +508,35 @@ Mesh decodeGlb(const std::vector<std::uint8_t>& d, const std::string& name) {
         fail("needs extension " + (req->array[0].isString() ? req->array[0].string : std::string("?")) + " (compressed meshes are not supported)");
     GlbReader r{doc, bin, binSize, name};
 
+    // A rigged model: the first skin's joints (other skins' meshes are read as they stand).
+    const json::Value* nodes = doc.find("nodes");
+    const std::size_t nodeCount = nodes && nodes->isArray() ? nodes->array.size() : 0;
+    std::vector<int> jointNodes;
+    std::vector<int> jointOfNode(nodeCount, -1), parentOfNode(nodeCount, -1);
+    for (std::size_t i = 0; i < nodeCount; ++i)
+        if (const json::Value* kids = nodes->array[i].find("children"); kids && kids->isArray())
+            for (const json::Value& k : kids->array)
+                if (k.isNumber() && k.number >= 0 && k.number < static_cast<double>(nodeCount)) parentOfNode[static_cast<std::size_t>(k.number)] = static_cast<int>(i);
+    const json::Value* skins = doc.find("skins");
+    const json::Value* skin = skins && skins->isArray() && !skins->array.empty() ? &skins->array[0] : nullptr;
+    if (skin)
+        if (const json::Value* js = skin->find("joints"); js && js->isArray()) {
+            if (js->array.size() > 1024) r.fail("too many joints");
+            for (const json::Value& j : js->array) {
+                if (!j.isNumber() || j.number < 0 || j.number >= static_cast<double>(nodeCount) || j.number != std::floor(j.number)) r.fail("bad joint");
+                const auto n = static_cast<std::size_t>(j.number);
+                if (jointOfNode[n] >= 0) r.fail("a joint listed twice");
+                jointOfNode[n] = static_cast<int>(jointNodes.size());
+                jointNodes.push_back(static_cast<int>(n));
+            }
+        }
+    std::vector<xf::Mat4> nodeWorld(nodeCount, xf::identity());
+    std::vector<bool> nodeSeen(nodeCount, false);
+    bool anySkinned = false;
+
     Mesh out;
     bool textureTaken = false;
-    auto addPrimitive = [&](const json::Value& prim, const Mat4& M) {
+    auto addPrimitive = [&](const json::Value& prim, const Mat4& M, bool skinnedNode) {
         if (prim.numberOr("mode", 4) != 4) return;  // triangles only (points and lines are skipped)
         const json::Value* attrs = prim.find("attributes");
         if (!attrs || !attrs->find("POSITION")) return;
@@ -352,9 +545,29 @@ Mesh decodeGlb(const std::vector<std::uint8_t>& d, const std::string& name) {
         if (comps != 3) r.fail("POSITION must be VEC3");
         checkCount(out.vertexCount() + n, "loadMesh: " + name);
         const std::uint32_t first = static_cast<std::uint32_t>(out.vertexCount());
+        // Skinned vertices stay in bind space (placed by their joints later); others go where the node puts them.
+        const bool skinned = skinnedNode && attrs->find("JOINTS_0") && attrs->find("WEIGHTS_0");
         for (std::size_t i = 0; i < n; ++i)
             for (int k = 0; k < 3; ++k)
-                out.positions.push_back(static_cast<float>(M[k] * pos[3 * i] + M[4 + k] * pos[3 * i + 1] + M[8 + k] * pos[3 * i + 2] + M[12 + k]));
+                out.positions.push_back(skinned ? static_cast<float>(pos[3 * i + k])
+                                                : static_cast<float>(M[k] * pos[3 * i] + M[4 + k] * pos[3 * i + 1] + M[8 + k] * pos[3 * i + 2] + M[12 + k]));
+        if (!jointNodes.empty()) {
+            std::vector<std::uint16_t> jv(4 * n, 0);
+            std::vector<float> wv(4 * n, 0.0f);
+            if (skinned) {
+                std::size_t jn = 0, jc = 0, wn = 0, wc = 0;
+                const std::vector<double> js = r.read(attrs->at("JOINTS_0").number, jn, jc), ws = r.read(attrs->at("WEIGHTS_0").number, wn, wc);
+                if (jn != n || wn != n || jc != 4 || wc != 4) r.fail("JOINTS_0 / WEIGHTS_0 do not match POSITION");
+                for (std::size_t i = 0; i < 4 * n; ++i) {
+                    if (!(js[i] >= 0 && js[i] < static_cast<double>(jointNodes.size()))) r.fail("joint index out of range");
+                    jv[i] = static_cast<std::uint16_t>(js[i]);
+                    wv[i] = std::isfinite(ws[i]) && ws[i] > 0 ? static_cast<float>(ws[i]) : 0.0f;
+                }
+                anySkinned = true;
+            }
+            out.rig.joints.insert(out.rig.joints.end(), jv.begin(), jv.end());
+            out.rig.weights.insert(out.rig.weights.end(), wv.begin(), wv.end());
+        }
         // uvs and colours are kept when every primitive has them (else dropped at the end)
         std::vector<float> uv(2 * n, 0.0f);
         bool hasUv = false;
@@ -416,7 +629,6 @@ Mesh decodeGlb(const std::vector<std::uint8_t>& d, const std::string& name) {
     };
 
     // Nodes of the default scene (or every root node), depth first, transforms composed.
-    const json::Value* nodes = doc.find("nodes");
     std::size_t visits = 0;
     std::function<void(double, const Mat4&, int)> visit = [&](double index, const Mat4& parent, int depth) {
         if (depth > 64 || ++visits > 100000) r.fail("node hierarchy too deep or too large");
@@ -438,10 +650,14 @@ Mesh decodeGlb(const std::vector<std::uint8_t>& d, const std::string& name) {
             local = mul(T, mul(R, S));
         }
         const Mat4 M = mul(parent, local);
+        const auto ni = static_cast<std::size_t>(index);
+        nodeSeen[ni] = true;
+        for (int k = 0; k < 16; ++k) nodeWorld[ni][static_cast<std::size_t>(k)] = M[static_cast<std::size_t>(k)];
         if (const json::Value* mesh = node.find("mesh"); mesh && mesh->isNumber()) {
             const json::Value& me = r.item("meshes", mesh->number);
+            const bool skinnedNode = !jointNodes.empty() && node.numberOr("skin", -1) == 0;
             if (const json::Value* prims = me.find("primitives"); prims && prims->isArray())
-                for (const json::Value& p : prims->array) addPrimitive(p, M);
+                for (const json::Value& p : prims->array) addPrimitive(p, M, skinnedNode);
         }
         if (const json::Value* kids = node.find("children"); kids && kids->isArray())
             for (const json::Value& k : kids->array) visit(k.number, M, depth + 1);
@@ -458,10 +674,12 @@ Mesh decodeGlb(const std::vector<std::uint8_t>& d, const std::string& name) {
         if (const json::Value* meshes = doc.find("meshes"); meshes && meshes->isArray())
             for (const json::Value& me : meshes->array)
                 if (const json::Value* prims = me.find("primitives"); prims && prims->isArray())
-                    for (const json::Value& p : prims->array) addPrimitive(p, identity());
+                    for (const json::Value& p : prims->array) addPrimitive(p, identity(), false);
     }
     for (double root : roots) visit(root, identity(), 0);
     if (out.indices.empty()) fail("no triangles");
+    if (anySkinned) readRig(out, r, doc, jointNodes, jointOfNode, parentOfNode, nodeWorld, nodeSeen);
+    else out.rig = MeshRig{};
     // Colours that were all defaults are dropped; uvs without a texture too.
     if (std::all_of(out.colors.begin(), out.colors.end(), [](std::uint8_t c) { return c == 255; })) out.colors.clear();
     if (out.texture.pixels.empty()) out.uvs.clear();
@@ -825,11 +1043,15 @@ Image renderMesh(const Mesh& m, const MeshRenderOptions& o) {
         lo = {std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
         hi = {std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
     }
-    const Vec3 centre{(lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2};
+    Vec3 centre{(lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2};
     double radius = 1e-9;
     for (std::size_t i = 0; i < m.vertexCount(); ++i) {
         const Vec3 d = Vec3{m.positions[3 * i], m.positions[3 * i + 1], m.positions[3 * i + 2]} - centre;
         radius = std::max(radius, std::sqrt(dot(d, d)));
+    }
+    if (o.fixedFrame) {
+        centre = {o.frameCentre[0], o.frameCentre[1], o.frameCentre[2]};
+        radius = std::max(1e-9, static_cast<double>(o.frameRadius));
     }
     constexpr double kDeg = 3.14159265358979323846 / 180.0;
     const double yaw = o.yaw * kDeg, pitch = std::clamp<double>(o.pitch, -89.0, 89.0) * kDeg;

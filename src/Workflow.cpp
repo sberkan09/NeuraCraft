@@ -3,6 +3,7 @@
 #include "Onnx.h"
 #include "Depth.h"
 #include "Stereo.h"
+#include "Animation.h"
 #include "Mesh.h"
 #include "ImageTo3D.h"
 #include "Diffusion.h"
@@ -656,7 +657,7 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
         const std::string& stepOp = v.at("op").string;
         const std::string key = results ? stepKey(v, base, clipKeys) : std::string();
         const std::string outField = v.find("out") && v.at("out").isString() ? v.at("out").string : std::string();
-        const bool makesMesh = stepOp == "depth_mesh" || stepOp == "image_to_3d" || stepOp == "rig" || (stepOp == "load" && v.find("path") && v.at("path").isString() && isMeshFile(v.at("path").string));
+        const bool makesMesh = stepOp == "depth_mesh" || stepOp == "image_to_3d" || stepOp == "rig" || stepOp == "animate" || (stepOp == "load" && v.find("path") && v.at("path").isString() && isMeshFile(v.at("path").string));
         if (results && makesMesh) {
             if (std::shared_ptr<const Mesh> hit = results->findMesh(key)) {
                 progress.stage("cached");
@@ -882,6 +883,21 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
             ro.postprocess = s.flag("postprocess", true);
             progress.stage("rigging service");
             made = std::make_shared<const Mesh>(rigMesh(s.mesh("in"), ro));
+        } else if (op == "animate") {
+            AnimateOptions ao;
+            ao.fps = s.num("fps", ao.fps);
+            ao.start = s.num("start", ao.start);
+            ao.seconds = s.num("seconds", ao.seconds);
+            ao.speed = s.num("speed", ao.speed);
+            ao.inPlace = s.flag("in_place", false);
+            const MotionCapture motion = loadBvh(s.path("capture"));
+            const double span = (ao.seconds > 0 ? ao.seconds : static_cast<double>(motion.frameCount()) / motion.fps / ao.speed);
+            if (limits.maxFrames && span * ao.fps > static_cast<double>(limits.maxFrames))
+                throw WorkflowLimitExceeded("animate: more frames than the limit (shorten it with seconds)");
+            std::vector<std::string> report;
+            made = std::make_shared<const Mesh>(animateMesh(s.mesh("in"), motion, ao, &report));
+            if (log)
+                for (const std::string& line : report) log("step " + std::to_string(index) + " animate: " + line);
         } else if (op == "render") {
             const Mesh& m = s.mesh("in");
             MeshRenderOptions ro;
@@ -894,8 +910,15 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
             const std::string bg = s.str("background", "white");
             const std::uint8_t level = bg == "black" ? 0 : bg == "grey" ? 128 : 255;
             for (std::uint8_t& c : ro.background) c = level;
-            const std::size_t frames = std::max<std::size_t>(1, s.size("frames", 1));
-            const float turn = static_cast<float>(s.num("turn", 360));
+            // An animated model plays its animation over the frames (all of it, one frame per frame of it,
+            // unless frames says otherwise), the camera held still around all of its poses.
+            const bool animated = m.rig.frameCount() > 1 && s.flag("play", true);
+            const std::size_t frames = std::max<std::size_t>(1, s.size("frames", animated ? std::min<std::size_t>(m.rig.frameCount(), 720) : 1));
+            const float turn = static_cast<float>(s.num("turn", animated ? 0 : 360));
+            if (animated) {
+                ro.fixedFrame = true;
+                animationBounds(m, ro.frameCentre, ro.frameRadius);
+            }
             const std::string stereo = s.str("stereo", "none");
             const bool pair = stereo != "none";
             const StereoLayout layout = pair ? stereoLayout(stereo) : StereoLayout::SideBySide;
@@ -907,15 +930,17 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
                 progress.frame(f, frames);
                 MeshRenderOptions view = ro;
                 view.yaw = ro.yaw + turn * static_cast<float>(f) / static_cast<float>(frames);
+                const Mesh posed = animated ? poseMesh(m, frames > 1 ? m.rig.duration() * static_cast<double>(f) / static_cast<double>(frames - 1) : 0.0) : Mesh{};
+                const Mesh& shown = animated ? posed : m;
                 if (!pair) {
-                    out.push_back(renderMesh(m, view));
+                    out.push_back(renderMesh(shown, view));
                     continue;
                 }
                 // Positive yaw moves the camera to the right: the left eye looks from yaw - eye / 2.
                 MeshRenderOptions left = view, right = view;
                 left.yaw -= eye / 2;
                 right.yaw += eye / 2;
-                out.push_back(stereoFrame(renderMesh(m, left), renderMesh(m, right), layout));
+                out.push_back(stereoFrame(renderMesh(shown, left), renderMesh(shown, right), layout));
             }
         } else if (op == "upscale") {
             const auto up = smallModel<Upscaler>("upscaler", s.path("model"));

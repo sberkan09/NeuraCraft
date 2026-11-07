@@ -4606,6 +4606,179 @@ TEST(image_to_3d_goes_through_the_3d_service) {
     std::filesystem::remove_all(dir);
 }
 
+namespace {
+// A rigged stick figure as a glTF binary: 13 joints (hips, chest, head; knees and feet; shoulders,
+// elbows and hands), a small box on each joint, every box bound to its joint.
+std::vector<std::uint8_t> stickFigureGlb() {
+    const char* names[] = {"hips", "chest", "head", "knee_l", "foot_l", "knee_r", "foot_r", "shoulder_l", "elbow_l", "hand_l", "shoulder_r", "elbow_r", "hand_r"};
+    const int parents[] = {-1, 0, 1, 0, 3, 0, 5, 1, 7, 8, 1, 10, 11};
+    const float world[][3] = {{0, 1, 0},          {0, 1.5f, 0},       {0, 2, 0},          {0.2f, 0.5f, 0},     {0.2f, 0, 0},
+                              {-0.2f, 0.5f, 0},   {-0.2f, 0, 0},      {0.15f, 1.5f, 0},   {0.45f, 1.2f, 0},    {0.7f, 0.9f, 0},
+                              {-0.15f, 1.5f, 0},  {-0.45f, 1.2f, 0},  {-0.7f, 0.9f, 0}};  // arms hang down (A-pose)
+    const int J = 13;
+    std::vector<float> pos, w;
+    std::vector<std::uint16_t> jn;
+    std::vector<std::uint32_t> idx;
+    for (int j = 0; j < J; ++j) {
+        const std::uint32_t base = static_cast<std::uint32_t>(pos.size() / 3);
+        for (int c = 0; c < 8; ++c) {
+            pos.push_back(world[j][0] + (c & 1 ? 0.03f : -0.03f));
+            pos.push_back(world[j][1] + (c & 2 ? 0.03f : -0.03f));
+            pos.push_back(world[j][2] + (c & 4 ? 0.03f : -0.03f));
+            jn.insert(jn.end(), {static_cast<std::uint16_t>(j), 0, 0, 0});
+            w.insert(w.end(), {1, 0, 0, 0});
+        }
+        const std::uint32_t faces[] = {0, 1, 3, 0, 3, 2, 4, 6, 7, 4, 7, 5, 0, 4, 5, 0, 5, 1, 2, 3, 7, 2, 7, 6, 0, 2, 6, 0, 6, 4, 1, 5, 7, 1, 7, 3};
+        for (std::uint32_t f : faces) idx.push_back(base + f);
+    }
+    std::vector<float> ibm;
+    for (int j = 0; j < J; ++j) ibm.insert(ibm.end(), {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -world[j][0], -world[j][1], -world[j][2], 1});
+    std::vector<std::uint8_t> bin;
+    auto put = [&](const void* p, std::size_t n) {
+        const std::size_t at = bin.size();
+        bin.insert(bin.end(), static_cast<const std::uint8_t*>(p), static_cast<const std::uint8_t*>(p) + n);
+        while (bin.size() % 4) bin.push_back(0);
+        return at;
+    };
+    const std::size_t oPos = put(pos.data(), pos.size() * 4), oJ = put(jn.data(), jn.size() * 2), oW = put(w.data(), w.size() * 4),
+                      oI = put(idx.data(), idx.size() * 4), oB = put(ibm.data(), ibm.size() * 4);
+    const std::size_t V = pos.size() / 3;
+    std::ostringstream js;
+    js.precision(9);
+    js << R"({"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0,1]}],"nodes":[{"mesh":0,"skin":0})";
+    for (int j = 0; j < J; ++j) {
+        const int p = parents[j];
+        const float* pw = p < 0 ? nullptr : world[p];
+        js << R"(,{"name":")" << names[j] << R"(","translation":[)" << world[j][0] - (pw ? pw[0] : 0) << "," << world[j][1] - (pw ? pw[1] : 0) << ","
+           << world[j][2] - (pw ? pw[2] : 0) << "]";
+        std::string kids;
+        for (int k = 0; k < J; ++k)
+            if (parents[k] == j) kids += (kids.empty() ? "" : ",") + std::to_string(k + 1);
+        if (!kids.empty()) js << R"(,"children":[)" << kids << "]";
+        js << "}";
+    }
+    js << R"(],"skins":[{"inverseBindMatrices":4,"joints":[)";
+    for (int j = 0; j < J; ++j) js << (j ? "," : "") << j + 1;
+    js << R"(]}],"meshes":[{"primitives":[{"attributes":{"POSITION":0,"JOINTS_0":1,"WEIGHTS_0":2},"indices":3}]}],)";
+    js << R"("buffers":[{"byteLength":)" << bin.size() << "}],";
+    js << R"("bufferViews":[{"buffer":0,"byteOffset":)" << oPos << R"(,"byteLength":)" << V * 12 << "},"
+       << R"({"buffer":0,"byteOffset":)" << oJ << R"(,"byteLength":)" << V * 8 << "},"
+       << R"({"buffer":0,"byteOffset":)" << oW << R"(,"byteLength":)" << V * 16 << "},"
+       << R"({"buffer":0,"byteOffset":)" << oI << R"(,"byteLength":)" << idx.size() * 4 << "},"
+       << R"({"buffer":0,"byteOffset":)" << oB << R"(,"byteLength":)" << J * 64 << "}],";
+    float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
+    for (std::size_t i = 0; i < pos.size(); ++i) {
+        lo[i % 3] = std::min(lo[i % 3], pos[i]);
+        hi[i % 3] = std::max(hi[i % 3], pos[i]);
+    }
+    js << R"("accessors":[{"bufferView":0,"componentType":5126,"count":)" << V << R"(,"type":"VEC3","min":[)" << lo[0] << "," << lo[1] << "," << lo[2]
+       << R"(],"max":[)" << hi[0] << "," << hi[1] << "," << hi[2] << "]},"
+       << R"({"bufferView":1,"componentType":5123,"count":)" << V << R"(,"type":"VEC4"},)"
+       << R"({"bufferView":2,"componentType":5126,"count":)" << V << R"(,"type":"VEC4"},)"
+       << R"({"bufferView":3,"componentType":5125,"count":)" << idx.size() << R"(,"type":"SCALAR"},)"
+       << R"({"bufferView":4,"componentType":5126,"count":)" << J << R"(,"type":"MAT4"}]})";
+    std::string json = js.str();
+    while (json.size() % 4) json.push_back(' ');
+    std::vector<std::uint8_t> out;
+    auto u32 = [&](std::uint32_t v) {
+        for (int k = 0; k < 4; ++k) out.push_back(static_cast<std::uint8_t>(v >> (8 * k)));
+    };
+    u32(0x46546C67);
+    u32(2);
+    u32(static_cast<std::uint32_t>(28 + json.size() + bin.size()));
+    u32(static_cast<std::uint32_t>(json.size()));
+    u32(0x4E4F534A);
+    out.insert(out.end(), json.begin(), json.end());
+    u32(static_cast<std::uint32_t>(bin.size()));
+    u32(0x004E4942);
+    out.insert(out.end(), bin.begin(), bin.end());
+    return out;
+}
+
+// A BVH stick figure in T-pose (arms out along x, in other units) that steps forward and lifts its
+// left arm over the frames; the first frame is CMU's T-pose, which the motion jumps away from.
+std::string stickFigureBvh() {
+    std::ostringstream b;
+    b << "HIERARCHY\nROOT Hips\n{\n OFFSET 0 0 0\n CHANNELS 6 Xposition Yposition Zposition Zrotation Yrotation Xrotation\n"
+      << " JOINT LeftUpLeg\n {\n  OFFSET 2 -1 0\n  CHANNELS 3 Zrotation Yrotation Xrotation\n  JOINT LeftLeg\n  {\n   OFFSET 0 -9 0\n"
+      << "   CHANNELS 3 Zrotation Yrotation Xrotation\n   End Site\n   {\n    OFFSET 0 -10 0\n   }\n  }\n }\n"
+      << " JOINT RightUpLeg\n {\n  OFFSET -2 -1 0\n  CHANNELS 3 Zrotation Yrotation Xrotation\n  JOINT RightLeg\n  {\n   OFFSET 0 -9 0\n"
+      << "   CHANNELS 3 Zrotation Yrotation Xrotation\n   End Site\n   {\n    OFFSET 0 -10 0\n   }\n  }\n }\n"
+      << " JOINT Spine\n {\n  OFFSET 0 10 0\n  CHANNELS 3 Zrotation Yrotation Xrotation\n"
+      << "  JOINT Head\n  {\n   OFFSET 0 10 0\n   CHANNELS 3 Zrotation Yrotation Xrotation\n   End Site\n   {\n    OFFSET 0 5 0\n   }\n  }\n"
+      << "  JOINT LeftArm\n  {\n   OFFSET 3 8 0\n   CHANNELS 3 Zrotation Yrotation Xrotation\n   JOINT LeftForeArm\n   {\n    OFFSET 8 0 0\n"
+      << "    CHANNELS 3 Zrotation Yrotation Xrotation\n    End Site\n    {\n     OFFSET 8 0 0\n    }\n   }\n  }\n"
+      << "  JOINT RightArm\n  {\n   OFFSET -3 8 0\n   CHANNELS 3 Zrotation Yrotation Xrotation\n   JOINT RightForeArm\n   {\n    OFFSET -8 0 0\n"
+      << "    CHANNELS 3 Zrotation Yrotation Xrotation\n    End Site\n    {\n     OFFSET -8 0 0\n    }\n   }\n  }\n }\n}\n";
+    // 10 channels groups: hips 6, then 3 for each of the 8 joints: LeftUpLeg LeftLeg RightUpLeg RightLeg Spine Head LeftArm LeftForeArm RightArm RightForeArm
+    b << "MOTION\nFrames: 31\nFrame Time: 0.0333333\n";
+    b << "0 20 0 0 0 0  0 0 0  0 0 0  0 0 0  0 0 0  0 0 0  0 0 0  0 0 0  0 0 0  0 0 0  0 0 0\n";  // T-pose
+    for (int f = 1; f <= 30; ++f) {
+        const double t = (f - 1) / 29.0;
+        // the left arm swings from hanging down (-80 degrees around z) to straight up (+80); hips walk 12 units along +z
+        b << "0 20 " << 12 * t << " 0 0 0  0 0 0  0 0 0  0 0 0  0 0 0  0 0 0  0 0 0  " << (-80 + 160 * t) << " 0 0  0 0 0  -80 0 0  0 0 0\n";
+    }
+    return b.str();
+}
+} // namespace
+
+TEST(motion_capture_animates_a_rigged_figure) {
+    const std::vector<std::uint8_t> glb = stickFigureGlb();
+    Mesh fig = decodeGlb(glb, "stick figure");
+    fig.glb = glb;  // as loadMesh keeps it
+    CHECK(fig.rig.jointCount() == 13 && fig.rig.frameCount() == 0 && fig.rig.names[0] == "hips");
+    CHECK(fig.vertexCount() == 104 && std::fabs(fig.positions[1] - 0.97f) < 1e-4f);  // the rest pose: boxes on their joints
+
+    const MotionCapture mo = parseBvh(stickFigureBvh());
+    CHECK(mo.jointCount() == 16 && mo.frameCount() == 31 && std::fabs(mo.fps - 30) < 0.01);
+    CHECK_THROWS(parseBvh("HIERARCHY\nROOT a\n{\n OFFSET 0 0\n"), std::runtime_error);
+    CHECK_THROWS(parseBvh("MOTION"), std::runtime_error);
+
+    std::vector<std::string> report;
+    AnimateOptions ao;
+    ao.fps = 10;
+    const Mesh moving = animateMesh(fig, mo, ao, &report);
+    CHECK(report.size() == 6 && report[0] == "spine: hips > chest > head" && report[1] == "left leg: hips > knee_l > foot_l");
+    CHECK(report[2] == "left arm: chest > shoulder_l > elbow_l > hand_l");
+    CHECK(moving.rig.frameCount() == 10 && !moving.glb.empty());  // 29 frames at 30 fps (the T-pose skipped) -> 0.93 s at 10 fps
+    // The saved glTF has the animation; reading it back gives the same frames.
+    const Mesh again = decodeGlb(moving.glb, "animated");
+    CHECK(again.rig.frameCount() == 10);
+    // Start: the left arm hangs down and to the side (as the motion's, -80 degrees); end: it points up.
+    auto hand = [](const Mesh& m) {  // centre of the left hand's box (vertices 72..79)
+        double c[3] = {0, 0, 0};
+        for (int v = 72; v < 80; ++v)
+            for (int k = 0; k < 3; ++k) c[k] += m.positions[3 * v + k] / 8.0;
+        return std::array<double, 3>{c[0], c[1], c[2]};
+    };
+    const auto h0 = hand(poseMesh(moving, 0)), h1 = hand(poseMesh(moving, moving.rig.duration()));
+    CHECK(h0[1] < 1.0 && h0[0] > 0.15 && h1[1] > 2.0 && h1[0] > 0.15 && h1[0] < 0.5);  // up above the shoulder, on its side (+x)
+    // The hips walk forward (+z), scaled from the motion's 12 units by the hip heights (1 / 20).
+    const auto hipsZ = [](const Mesh& m) { return (m.positions[2] + m.positions[3 * 7 + 2]) / 2; };
+    CHECK(std::fabs(hipsZ(poseMesh(moving, moving.rig.duration())) - hipsZ(poseMesh(moving, 0)) - 0.6 * 28.0 / 29.0 * 0.93 / 0.9667) < 0.05);
+    ao.inPlace = true;
+    const Mesh still = animateMesh(fig, mo, ao);
+    CHECK(std::fabs(hipsZ(poseMesh(still, still.rig.duration())) - hipsZ(poseMesh(still, 0))) < 1e-3);
+    // Without a rig, or with no legs to find, it says so.
+    Mesh plain = fig;
+    plain.rig = MeshRig{};
+    CHECK_THROWS(animateMesh(plain, mo), std::invalid_argument);
+    // In a workflow: animate, render the animation (camera still), save the animated model.
+    const std::string dir = tempPath("animate");
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir + "/fig.glb", std::ios::binary).write(reinterpret_cast<const char*>(glb.data()), static_cast<std::streamsize>(glb.size()));
+    std::ofstream(dir + "/move.bvh") << stickFigureBvh();
+    const auto clips = runWorkflow(R"({"steps":[{"op":"load","path":"fig.glb","out":"f"},{"op":"animate","in":"f","capture":"move.bvh","fps":10,"out":"a"},)"
+                                   R"({"op":"render","in":"a","width":48,"height":48,"out":"v"},{"op":"save","in":"a","path":"a.glb"}]})",
+                                   dir);
+    CHECK(clips.at("v").size() == 10 && clips.at("v")[0].pixels != clips.at("v")[9].pixels);
+    CHECK(loadMesh(dir + "/a.glb").rig.frameCount() == 10);
+    CHECK(checkWorkflow(R"({"steps":[{"op":"animate","in":"m"}]})").size() == 1);  // the capture is required
+    const auto found = findModels(dir);  // motion captures are listed with the models (kind "mocap")
+    CHECK(std::any_of(found.begin(), found.end(), [](const ModelInfo& m) { return m.kind == "mocap" && m.name == "move.bvh"; }));
+    std::filesystem::remove_all(dir);
+}
+
 TEST(meshes_round_trip_render_and_come_from_depth) {
     // A textured quad leaning back, and a coloured triangle.
     Mesh q;

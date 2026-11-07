@@ -736,7 +736,12 @@ without up blocks: the conditioning embedding turns the control picture into
 latent-size features, the copied down / mid blocks run on the noisy latent,
 and zero convolutions produce residuals that `forward(..., residuals)` adds
 to the UNet's skips and mid block (`controlScale` weights them).
-`scripts/controlnet_reference.py` agrees with it within 2.5e-6.
+`scripts/controlnet_reference.py` agrees with it within 2.5e-6 (relative). Other ControlNet 1.1
+models have the same architecture: with `NEURACRAFT_CONTROLNET_DIR` set, the test
+`controlnet_matches_the_reference_on_real_weights` runs a real one against the reference (scribble:
+1.3e-5 at values up to 7.2, canny: 2.0e-5 at 7.0). For **scribble**, the `scribble` step turns a drawing
+(dark strokes on light paper, as a tablet sketch exports it) into the model's input: white strokes on
+black, thickened by `thickness` pixels.
 `cannyEdges()` follows OpenCV's `cv2.Canny` (the ControlNet canny
 preprocessor; IoU 0.99 with OpenCV's edges). Above: the snowy cabin's edges
 (middle) redrawn as a summer scene, 4 LCM steps, 92 s. ControlNet works for

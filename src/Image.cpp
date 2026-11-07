@@ -1191,6 +1191,43 @@ Image fitImage(const Image& image, std::size_t width, std::size_t height) {
     return crop.width == width && crop.height == height ? crop : resizeImage(crop, width, height);
 }
 
+Image scribbleImage(const Image& input, bool darkStrokes, int threshold, int thickness) {
+    checkImage(input, "scribbleImage");
+    if (thickness < 0 || thickness > 32) throw std::invalid_argument("scribbleImage: thickness must be 0..32");
+    const Image im = toRgb(input);
+    const std::size_t W = im.width, H = im.height;
+    std::vector<std::uint8_t> on(W * H);
+    for (std::size_t i = 0; i < W * H; ++i) {
+        const int lum = (299 * im.pixels[3 * i] + 587 * im.pixels[3 * i + 1] + 114 * im.pixels[3 * i + 2]) / 1000;
+        on[i] = darkStrokes ? lum < threshold : lum > threshold;
+    }
+    // Thicken: a square neighbourhood, rows then columns (separable).
+    const long t = thickness;
+    std::vector<std::uint8_t> rows(W * H, 0), out(W * H, 0);
+    for (std::size_t y = 0; y < H; ++y)
+        for (std::size_t x = 0; x < W; ++x) {
+            if (!on[y * W + x]) continue;
+            for (long d = -t; d <= t; ++d) {
+                const long xx = static_cast<long>(x) + d;
+                if (xx >= 0 && xx < static_cast<long>(W)) rows[y * W + static_cast<std::size_t>(xx)] = 1;
+            }
+        }
+    for (std::size_t y = 0; y < H; ++y)
+        for (std::size_t x = 0; x < W; ++x) {
+            if (!rows[y * W + x]) continue;
+            for (long d = -t; d <= t; ++d) {
+                const long yy = static_cast<long>(y) + d;
+                if (yy >= 0 && yy < static_cast<long>(H)) out[static_cast<std::size_t>(yy) * W + x] = 1;
+            }
+        }
+    Image r;
+    r.width = W;
+    r.height = H;
+    r.pixels.resize(W * H * 3);
+    for (std::size_t i = 0; i < W * H; ++i) r.pixels[3 * i] = r.pixels[3 * i + 1] = r.pixels[3 * i + 2] = out[i] ? 255 : 0;
+    return r;
+}
+
 Image cannyEdges(const Image& input, float low, float high) {
     checkImage(input, "cannyEdges");
     const Image im = input.channels == 1 ? input : toRgb(input);

@@ -141,6 +141,11 @@ std::vector<WorkflowOp> buildOps() {
               number("keyframes", "int", "6", "Keyframes", 1, 64), number("shrink", "float", "0.75", "Keyframe scale step", 0.3, 0.95),
               number("frames", "int", "12", "Frames between keyframes", 1, 256), field("zoom_in", "bool", "false", "Play inward")},
              diffusionFields("25", "0.9", false)));
+    add("scribble", "Scribble", "analysis",
+        "A drawing as the scribble ControlNet's input: its strokes white on black, thickened (dark strokes on light paper by default)", true,
+        {field("in", "clip", "", "Drawing", true), field("dark_strokes", "bool", "true", "The strokes are darker than the paper"),
+         number("threshold", "int", "128", "Brightness that separates strokes from paper", 1, 254),
+         number("thickness", "int", "2", "Pixels added on every side of a stroke", 0, 32)});
     add("canny", "Canny edges", "analysis", "Edge map for a Canny ControlNet", true,
         {field("in", "clip", "", "Input", true), number("low", "float", "100", "Low threshold", 0, 1000),
          number("high", "float", "200", "High threshold", 0, 1000)});

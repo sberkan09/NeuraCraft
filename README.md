@@ -879,6 +879,26 @@ milliseconds per second of motion. The figure has to stand upright with its legs
 base among props (the witch above) gets a skeleton without legs from the rigging model and cannot
 walk. Motion data: mocap.cs.cmu.edu, created with funding from NSF EIA-0196217.
 
+**From one picture to a dancing character.** The steps chain: a picture becomes a textured model
+(`image_to_3d`), the model gets a skeleton (`rig`), and the skeleton takes a motion (`animate`).
+`services/pod_chain.sh` runs the whole chain on one rented GPU with both services:
+
+```json
+{"steps": [
+  {"op": "load", "path": "robot.png", "out": "picture"},
+  {"op": "image_to_3d", "in": "picture", "faces": 200000, "out": "model"},
+  {"op": "rig", "in": "model", "out": "rigged"},
+  {"op": "animate", "in": "rigged", "capture": "data/motions/dance.bvh", "seconds": 6, "fps": 24, "out": "dancing"},
+  {"op": "save", "in": "dancing", "path": "robot_dance.glb"}]}
+```
+
+<p><img src="docs/images/chain.jpg" width="900"></p>
+
+Two characters drawn by SD-Turbo (left), each turned into a model, rigged, and walking and dancing
+(CMU captures), all drawn by the engine. On an A40 the 3D model takes 1-2.5 min and the rig 30 s; the
+animation then takes under a second. The robot is found with every limb. The knight waves with his
+right hand above his head, and his hand is still taken for an arm, not his head.
+
 ### Stereo 3D: pictures and video for 3D screens, headsets and glasses
 
 `stereo` turns pictures or a video into stereoscopic 3D (`Stereo.h`): Depth Anything V2 gives each

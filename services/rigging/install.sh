@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Installs SkinTokens / TokenRig and the rigging service in a Python 3.11 virtual environment, on Linux
 # with an NVIDIA GPU (14 GB or more). Needs python3.11 with venv, git, and the system libraries Blender's
-# bpy module loads (libxrender1 libxxf86vm1 libxfixes3 libxi6 libxkbcommon0 libsm6 libgl1).
+# bpy module and Open3D load (libxrender1 libxxf86vm1 libxfixes3 libxi6 libxkbcommon0 libsm6 libgl1
+# libegl1 libusb-1.0-0 libgomp1).
 #   services/rigging/install.sh [DIR]      (default /opt/skintokens; then: DIR/run.sh)
 set -euo pipefail
 DIR=${1:-/opt/skintokens}
@@ -25,4 +26,4 @@ cat > run.sh <<RUN
 cd "$DIR" && . venv/bin/activate && SKINTOKENS_DIR="$DIR/SkinTokens" exec python server.py
 RUN
 chmod +x run.sh
-cd SkinTokens && python -c "import torch, bpy, flash_attn, demo; print('skintokens ready, torch', torch.__version__, 'bpy', bpy.app.version_string)"
+cd SkinTokens && python -c "import torch, bpy, open3d, flash_attn, demo; print('skintokens ready, torch', torch.__version__, 'bpy', bpy.app.version_string)"

@@ -8,7 +8,7 @@ set -uo pipefail
 BRANCH=${1:-main}
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y -qq git cmake build-essential curl python3.11-venv python3.11-dev \
-    libxrender1 libxxf86vm1 libxfixes3 libxi6 libxkbcommon0 libsm6 libgl1 libegl1 > /dev/null
+    libxrender1 libxxf86vm1 libxfixes3 libxi6 libxkbcommon0 libsm6 libgl1 libegl1 libusb-1.0-0 libgomp1 > /dev/null
 export PYTHON=python3.11
 [ -d /nc ] || git clone -q -b "$BRANCH" https://github.com/sberkan09/NeuraCraft /nc
 cd /nc && git pull -q

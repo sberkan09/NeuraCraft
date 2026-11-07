@@ -25,7 +25,9 @@ cmake -S /nc -B /nc/build -DCMAKE_BUILD_TYPE=Release > /dev/null && cmake --buil
 echo "engine build: $(( $(date +%s) - T0 )) s"
 until curl -s localhost:8000/health | grep -q '"ok": true'; do
     sleep 10
-    if ! pgrep -f server.py > /dev/null; then echo "service died:"; tail -40 /tmp/server.log; sleep infinity; fi
+    if ! pgrep -f server.py > /dev/null || curl -s localhost:8000/health | grep -q '"error"'; then
+        echo "service failed:"; tail -60 /tmp/server.log; cp /tmp/server.log /results/server.log; sleep infinity
+    fi
 done
 grep "loaded in" /tmp/server.log
 export NEURACRAFT_3D_URL=http://127.0.0.1:8000
@@ -56,5 +58,6 @@ run 2 standard
 run 0 fast
 run 0 high
 grep "^\[3d\] .*faces" /tmp/server.log
+cp /tmp/server.log /results/server.log
 echo "=== pod check done ==="
 sleep infinity

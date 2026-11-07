@@ -14,7 +14,9 @@ mkdir -p "$DIR" && cd "$DIR"
 . venv/bin/activate
 pip install -q --upgrade pip wheel setuptools
 pip install -q torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
-pip install -q imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja trimesh transformers pandas zstandard kornia timm pillow
+# transformers: DINOv3 needs 4.56+; BiRefNet's remote code (background removal) needs einops.
+pip install -q imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja trimesh transformers==4.56.2 pandas zstandard \
+    kornia timm einops pillow
 pip install -q git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
 # Attention: FlashAttention (a prebuilt wheel; building it from source would take an hour), else xFormers.
 timeout 900 pip install -q flash-attn==2.7.4.post1 --no-build-isolation \
@@ -35,4 +37,6 @@ cat > run.sh <<RUN
 cd "$DIR" && . venv/bin/activate && TRELLIS_DIR="$DIR/TRELLIS.2" exec python server.py
 RUN
 chmod +x run.sh
-python -c "import torch, o_voxel, cumesh, flex_gemm, nvdiffrast.torch; print('trellis2 ready, torch', torch.__version__, 'cuda', torch.version.cuda)"
+cd TRELLIS.2 && python -c "import torch, o_voxel, cumesh, flex_gemm, nvdiffrast.torch, einops
+from trellis2.pipelines import Trellis2ImageTo3DPipeline
+print('trellis2 ready, torch', torch.__version__, 'cuda', torch.version.cuda)"

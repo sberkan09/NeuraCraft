@@ -46,18 +46,24 @@ MODEL = os.environ.get("MODEL", "microsoft/TRELLIS.2-4B")
 gpu = threading.Lock()
 pipeline = None
 loaded_at = None
+load_error = None  # why the model could not be loaded (then /health answers 500 with it)
 
 
 def load():
-    global pipeline, loaded_at
-    from trellis2.pipelines import Trellis2ImageTo3DPipeline
+    global pipeline, loaded_at, load_error
+    try:
+        from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
-    start = time.time()
-    p = Trellis2ImageTo3DPipeline.from_pretrained(MODEL)
-    p.cuda()
-    pipeline = p
-    loaded_at = time.time()
-    print(f"[3d] {MODEL} loaded in {loaded_at - start:.1f} s", flush=True)
+        start = time.time()
+        p = Trellis2ImageTo3DPipeline.from_pretrained(MODEL)
+        p.cuda()
+        pipeline = p
+        loaded_at = time.time()
+        print(f"[3d] {MODEL} loaded in {loaded_at - start:.1f} s", flush=True)
+    except BaseException as e:
+        traceback.print_exc()
+        load_error = f"{type(e).__name__}: {e}"
+        print(f"[3d] could not load {MODEL}: {load_error}", flush=True)
 
 
 def generate(png: bytes, quality: str, seed: int, texture: int, faces: int) -> bytes:
@@ -110,7 +116,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.error(403, "forbidden")
         url = urlparse(self.path)
         if url.path == "/health":
-            return self.reply(200, json.dumps({"ok": pipeline is not None, "model": MODEL, "busy": gpu.locked()}).encode())
+            state = {"ok": pipeline is not None, "model": MODEL, "busy": gpu.locked()}
+            if load_error:
+                state["error"] = load_error
+            return self.reply(200 if load_error is None else 500, json.dumps(state).encode())
         m = re.fullmatch(r"/files/([A-Za-z0-9._-]{1,128})", url.path)
         if m and FILES_DIR:
             path = os.path.join(FILES_DIR, m.group(1))
@@ -142,7 +151,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             return self.error(400, str(e))
         if pipeline is None:
-            return self.error(503, "the model is still loading")
+            return self.error(503, f"the 3D model could not be loaded ({load_error})" if load_error else "the model is still loading")
         try:
             data = generate(png, quality, seed, texture, faces)
         except torch.cuda.OutOfMemoryError:

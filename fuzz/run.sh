@@ -12,7 +12,7 @@ mkdir -p "$C"/{json,workflow,png,safetensors,onnx,tensorproto,mesh}
 cp docs/workflows/*.json "$C/json/"; cp docs/workflows/*.json "$C/workflow/"
 i=0; for f in tests/onnx/cases/*/model.onnx tests/onnx/pipeline/*.onnx; do cp "$f" "$C/onnx/m$i.onnx"; i=$((i+1)); done
 i=0; for f in tests/onnx/cases/*/*.pb; do [ "$(wc -c <"$f")" -lt 4096 ] && cp "$f" "$C/tensorproto/t$i.pb"; i=$((i+1)); done
-cp fuzz/seeds/*.png fuzz/seeds/*.ppm "$C/png/"; cp fuzz/seeds/*.safetensors "$C/safetensors/"; cp fuzz/seeds/*.glb fuzz/seeds/*.obj fuzz/seeds/*.ply "$C/mesh/"
+cp fuzz/seeds/*.png fuzz/seeds/*.ppm "$C/png/"; cp fuzz/seeds/*.safetensors "$C/safetensors/"; cp fuzz/seeds/*.glb fuzz/seeds/*.obj fuzz/seeds/*.ply fuzz/seeds/*.bvh "$C/mesh/"
 status=0
 for t in json workflow png safetensors onnx tensorproto mesh; do
     echo "== fuzz_$t (${SECONDS_EACH} s)"

@@ -186,6 +186,15 @@ std::vector<WorkflowOp> buildOps() {
         {field("in", "mesh", "", "3D model", true), number("seed", "int", "42", "Seed (another seed, another skeleton)", 0, 2147483647),
          field("postprocess", "bool", "true", "Smooth the skin weights over the model's volume")});
     ops.back().makes = "mesh";
+    add("animate", "Animate", "3d",
+        "Moves a rigged figure with motion capture (a .bvh file, as CMU's free library has them): legs, arms, spine and head found "
+        "on both skeletons, the hips carried along; saved as an animated .glb",
+        true,
+        {field("in", "mesh", "", "Rigged 3D model (from rig)", true), field("capture", "file", "", "Motion capture (.bvh)", true),
+         number("fps", "float", "30", "Frames a second", 1, 120), number("start", "float", "0", "Seconds into the motion", 0, 36000),
+         number("seconds", "float", "0", "How much of the motion (0: all of it)", 0, 600), number("speed", "float", "1", "Playback speed", 0.1, 10),
+         field("in_place", "bool", "false", "Keep the figure in place (no walking away)")});
+    ops.back().makes = "mesh";
     add("render", "Render 3D", "3d", "Pictures of a 3D model: a still, or a turntable clip", true,
         {field("in", "mesh", "", "3D model", true), number("width", "int", "512", "Width", 16, 4096), number("height", "int", "512", "Height", 16, 4096),
          number("frames", "int", "1", "Frames (more than 1: a turntable)", 1, 720), number("turn", "float", "360", "Degrees turned over the frames", -1080, 1080),
@@ -194,7 +203,8 @@ std::vector<WorkflowOp> buildOps() {
          field("lighting", "bool", "true", "Shade by a light (off: flat colours)"),
          choice("stereo", {"none", "sbs", "half_sbs", "tb", "anaglyph"}, "\"none\"",
                 "Stereo 3D: both eyes' views side by side (half_sbs: in the same width), top and bottom, or red-cyan"),
-         number("eye", "float", "3", "Stereo: degrees between the two eyes' cameras", 0, 20)});
+         number("eye", "float", "3", "Stereo: degrees between the two eyes' cameras", 0, 20),
+         field("play", "bool", "true", "Animated models: play the animation over the frames (frames default to all of it, turn to 0)")});
     add("stereo", "Stereo 3D", "3d",
         "Stereoscopic 3D from pictures or video and their depth: left and right eye views for 3D TVs, VR players and "
         "red-cyan glasses",

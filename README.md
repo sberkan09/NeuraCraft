@@ -853,6 +853,32 @@ SkinTokens' giraffe with its skeleton and posed (legs swung, drawn by three.js f
 sampled: a sample that is not a valid rig is drawn again with the next seed (up to four), and a
 figure on a base with props (the witch) gets bones for the props too.
 
+**Animation.** `animate` moves a rigged figure with motion capture (`Animation.h`): BVH files, as the
+CMU motion capture database shares thousands of them for free (`scripts/download_cmu_motions.sh` fetches
+a walk, a run, a jump, a dance and a cartwheel). No bone names are needed: on both skeletons the spine,
+head, legs and arms are found from the rest pose. Each bone of the figure then points the way the
+motion's bone at the same place along the limb points, with the motion's twist; the hips travel and
+bob, scaled by the ratio of hip heights. Different rest poses (A-pose figure, T-pose capture) and
+different bone counts work. The animation is written into the model's `.glb` (materials kept, valid
+under the Khronos validator), and the engine reads animated glTF too: `render` plays an animation with
+the camera held still around all of its poses.
+
+```json
+{"steps": [
+  {"op": "load", "path": "figure_rigged.glb", "out": "figure"},
+  {"op": "animate", "in": "figure", "capture": "data/motions/cartwheel.bvh", "seconds": 4, "out": "moving"},
+  {"op": "render", "in": "moving", "width": 256, "height": 256, "yaw": -35, "out": "clip"},
+  {"op": "save", "in": "moving", "path": "figure_cartwheel.glb"},
+  {"op": "save", "in": "clip", "path": "figure_cartwheel.gif", "fps": 15}]}
+```
+
+<p><img src="docs/images/animate.jpg" width="800"></p>
+
+Walk, dance and cartwheel on Cesium's Rigged Figure (glTF Sample Assets, CC BY 4.0), a few
+milliseconds per second of motion. The figure has to stand upright with its legs apart; a figure on a
+base among props (the witch above) gets a skeleton without legs from the rigging model and cannot
+walk. Motion data: mocap.cs.cmu.edu, created with funding from NSF EIA-0196217.
+
 ### Stereo 3D: pictures and video for 3D screens, headsets and glasses
 
 `stereo` turns pictures or a video into stereoscopic 3D (`Stereo.h`): Depth Anything V2 gives each

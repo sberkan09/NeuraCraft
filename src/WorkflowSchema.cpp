@@ -168,6 +168,12 @@ std::vector<WorkflowOp> buildOps() {
          field("apply", "bool", "false", "Mask models: cut the input out with the mask (transparent background)"),
          field("invert", "bool", "false", "Invert the output"),
          number("tile", "int", "-1", "Fixed-size upscalers: tile overlap in pixels (-1 automatic, 0 never tile)", -1, 512)});
+    add("classify", "Classify", "analysis",
+        "An image classifier exported to ONNX (a content filter, a tagger): scores per frame and label written to a .json file "
+        "(labels, size and activation from the manifest next to it); the clip itself is unchanged",
+        false,
+        {model("model", "onnx", "The .onnx file", true), field("in", "clip", "", "Pictures to classify", true),
+         field("path", "file", "", "Scores file (.json): labels, the highest score per label, and every frame's", true)});
     add("interpolate", "Interpolate", "enhance", "RIFE in-between frames (each pass doubles the frame rate)", true,
         {model("model", "rife", "RIFE weights", true), field("in", "clip", "", "Clip", true),
          number("passes", "int", "1", "Doublings", 1, 4), field("loop", "bool", "false", "Also between the last and first frame")});

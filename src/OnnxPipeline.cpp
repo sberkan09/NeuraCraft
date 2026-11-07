@@ -1,6 +1,7 @@
 // What a workflow's "onnx" step does around Model::run: picture -> input tensor (size, layout,
 // channel order, value range, mean / std), output tensor -> picture (image, mask or depth), and
-// tiles for fixed-size super-resolution models.
+// tiles for fixed-size super-resolution models. The "classify" step uses the same input side and
+// reads the output as scores, one per label.
 
 #include "Onnx.h"
 
@@ -133,6 +134,13 @@ OnnxPipeline OnnxPipeline::fromModel(const Model& model, const json::Value& mani
         if (out->find("channels")) p.bgrOut = upper(out->at("channels").string) == "BGR";
         if (out->find("invert")) p.invert = out->at("invert").boolean;
         if (out->find("apply")) p.applyMask = out->at("apply").boolean;
+        if (const json::Value* l = out->find("labels"))
+            for (const json::Value& x : l->array) p.labels.push_back(x.isString() ? x.string : std::to_string(p.labels.size()));
+        if (out->find("activation")) {
+            p.activation = out->at("activation").string;
+            if (p.activation != "softmax" && p.activation != "sigmoid" && p.activation != "none")
+                throw std::runtime_error("onnx: output.activation is softmax, sigmoid or none, not \"" + p.activation + "\"");
+        }
         if (const json::Value* r = out->find("range")) {
             if (r->isString()) p.autoRange = r->string == "auto";
             else {
@@ -148,39 +156,73 @@ OnnxPipeline OnnxPipeline::fromModel(const Model& model, const json::Value& mani
     return p;
 }
 
+namespace {
+
+// The picture as the model takes it: grey or RGB.
+Image sourcePicture(const OnnxPipeline& p, const Image& input) {
+    if (!p.grayIn) return toRgb(input);
+    const Image rgb = toRgb(input);
+    Image g;
+    g.width = rgb.width;
+    g.height = rgb.height;
+    g.channels = 1;
+    g.pixels.resize(rgb.width * rgb.height);
+    for (std::size_t k = 0; k < g.pixels.size(); ++k)
+        g.pixels[k] = static_cast<std::uint8_t>(std::lround(0.299 * rgb.pixels[3 * k] + 0.587 * rgb.pixels[3 * k + 1] + 0.114 * rgb.pixels[3 * k + 2]));
+    return g;
+}
+
+// A picture of the model's size -> its input tensor (layout, channel order, range, mean / std).
+Tensor pictureTensor(const OnnxPipeline& p, const Image& im) {
+    const std::size_t H = im.height, W = im.width, C = im.channels;
+    Tensor t;
+    t.kind = Tensor::Kind::Float;
+    t.elemType = 1;
+    t.shape = p.nhwcIn ? std::vector<std::int64_t>{1, static_cast<std::int64_t>(H), static_cast<std::int64_t>(W), static_cast<std::int64_t>(C)}
+                       : std::vector<std::int64_t>{1, static_cast<std::int64_t>(C), static_cast<std::int64_t>(H), static_cast<std::int64_t>(W)};
+    t.f.resize(C * H * W);
+    for (std::size_t y = 0; y < H; ++y)
+        for (std::size_t x = 0; x < W; ++x)
+            for (std::size_t c = 0; c < C; ++c) {
+                const std::size_t sc = p.bgrIn && C == 3 ? 2 - c : c;
+                float v = im.pixels[(y * W + x) * C + sc] / 255.0f * (p.inHigh - p.inLow) + p.inLow;
+                if (!p.mean.empty()) v -= p.mean[std::min(c, p.mean.size() - 1)];
+                if (!p.stdev.empty()) v /= p.stdev[std::min(c, p.stdev.size() - 1)];
+                t.f[p.nhwcIn ? (y * W + x) * C + c : (c * H + y) * W + x] = v;
+            }
+    return t;
+}
+
+} // namespace
+
+std::vector<float> OnnxPipeline::classify(const Model& model, const Image& input) const {
+    if (width <= 0 || height <= 0) throw std::runtime_error("classify: the model needs a fixed input size (give input.size in its manifest)");
+    const Image src = sourcePicture(*this, input);
+    const std::size_t tw = static_cast<std::size_t>(width), th = static_cast<std::size_t>(height);
+    const Image sized = (src.width == tw && src.height == th) ? src : resizeImage(src, tw, th);
+    const auto res = model.run({{inputName, pictureTensor(*this, sized)}}, {outputName});
+    const Tensor& o = res.at(outputName);
+    if (o.kind != Tensor::Kind::Float) throw std::runtime_error("classify: output '" + outputName + "' is not a float tensor");
+    std::vector<float> v = o.f;
+    if (!labels.empty() && v.size() != labels.size())
+        throw std::runtime_error("classify: the model gives " + std::to_string(v.size()) + " values for " + std::to_string(labels.size()) + " labels");
+    if (activation == "softmax" && !v.empty()) {
+        const float top = *std::max_element(v.begin(), v.end());
+        double sum = 0;
+        for (float& x : v) sum += (x = std::exp(x - top));
+        for (float& x : v) x = static_cast<float>(x / sum);
+    } else if (activation == "sigmoid") {
+        for (float& x : v) x = 1.0f / (1.0f + std::exp(-x));
+    }
+    return v;
+}
+
 Image OnnxPipeline::run(const Model& model, const Image& input) const {
-    const Image src = grayIn ? [&] {
-        const Image rgb = toRgb(input);
-        Image g;
-        g.width = rgb.width;
-        g.height = rgb.height;
-        g.channels = 1;
-        g.pixels.resize(rgb.width * rgb.height);
-        for (std::size_t k = 0; k < g.pixels.size(); ++k)
-            g.pixels[k] = static_cast<std::uint8_t>(std::lround(0.299 * rgb.pixels[3 * k] + 0.587 * rgb.pixels[3 * k + 1] + 0.114 * rgb.pixels[3 * k + 2]));
-        return g;
-    }()
-                               : toRgb(input);
-    const std::size_t C = src.channels;
+    const Image src = sourcePicture(*this, input);
 
     // One forward pass over a picture of the size the model takes -> planes.
     auto forward = [&](const Image& im) {
-        const std::size_t H = im.height, W = im.width;
-        Tensor t;
-        t.kind = Tensor::Kind::Float;
-        t.elemType = 1;
-        t.shape = nhwcIn ? std::vector<std::int64_t>{1, static_cast<std::int64_t>(H), static_cast<std::int64_t>(W), static_cast<std::int64_t>(C)}
-                         : std::vector<std::int64_t>{1, static_cast<std::int64_t>(C), static_cast<std::int64_t>(H), static_cast<std::int64_t>(W)};
-        t.f.resize(C * H * W);
-        for (std::size_t y = 0; y < H; ++y)
-            for (std::size_t x = 0; x < W; ++x)
-                for (std::size_t c = 0; c < C; ++c) {
-                    const std::size_t sc = bgrIn && C == 3 ? 2 - c : c;
-                    float v = im.pixels[(y * W + x) * C + sc] / 255.0f * (inHigh - inLow) + inLow;
-                    if (!mean.empty()) v -= mean[std::min(c, mean.size() - 1)];
-                    if (!stdev.empty()) v /= stdev[std::min(c, stdev.size() - 1)];
-                    t.f[nhwcIn ? (y * W + x) * C + c : (c * H + y) * W + x] = v;
-                }
+        Tensor t = pictureTensor(*this, im);
         const auto res = model.run({{inputName, std::move(t)}}, {outputName});
         const Tensor& o = res.at(outputName);
         if (o.kind != Tensor::Kind::Float) throw std::runtime_error("onnx: output '" + outputName + "' is not a float tensor");

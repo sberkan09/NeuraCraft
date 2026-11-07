@@ -644,6 +644,31 @@ Real-ESRGAN's x4 (from 256 px, in tiles).
 `depth_anything_v2_small.json`: the same input plus `"size": [518, 518]` and
 `"output": {"kind": "depth"}`; Real-ESRGAN needs none.
 
+The `classify` step runs an **image classifier** (a content filter, a tagger)
+on every frame and writes its scores to a `.json` file; the clip goes on
+unchanged. The manifest's input side is the same, plus `output.labels` and
+`output.activation` (`softmax`, the default, `sigmoid` or `none`). The file
+holds the labels, the highest score per label over the frames and every
+frame's scores:
+
+```json
+{"steps": [
+  {"op": "load", "path": "scene.png", "out": "pic"},
+  {"op": "classify", "model": "data/onnx/nsfw.onnx", "in": "pic", "path": "out/moderation.json"}]}
+```
+```json
+{"model": "nsfw.onnx", "labels": ["normal", "nsfw"], "scores": {"normal": 0.9998, "nsfw": 0.0002},
+ "frames": [[0.9998, 0.0002]]}
+```
+
+`nsfw.onnx` here is Falconsai's
+[ViT NSFW classifier](https://huggingface.co/Falconsai/nsfw_image_detection)
+(Apache-2.0; [its ONNX export](https://huggingface.co/onnx-community/nsfw_image_detection-ONNX),
+`onnx/model.onnx`, 343 MB) with `nsfw.json`:
+`{"input": {"size": [224, 224], "mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]}, "output": {"labels": ["normal", "nsfw"]}}`.
+Its logits match onnxruntime to 1e-6, about 0.45 s a picture on two CPU
+threads. NeuraCraft Cloud runs it on every preset result before releasing it.
+
 ### LoRA and the LCM sampler
 
 `--lora file.safetensors[:scale]` merges LoRA adapters

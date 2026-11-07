@@ -60,7 +60,9 @@ def load():
         print(f"[rig] could not load TokenRig: {load_error}", flush=True)
 
 
-ATTEMPTS = 3  # the rig is sampled; now and then a sample ends without skin weights, and the next seed works
+# The rig is sampled, and now and then a sample is not a valid rig (no skin weights, a broken token
+# sequence); the next seed usually is.
+ATTEMPTS = 4
 
 
 def rig(glb: bytes, seed: int, postprocess: bool) -> bytes:
@@ -82,8 +84,10 @@ def rig(glb: bytes, seed: int, postprocess: bool) -> bytes:
                 demo.run_rig([src], top_k=5, top_p=0.95, temperature=1.0, repetition_penalty=2.0, num_beams=10,
                              use_skeleton=False, use_transfer=True, use_postprocess=postprocess, output_paths=[dst],
                              model_ckpt=ckpt, hf_path=None)
-            except AssertionError:  # TokenRig's check that the sample has skin weights
-                print(f"[rig] seed {s}: no complete rig, trying another seed", flush=True)
+            except torch.cuda.OutOfMemoryError:
+                raise
+            except Exception as e:  # an invalid sample: TokenRig's assertions, its detokenizer
+                print(f"[rig] seed {s}: no valid rig ({type(e).__name__}: {e}), trying another seed", flush=True)
                 continue
             if dst.is_file():
                 break

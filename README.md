@@ -848,8 +848,8 @@ generates the bone hierarchy and every vertex's weights as one token sequence, o
 <p><img src="docs/images/rig.jpg" width="800"></p>
 
 SkinTokens' giraffe with its skeleton and posed (legs swung, drawn by three.js from the rigged
-`.glb`), and the TRELLIS.2 witch from above: 50 and 32 bones. On an A40 a rig takes 20 s (giraffe,
-10,000 vertices) to 1-2 min (witch, 335,000 vertices) with 2.5-3.7 GiB of GPU memory. Rigs are
+`.glb`), and the TRELLIS.2 witch from above: 50 and 32 bones. On an A40 a rig takes 20-30 s (giraffe,
+10,000 vertices) and 50 s to 2 min (witch, 335,000 vertices) with 2.4-3.7 GiB of GPU memory. Rigs are
 sampled: a sample that is not a valid rig is drawn again with the next seed (up to four), and a
 figure on a base with props (the witch) gets bones for the props too.
 

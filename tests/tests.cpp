@@ -4395,8 +4395,70 @@ TEST(depth_anything_and_parallax) {
     CHECK_THROWS(runWorkflow(R"({"steps":[{"op":"load","path":"in.png","out":"pic"},{"op":"render","in":"pic"}]})", out), std::invalid_argument);
     CHECK_THROWS(runWorkflow(R"({"steps":[{"op":"load","path":"relief.glb","out":"m"},{"op":"save","in":"m","path":"m.png"}]})", out), std::invalid_argument);
     CHECK(checkWorkflow(R"({"steps":[{"op":"render","in":"x","background":"pink"}]})").size() == 1);
+    // Stereo 3D: a picture through its depth, and a mesh rendered for both eyes.
+    const auto s3d = runWorkflow(R"({"steps":[{"op":"load","path":"in.png","out":"pic"},)"
+                                 R"({"op":"stereo","model":")" + dir + R"(","in":"pic","layout":"sbs","size":28,"out":"sbs"},)"
+                                 R"({"op":"stereo","model":")" + dir + R"(","in":"pic","layout":"anaglyph","size":28,"out":"red"},)"
+                                 R"({"op":"load","path":"relief.glb","out":"relief"},)"
+                                 R"({"op":"render","in":"relief","width":32,"height":24,"stereo":"tb","out":"pair"}]})",
+                                 out, {}, &results);
+    CHECK(s3d.at("sbs")[0].width == 100 && s3d.at("sbs")[0].height == 30 && s3d.at("red")[0].width == 50);
+    CHECK(s3d.at("pair")[0].width == 32 && s3d.at("pair")[0].height == 48);
+    CHECK(checkWorkflow(R"({"steps":[{"op":"stereo","model":"m","in":"x","layout":"3d"}]})").size() == 1);
     std::filesystem::remove_all(out);
     std::filesystem::remove_all(dir);
+}
+
+TEST(stereo_views_and_layouts) {
+    // 40 x 10, every column its own colour; columns 15..19 are near, the rest far.
+    Image img;
+    img.width = 40;
+    img.height = 10;
+    std::vector<float> near(400, 0.0f);
+    for (std::size_t y = 0; y < 10; ++y)
+        for (std::size_t x = 0; x < 40; ++x) {
+            for (int c = 0; c < 3; ++c) img.pixels.push_back(static_cast<std::uint8_t>(x * 6 + c));
+            if (x >= 15 && x <= 19) near[y * 40 + x] = 1.0f;
+        }
+    const auto px = [](const Image& im, std::size_t x, std::size_t y) { return im.pixels[(y * im.width + x) * 3]; };
+    StereoOptions so;
+    so.strength = 0.2f;  // 8 pixels between near and far; each eye moves near pixels by 4
+    so.focus = 0.0f;     // far stays on the screen plane
+    auto [left, right] = stereoViews(img, near, so);
+    CHECK(left.width == 40 && right.height == 10);
+    CHECK(px(left, 19, 3) == px(img, 15, 3) && px(right, 11, 3) == px(img, 15, 3));  // near: crossed, in front of the screen
+    CHECK(px(left, 5, 3) == px(img, 5, 3) && px(right, 30, 3) == px(img, 30, 3));    // far: in place
+    CHECK(px(left, 15, 3) == px(img, 14, 3));  // uncovered: filled from the far side
+    so.focus = 1.0f;  // near on the screen plane: it stays, far moves the other way
+    auto [l2, r2] = stereoViews(img, near, so);
+    CHECK(px(l2, 17, 3) == px(img, 17, 3) && px(l2, 1, 3) == px(img, 5, 3));
+    CHECK_THROWS(stereoViews(img, std::vector<float>(3), so), std::invalid_argument);
+
+    CHECK(stereoFrame(left, right, StereoLayout::SideBySide).width == 80);
+    const Image half = stereoFrame(left, right, StereoLayout::HalfSideBySide);
+    CHECK(half.width == 40 && half.height == 10 && px(half, 20, 0) == (px(right, 0, 0) + px(right, 1, 0) + 1) / 2);
+    const Image tb = stereoFrame(left, right, StereoLayout::TopBottom);
+    CHECK(tb.width == 40 && tb.height == 20 && px(tb, 11, 13) == px(right, 11, 3));
+    Image white = img, black = img;
+    std::fill(white.pixels.begin(), white.pixels.end(), 255);
+    std::fill(black.pixels.begin(), black.pixels.end(), 0);
+    const Image red = stereoFrame(white, black, StereoLayout::Anaglyph), cyan = stereoFrame(black, white, StereoLayout::Anaglyph);
+    CHECK(red.pixels[0] > 150 && red.pixels[1] < 20 && red.pixels[2] < 20);
+    CHECK(cyan.pixels[0] < 20 && cyan.pixels[1] > 150 && cyan.pixels[2] > 150);
+    CHECK_THROWS(stereoFrame(left, tb, StereoLayout::SideBySide), std::invalid_argument);
+    CHECK(stereoLayout("tb") == StereoLayout::TopBottom && stereoLayoutName(StereoLayout::HalfSideBySide) == "half_sbs");
+    CHECK_THROWS(stereoLayout("3d"), std::invalid_argument);
+
+    // Depth range: robust to outliers, smoothed from frame to frame.
+    std::vector<float> depth(1000);
+    for (std::size_t i = 0; i < depth.size(); ++i) depth[i] = static_cast<float>(i % 100);
+    depth[7] = 1e9f;  // one wild value does not flatten the rest
+    StereoDepthRange range(0.5f);
+    const auto n1 = range.nearness(depth);
+    CHECK(n1[0] == 0.0f && n1[98] == 1.0f && n1[50] > 0.45f && n1[50] < 0.55f && n1[7] == 1.0f);
+    for (float& d : depth) d *= 2;  // the next frame's range jumps; the range moves halfway
+    const auto n2 = range.nearness(depth);
+    CHECK(n2[50] > 0.6f && n2[50] < 0.75f);
 }
 
 namespace {

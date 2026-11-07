@@ -2,6 +2,7 @@
 #include "Backend.h"
 #include "Onnx.h"
 #include "Depth.h"
+#include "Stereo.h"
 #include "Mesh.h"
 #include "ImageTo3D.h"
 #include "Diffusion.h"
@@ -239,7 +240,7 @@ std::set<std::string> modelsUsed(const Step& s) {
             out.insert(modelTag(ip));
             out.insert(modelTag(enc));
         }
-    } else if (op == "depth" || op == "parallax" || op == "depth_mesh" || op == "upscale" || op == "interpolate" || op == "onnx") {
+    } else if (op == "depth" || op == "parallax" || op == "depth_mesh" || op == "stereo" || op == "upscale" || op == "interpolate" || op == "onnx") {
         out.insert(modelTag(s.path("model")));
     }
     return out;
@@ -543,7 +544,7 @@ std::vector<std::string> checkWorkflowLimits(const std::string& text, const std:
         const double w = v.numberOr("width", 512), h = v.numberOr("height", 512);
         if (limits.maxPixels && (v.find("width") || v.find("height") || generationOps.count(op)) && w * h > static_cast<double>(limits.maxPixels))
             out.push_back(where + "width x height is more than the limit of " + std::to_string(limits.maxPixels) + " pixels");
-        if (limits.maxPixels && v.find("size") && op == "depth") {
+        if (limits.maxPixels && v.find("size") && (op == "depth" || op == "parallax" || op == "depth_mesh" || op == "stereo")) {
             const double sz = v.numberOr("size", 518);
             if (sz * sz > static_cast<double>(limits.maxPixels)) out.push_back(where + "size is more than the pixel limit");
         }
@@ -840,6 +841,24 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
                 po.loop = s.flag("loop", true);
                 out = parallaxAnimation(s.image("in"), de.estimate(s.image("in"), inputSize), po);
             }
+        } else if (op == "stereo") {
+            const auto depthHold = smallModel<DepthEstimator>("depth", s.path("model"));
+            const std::size_t inputSize = s.size("size", 518);
+            const StereoLayout layout = stereoLayout(s.str("layout", "half_sbs"));
+            StereoOptions so;
+            so.strength = static_cast<float>(s.num("strength", so.strength));
+            so.focus = static_cast<float>(s.num("focus", so.focus));
+            so.smooth = static_cast<float>(std::clamp(s.num("smooth", so.smooth), 0.0, 0.99));
+            StereoDepthRange range(so.smooth);
+            const Clip& in = s.clip("in");
+            for (const Image& im : in) {
+                progress.frame(static_cast<std::size_t>(&im - in.data()), in.size());
+                const std::size_t factor = layout == StereoLayout::SideBySide || layout == StereoLayout::TopBottom ? 2 : 1;
+                if (limits.maxPixels && im.width * im.height * factor > limits.maxPixels)
+                    throw WorkflowLimitExceeded("stereo: the result would be bigger than the pixel limit");
+                const auto views = stereoViews(im, range.nearness(depthHold->estimate(im, inputSize)), so);
+                out.push_back(stereoFrame(views.first, views.second, layout));
+            }
         } else if (op == "depth_mesh") {
             const auto depthHold = smallModel<DepthEstimator>("depth", s.path("model"));
             const Image& picture = s.image("in");
@@ -871,11 +890,26 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
             for (std::uint8_t& c : ro.background) c = level;
             const std::size_t frames = std::max<std::size_t>(1, s.size("frames", 1));
             const float turn = static_cast<float>(s.num("turn", 360));
+            const std::string stereo = s.str("stereo", "none");
+            const bool pair = stereo != "none";
+            const StereoLayout layout = pair ? stereoLayout(stereo) : StereoLayout::SideBySide;
+            const float eye = static_cast<float>(s.num("eye", 3));  // degrees between the two eyes' cameras
+            if (pair && limits.maxPixels && (layout == StereoLayout::SideBySide || layout == StereoLayout::TopBottom) &&
+                2 * ro.width * ro.height > limits.maxPixels)
+                throw WorkflowLimitExceeded("render: the stereo frames would be bigger than the pixel limit");
             for (std::size_t f = 0; f < frames; ++f) {
                 progress.frame(f, frames);
                 MeshRenderOptions view = ro;
                 view.yaw = ro.yaw + turn * static_cast<float>(f) / static_cast<float>(frames);
-                out.push_back(renderMesh(m, view));
+                if (!pair) {
+                    out.push_back(renderMesh(m, view));
+                    continue;
+                }
+                // Positive yaw moves the camera to the right: the left eye looks from yaw - eye / 2.
+                MeshRenderOptions left = view, right = view;
+                left.yaw -= eye / 2;
+                right.yaw += eye / 2;
+                out.push_back(stereoFrame(renderMesh(m, left), renderMesh(m, right), layout));
             }
         } else if (op == "upscale") {
             const auto up = smallModel<Upscaler>("upscaler", s.path("model"));

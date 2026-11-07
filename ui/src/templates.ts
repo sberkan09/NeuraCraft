@@ -200,6 +200,39 @@ export const templates: Template[] = [
     },
   },
   {
+    id: "stereo",
+    title: "3D video / fotoğraf",
+    subtitle: "Derinlikten sol ve sağ göz (VR, 3D TV, kırmızı-camgöbeği gözlük)",
+    needs: ["depth"],
+    fields: [
+      { key: "image", label: "Fotoğraf", kind: "image", wide: true },
+      {
+        key: "layout",
+        label: "Düzen",
+        kind: "enum",
+        default: "half_sbs",
+        options: [
+          { value: "half_sbs", label: "Yan yana (yarım genişlik)", hint: "3D TV'ler ve çoğu VR oynatıcı" },
+          { value: "sbs", label: "Yan yana (tam)", hint: "iki kat geniş" },
+          { value: "tb", label: "Üst üste" },
+          { value: "anaglyph", label: "Kırmızı-camgöbeği", hint: "3D gözlükle" },
+        ],
+      },
+      { key: "strength", label: "Derinlik etkisi", kind: "float", default: 0.03, min: 0, max: 0.08, step: 0.005 },
+      { key: "focus", label: "Ekran düzlemi (0: önde, 1: arkada)", kind: "float", default: 0.5, min: 0, max: 1, step: 0.05 },
+    ],
+    build(v, models, out) {
+      const depth = pickModel(models, "depth");
+      return {
+        steps: [
+          { op: "load", path: v.image, out: "photo" },
+          { op: "stereo", model: depth, in: "photo", layout: String(v.layout), strength: Number(v.strength), focus: Number(v.focus), out: "stereo" },
+          { op: "save", in: "stereo", path: `${out}/stereo.png` },
+        ],
+      };
+    },
+  },
+  {
     id: "hires",
     title: "Hires portre",
     subtitle: "Üret, ×4 büyüt, yeniden çiz",

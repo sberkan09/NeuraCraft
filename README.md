@@ -833,6 +833,31 @@ s (`standard`, 6-8 GiB) and 260 s (`high`, 14 GiB) per model, about 300,000 tria
 texture each. Transparent or glowing parts (the bottles) come out opaque: the renderer draws base
 colour only.
 
+### Stereo 3D: pictures and video for 3D screens, headsets and glasses
+
+`stereo` turns pictures or a video into stereoscopic 3D (`Stereo.h`): Depth Anything V2 gives each
+frame's depth, and each eye's view moves pixels along their row by half the disparity, nearer pixels
+in front of the screen plane and farther ones behind it (`focus`), with a depth test and the gaps
+behind near edges filled from the far side. Layouts: `half_sbs` (both views in the original width:
+3D TVs and most VR video players), `sbs`, `tb` and `anaglyph` (red-cyan glasses, Dubois colours). For
+video the depth range (2nd to 98th percentile) is smoothed from frame to frame (`smooth`), so the
+depth effect does not pump when something near enters the picture. `render` draws 3D models for both
+eyes too (`"stereo": "sbs"`, `eye` degrees between the cameras).
+
+```json
+{"steps": [
+  {"op": "load", "dir": "frames", "out": "clip"},
+  {"op": "stereo", "model": "data/depth-anything-v2-small", "in": "clip", "layout": "half_sbs", "strength": 0.03, "out": "vr"},
+  {"op": "save", "in": "vr", "path": "clip_3d.mov", "fps": 24}]}
+```
+
+<p><img src="docs/images/stereo_sbs.jpg" width="512"> <img src="docs/images/stereo_anaglyph.jpg" width="256"></p>
+<p><img src="docs/images/stereo_video_sbs.gif" width="512"></p>
+
+The SD-Turbo Istanbul picture side by side (left eye left: parallel viewing) and as an anaglyph, and
+the AnimateDiff clip in 3D. On the 2-core machine a 384 x 384 frame takes 1.9 s, nearly all of it
+depth; the video's 16 frames at 256 x 256 about 30 s.
+
 ### Image prompts: IP-Adapter
 
 ```

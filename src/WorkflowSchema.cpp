@@ -184,7 +184,22 @@ std::vector<WorkflowOp> buildOps() {
          number("frames", "int", "1", "Frames (more than 1: a turntable)", 1, 720), number("turn", "float", "360", "Degrees turned over the frames", -1080, 1080),
          number("yaw", "float", "0", "Starting angle around the model (degrees)", -360, 360), number("pitch", "float", "15", "Camera height (degrees)", -89, 89),
          number("fov", "float", "35", "Field of view (degrees)", 5, 120), choice("background", {"white", "grey", "black"}, "\"white\"", "Background"),
-         field("lighting", "bool", "true", "Shade by a light (off: flat colours)")});
+         field("lighting", "bool", "true", "Shade by a light (off: flat colours)"),
+         choice("stereo", {"none", "sbs", "half_sbs", "tb", "anaglyph"}, "\"none\"",
+                "Stereo 3D: both eyes' views side by side (half_sbs: in the same width), top and bottom, or red-cyan"),
+         number("eye", "float", "3", "Stereo: degrees between the two eyes' cameras", 0, 20)});
+    add("stereo", "Stereo 3D", "3d",
+        "Stereoscopic 3D from pictures or video and their depth: left and right eye views for 3D TVs, VR players and "
+        "red-cyan glasses",
+        true,
+        {model("model", "depth", "Depth Anything V2 folder", true), field("in", "clip", "", "Pictures or video", true),
+         choice("layout", {"half_sbs", "sbs", "tb", "anaglyph"}, "\"half_sbs\"",
+                "half_sbs: both views in the original width (3D TVs, most VR players); sbs: twice as wide; tb: top and bottom; "
+                "anaglyph: red-cyan glasses"),
+         number("strength", "float", "0.03", "Depth effect: largest disparity as a fraction of the width", 0, 0.1),
+         number("focus", "float", "0.5", "Screen plane (0: everything comes out of the screen, 1: everything behind it)", 0, 1),
+         number("smooth", "float", "0.8", "Video: depth range smoothing between frames (0: none)", 0, 0.99),
+         number("size", "int", "518", "Depth network input size", 14, 2044)});
     return ops;
 }
 

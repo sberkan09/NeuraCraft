@@ -13,7 +13,8 @@ const labels: Record<string, string> = {
   zoom_in: "İçeri doğru", low: "Alt eşik", high: "Üst eşik", size: "Ağ boyutu", amplitude: "Salınım", passes: "Geçiş", mode: "Mod",
   weight: "Ağırlık", beta_schedule: "Beta planı", grid: "Izgara", depth: "Derinlik", edges: "Kenar kesme", turn: "Dönüş",
   yaw: "Açı", pitch: "Yükseklik açısı", fov: "Görüş açısı", background: "Arka plan", lighting: "Işıklandırma",
-  texture: "Doku boyutu", faces: "Üçgen sayısı",
+  texture: "Doku boyutu", faces: "Üçgen sayısı", layout: "Düzen", focus: "Ekran düzlemi", smooth: "Yumuşatma",
+  stereo: "Stereo 3D", eye: "Göz açısı",
 };
 export const fieldLabel = (name: string) => labels[name] ?? name;
 

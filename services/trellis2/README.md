@@ -14,7 +14,8 @@ NEURACRAFT_3D_URL=http://127.0.0.1:8188 bin/NeuraCraft workflow my3d.json
 
 * **Models**: `microsoft/TRELLIS.2-4B` (MIT), `facebook/dinov3-vitl16-pretrain-lvd1689m` (gated: the
   Hugging Face account behind `HF_TOKEN` must have been granted access; DINOv3 License) and
-  `ZhengPeng7/BiRefNet` (MIT; background removal, only for pictures without transparency).
+  `ZhengPeng7/BiRefNet` (MIT; background removal, only for pictures without transparency; it replaces
+  the gated, non-commercial `briaai/RMBG-2.0` that TRELLIS.2's config names, `REMBG_MODEL` to change).
 * **Quality**: `fast` = 512³ voxels, `standard` = 1024³ (cascade), `high` = 1536³ (cascade).
 * **Protocol**: `GET /health`; `POST /v1/image-to-3d?quality=&seed=&texture=&faces=` with a PNG body →
   `model/gltf-binary`, or an error status with `{"error": "..."}`. Requests from other machines need

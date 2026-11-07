@@ -42,6 +42,9 @@ MAX_BODY = 64 << 20
 TOKEN = os.environ.get("TOKEN", "")
 FILES_DIR = os.environ.get("FILES_DIR", "")
 MODEL = os.environ.get("MODEL", "microsoft/TRELLIS.2-4B")
+# Background removal for pictures without alpha. TRELLIS.2's config names briaai/RMBG-2.0, which is
+# gated and non-commercial; BiRefNet (MIT) is the same architecture.
+REMBG_MODEL = os.environ.get("REMBG_MODEL", "ZhengPeng7/BiRefNet")
 
 gpu = threading.Lock()
 pipeline = None
@@ -52,8 +55,13 @@ load_error = None  # why the model could not be loaded (then /health answers 500
 def load():
     global pipeline, loaded_at, load_error
     try:
-        from trellis2.pipelines import Trellis2ImageTo3DPipeline
+        from trellis2.pipelines import Trellis2ImageTo3DPipeline, rembg
 
+        class BackgroundRemoval(rembg.BiRefNet):
+            def __init__(self, model_name=None):
+                super().__init__(REMBG_MODEL)
+
+        rembg.BiRefNet = BackgroundRemoval
         start = time.time()
         p = Trellis2ImageTo3DPipeline.from_pretrained(MODEL)
         p.cuda()

@@ -3925,18 +3925,21 @@ TEST(workflow_sandbox_and_limits) {
     CHECK(maxDecodePixels() == (std::size_t(1) << 28));
     // file names mapped for a service (scales kept), every file seen
     std::vector<std::string> seen;
-    const std::string mapped = mapWorkflowFiles(R"({"steps": [{"op": "txt2img", "model": "asset:sd", "prompt": "asset:not-a-file", "lora": ["asset:l1:0.7", "asset:l2"], "out": "x"},
+    const std::string mapped = mapWorkflowFiles(R"({"steps": [{"op": "txt2img", "model": "asset:sd", "prompt": "asset:not-a-file", "lora": ["asset:l1:0.7", "asset:l2", "asset:045a45db-1:1", "asset:7e1d"], "out": "x"},
         {"op": "load", "path": "asset:pic"}]})",
                                                 [&](const WorkflowField& f, const std::string& v) {
                                                     seen.push_back(f.name + "=" + v);
                                                     return "/cache/" + v.substr(6);
                                                 });
-    CHECK(seen.size() == 4);
+    CHECK(seen.size() == 6);
     const json::Value m = json::parse(mapped);
     CHECK(m.at("steps").array[0].at("model").string == "/cache/sd");
     CHECK(m.at("steps").array[0].at("prompt").string == "asset:not-a-file");
     CHECK(m.at("steps").array[0].at("lora").array[0].string == "/cache/l1:0.7");
     CHECK(m.at("steps").array[0].at("lora").array[1].string == "/cache/l2");
+    // an id starting with a digit is not a scale; a scale after it still is
+    CHECK(m.at("steps").array[0].at("lora").array[2].string == "/cache/045a45db-1:1");
+    CHECK(m.at("steps").array[0].at("lora").array[3].string == "/cache/7e1d");
     CHECK(m.at("steps").array[1].at("path").string == "/cache/pic");
     // hostile files: a PNG claiming to be huge is refused before allocating, an ONNX model cannot
     // point its external data outside its folder

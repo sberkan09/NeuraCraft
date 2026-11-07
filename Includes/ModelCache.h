@@ -1,6 +1,7 @@
 #ifndef NEURACRAFT_MODEL_CACHE_H
 #define NEURACRAFT_MODEL_CACHE_H
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -34,18 +35,42 @@ std::size_t modelCacheKeep();
 // "data/sd/../sd" and "data/sd/" -> "data/sd"; width / height > 0 append "@WxH".
 std::string modelTag(const std::string& path, std::size_t width = 0, std::size_t height = 0);
 
+// Seconds this process has spent loading models through cachedModel (reading weights, quantizing,
+// merging LoRAs), loads inside loads counted once. A worker reads it before and after a job to tell
+// model loading from running.
+double modelLoadSeconds();
+
 namespace detail {
 std::shared_ptr<void> cacheFind(const std::string& key);
 void cacheStore(const std::string& key, const std::string& tag, std::shared_ptr<void> value);
+// Adds the time of the outermost load on this thread to modelLoadSeconds().
+class LoadTimer {
+public:
+    LoadTimer();
+    ~LoadTimer();
+    LoadTimer(const LoadTimer&) = delete;
+    LoadTimer& operator=(const LoadTimer&) = delete;
+
+private:
+    std::chrono::steady_clock::time_point start_;
+    bool outer_;
+};
 } // namespace detail
 
 // The cached model under `key`, or load() (which returns a shared_ptr<T>)
 // stored under it. Without caching, just load().
 template <typename T>
 std::shared_ptr<T> cachedModel(const std::string& key, const std::string& tag, const std::function<std::shared_ptr<T>()>& load) {
-    if (!modelCaching()) return load();
+    if (!modelCaching()) {
+        const detail::LoadTimer timer;
+        return load();
+    }
     if (std::shared_ptr<void> hit = detail::cacheFind(key)) return std::static_pointer_cast<T>(hit);
-    std::shared_ptr<T> model = load();
+    std::shared_ptr<T> model;
+    {
+        const detail::LoadTimer timer;
+        model = load();
+    }
     detail::cacheStore(key, tag, model);
     return model;
 }

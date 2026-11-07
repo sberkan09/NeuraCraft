@@ -3830,6 +3830,25 @@ TEST(onnx_classifier_step_writes_scores_per_label) {
 
 // Running other people's workflows: files only inside the allowed folders, bounded sizes and time,
 // files renamed for a service, and the readers' guards against hostile files.
+TEST(model_cache_counts_the_time_spent_loading_models) {
+    ModelCacheScope scope;
+    const double before = modelLoadSeconds();
+    auto slow = [] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        // a load inside a load is counted once
+        return cachedModel<int>("inner-load-timer", "inner", [] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            return std::make_shared<int>(2);
+        });
+    };
+    CHECK(*cachedModel<int>("outer-load-timer", "outer", slow) == 2);
+    const double took = modelLoadSeconds() - before;
+    CHECK(took >= 0.045 && took < 0.5);
+    CHECK(*cachedModel<int>("outer-load-timer", "outer", slow) == 2);  // cached: no load
+    CHECK(modelLoadSeconds() - before < took + 0.005);
+    clearModelCache();
+}
+
 TEST(model_cache_keeps_recent_models_when_asked) {
     ModelCacheScope scope;
     auto load = [](int v) { return [v] { return std::make_shared<int>(v); }; };

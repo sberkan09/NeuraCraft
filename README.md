@@ -895,7 +895,7 @@ walk. Motion data: mocap.cs.cmu.edu, created with funding from NSF EIA-0196217.
 <p><img src="docs/images/chain.jpg" width="900"></p>
 
 Two characters drawn by SD-Turbo (left), each turned into a model, rigged, and walking and dancing
-(CMU captures), all drawn by the engine. On an A40 the 3D model takes 150 s and the rig 30 s; the
+(CMU captures), all drawn by the engine. On an A40 the 3D model takes 1-2.5 min and the rig 30 s; the
 animation then takes under a second. The robot is found with every limb. The knight waves with his
 right hand above his head, and his hand is still taken for an arm, not his head.
 

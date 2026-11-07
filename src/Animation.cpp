@@ -271,9 +271,18 @@ Limbs findLimbs(const std::vector<Vec3>& P, const std::vector<int>& parents, con
         return path;
     };
     Limbs L;
+    // The head: the highest end joint above the root (a raised hand can be higher, but not over it).
+    const std::size_t root0 = [&] {
+        std::size_t r = 0;
+        while (r < J && parents[r] >= 0) ++r;
+        return r < J ? r : 0;
+    }();
     int head = -1;
-    for (std::size_t j = 0; j < J; ++j)
-        if (!kids[j] && (head < 0 || P[j][1] > P[static_cast<std::size_t>(head)][1])) head = static_cast<int>(j);
+    for (int pass = 0; pass < 2 && head < 0; ++pass)
+        for (std::size_t j = 0; j < J; ++j)
+            if (!kids[j] && (pass == 1 || std::fabs(P[j][0] - P[root0][0]) < 0.12 * H) &&
+                (head < 0 || P[j][1] > P[static_cast<std::size_t>(head)][1]))
+                head = static_cast<int>(j);
     if (head < 0) throw std::invalid_argument(what + ": no joints");
     L.spine = pathTo(head);
     if (L.spine.size() < 2) throw std::invalid_argument(what + ": no spine (the highest end joint hangs from the root)");

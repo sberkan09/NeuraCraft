@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <map>
@@ -4609,12 +4610,19 @@ TEST(image_to_3d_goes_through_the_3d_service) {
 namespace {
 // A rigged stick figure as a glTF binary: 13 joints (hips, chest, head; knees and feet; shoulders,
 // elbows and hands), a small box on each joint, every box bound to its joint.
-std::vector<std::uint8_t> stickFigureGlb() {
+std::vector<std::uint8_t> stickFigureGlb(bool waving = false) {
     const char* names[] = {"hips", "chest", "head", "knee_l", "foot_l", "knee_r", "foot_r", "shoulder_l", "elbow_l", "hand_l", "shoulder_r", "elbow_r", "hand_r"};
     const int parents[] = {-1, 0, 1, 0, 3, 0, 5, 1, 7, 8, 1, 10, 11};
-    const float world[][3] = {{0, 1, 0},          {0, 1.5f, 0},       {0, 2, 0},          {0.2f, 0.5f, 0},     {0.2f, 0, 0},
+    const float worldA[][3] = {{0, 1, 0},          {0, 1.5f, 0},       {0, 2, 0},          {0.2f, 0.5f, 0},     {0.2f, 0, 0},
                               {-0.2f, 0.5f, 0},   {-0.2f, 0, 0},      {0.15f, 1.5f, 0},   {0.45f, 1.2f, 0},    {0.7f, 0.9f, 0},
                               {-0.15f, 1.5f, 0},  {-0.45f, 1.2f, 0},  {-0.7f, 0.9f, 0}};  // arms hang down (A-pose)
+    float world[13][3];
+    std::memcpy(world, worldA, sizeof(world));
+    if (waving) {  // the right hand raised above the head
+        const float elbow[3] = {-0.35f, 1.9f, 0}, hand[3] = {-0.4f, 2.3f, 0};
+        std::memcpy(world[11], elbow, sizeof(elbow));
+        std::memcpy(world[12], hand, sizeof(hand));
+    }
     const int J = 13;
     std::vector<float> pos, w;
     std::vector<std::uint16_t> jn;
@@ -4763,6 +4771,13 @@ TEST(motion_capture_animates_a_rigged_figure) {
     Mesh plain = fig;
     plain.rig = MeshRig{};
     CHECK_THROWS(animateMesh(plain, mo), std::invalid_argument);
+    // A raised hand higher than the head is still an arm (the head is the highest end over the hips).
+    const std::vector<std::uint8_t> wavingGlb = stickFigureGlb(true);
+    Mesh waving = decodeGlb(wavingGlb);
+    waving.glb = wavingGlb;
+    report.clear();
+    animateMesh(waving, mo, ao, &report);
+    CHECK(report[0] == "spine: hips > chest > head" && report[4] == "right arm: chest > shoulder_r > elbow_r > hand_r");
     // In a workflow: animate, render the animation (camera still), save the animated model.
     const std::string dir = tempPath("animate");
     std::filesystem::create_directories(dir);

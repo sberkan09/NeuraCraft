@@ -190,7 +190,7 @@ std::vector<WorkflowOp> buildOps() {
         "Moves a rigged figure with motion capture (a .bvh file, as CMU's free library has them): legs, arms, spine and head found "
         "on both skeletons, the hips carried along; saved as an animated .glb",
         true,
-        {field("in", "mesh", "", "Rigged 3D model (from rig)", true), field("capture", "file", "", "Motion capture (.bvh)", true),
+        {field("in", "mesh", "", "Rigged 3D model (from rig)", true), model("capture", "mocap", "Motion capture (.bvh)", true),
          number("fps", "float", "30", "Frames a second", 1, 120), number("start", "float", "0", "Seconds into the motion", 0, 36000),
          number("seconds", "float", "0", "How much of the motion (0: all of it)", 0, 600), number("speed", "float", "1", "Playback speed", 0.1, 10),
          field("in_place", "bool", "false", "Keep the figure in place (no walking away)")});
@@ -462,6 +462,8 @@ std::vector<ModelInfo> findModels(const std::string& root, std::size_t maxDepth)
                 if (depth + 1 < maxDepth) stack.push_back({p, depth + 1});
             } else if (e.is_regular_file(ec) && p.extension() == ".onnx") {
                 out.push_back({p.string(), "onnx", p.filename().string(), static_cast<std::size_t>(e.file_size(ec))});
+            } else if (e.is_regular_file(ec) && p.extension() == ".bvh") {
+                out.push_back({p.string(), "mocap", p.filename().string(), static_cast<std::size_t>(e.file_size(ec))});
             } else if (e.is_regular_file(ec) && p.extension() == ".safetensors") {
                 if (p.parent_path().filename() == "unet" || p.parent_path().filename() == "vae" ||
                     p.parent_path().filename() == "text_encoder" || folderKind(p.parent_path()) != "")

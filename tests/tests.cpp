@@ -4774,6 +4774,8 @@ TEST(motion_capture_animates_a_rigged_figure) {
     CHECK(clips.at("v").size() == 10 && clips.at("v")[0].pixels != clips.at("v")[9].pixels);
     CHECK(loadMesh(dir + "/a.glb").rig.frameCount() == 10);
     CHECK(checkWorkflow(R"({"steps":[{"op":"animate","in":"m"}]})").size() == 1);  // the capture is required
+    const auto found = findModels(dir);  // motion captures are listed with the models (kind "mocap")
+    CHECK(std::any_of(found.begin(), found.end(), [](const ModelInfo& m) { return m.kind == "mocap" && m.name == "move.bvh"; }));
     std::filesystem::remove_all(dir);
 }
 

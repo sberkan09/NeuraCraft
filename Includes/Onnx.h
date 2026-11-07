@@ -99,7 +99,8 @@ std::vector<std::string> supportedOperators();
 //   "output": {"name": "...", "kind": "image" | "mask" | "depth",
 //              "range": [0, 1] (values that map to 0..255; "auto" stretches min..max),
 //              "layout": "NCHW" | "NHWC", "channels": "RGB" | "BGR", "invert": false,
-//              "apply": true (kind mask: cut the input out with it - RGBA - instead of returning it)}
+//              "apply": true (kind mask: cut the input out with it - RGBA - instead of returning it),
+//              "labels": ["normal", "nsfw"], "activation": "softmax" | "sigmoid" | "none" (classifiers)}
 // }
 // Without a manifest: one NCHW RGB input in 0..1, the model's fixed size if it has one, the output
 // an image (3 channels) or a mask / depth (1 channel) stretched to 0..255. An image output comes back
@@ -121,9 +122,14 @@ struct OnnxPipeline {
     int tileOverlap = -1;             // tiles for fixed-size models: overlap in input pixels (-1: automatic, 0: never)
     bool rangeSet = false;            // the manifest gave output.range
     bool fixedByModel = false;        // width / height are the model's own (not the manifest's "size")
+    std::vector<std::string> labels;  // classifiers: a name per output value ("0", "1", ... when absent)
+    std::string activation = "softmax";  // classifiers: softmax, sigmoid or none (the raw outputs)
 
     static OnnxPipeline fromModel(const Model& model, const json::Value& manifest);
     Image run(const Model& model, const Image& in) const;
+    // An image classifier: the picture squeezed to the model's size (it needs one), the output values
+    // through the activation, one per label. Throws when the output does not match the labels.
+    std::vector<float> classify(const Model& model, const Image& in) const;
 };
 
 // The manifest of a model (an empty object when there is none).

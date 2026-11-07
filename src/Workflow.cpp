@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -124,7 +125,7 @@ struct Step {
         if (s.empty()) return s;
         const std::filesystem::path p(s);
         const std::string full = p.is_absolute() ? s : (std::filesystem::path(base) / p).string();
-        if (std::string(k) == "path" && op == "save") allowWrite(limits, full);
+        if (std::string(k) == "path" && (op == "save" || op == "classify")) allowWrite(limits, full);
         else allowRead(limits, full);
         return full;
     }
@@ -241,7 +242,7 @@ std::set<std::string> modelsUsed(const Step& s) {
             out.insert(modelTag(ip));
             out.insert(modelTag(enc));
         }
-    } else if (op == "depth" || op == "parallax" || op == "depth_mesh" || op == "stereo" || op == "upscale" || op == "interpolate" || op == "onnx") {
+    } else if (op == "depth" || op == "parallax" || op == "depth_mesh" || op == "stereo" || op == "upscale" || op == "interpolate" || op == "onnx" || op == "classify") {
         out.insert(modelTag(s.path("model")));
     }
     return out;
@@ -562,7 +563,7 @@ std::vector<std::string> checkWorkflowLimits(const std::string& text, const std:
                 const std::filesystem::path p(value);
                 const std::string full = p.is_absolute() ? value : (std::filesystem::path(base) / p).string();
                 try {
-                    if (op == "save" && field.name == "path") allowWrite(&limits, full);
+                    if ((op == "save" || op == "classify") && field.name == "path") allowWrite(&limits, full);
                     else allowRead(&limits, full);
                 } catch (const std::exception& e) {
                     out.push_back(where + e.what());
@@ -973,6 +974,45 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
                 progress.frame(static_cast<std::size_t>(&im - in.data()), in.size());
                 out.push_back(pipe.run(*model, im));
             }
+        } else if (op == "classify") {
+            // Scores per frame and label into a JSON file; the clip goes on unchanged (nothing made).
+            const std::string path = s.path("model");
+            const auto model = cachedModel<onnx::Model>("onnx|" + modelTag(path), modelTag(path),
+                                                         [&] { return std::make_shared<onnx::Model>(onnx::Model::load(path)); });
+            const onnx::OnnxPipeline pipe = onnx::OnnxPipeline::fromModel(*model, onnx::onnxManifest(path));
+            const std::string file = s.path("path");
+            if (file.empty()) throw std::invalid_argument("classify: needs \"path\" (a .json file)");
+            if (file.size() < 5 || file.compare(file.size() - 5, 5, ".json") != 0) throw std::invalid_argument("classify: \"path\" is a .json file, not " + file);
+            const Clip& in = s.clip("in");
+            std::vector<std::vector<float>> scores;
+            for (const Image& im : in) {
+                progress.frame(static_cast<std::size_t>(&im - in.data()), in.size());
+                scores.push_back(pipe.classify(*model, im));
+            }
+            const std::size_t n = scores.empty() ? 0 : scores.front().size();
+            std::vector<json::Value> labels, frames;
+            std::vector<std::pair<std::string, json::Value>> top;
+            for (std::size_t k = 0; k < n; ++k) {
+                const std::string name = k < pipe.labels.size() ? pipe.labels[k] : std::to_string(k);
+                float best = 0;
+                for (const auto& f : scores) best = std::max(best, f[k]);
+                labels.push_back(json::makeString(name));
+                top.emplace_back(name, json::makeNumber(best));
+            }
+            for (const auto& f : scores) {
+                std::vector<json::Value> row;
+                for (float x : f) row.push_back(json::makeNumber(x));
+                frames.push_back(json::makeArray(std::move(row)));
+            }
+            const json::Value doc = json::makeObject({{"model", json::makeString(std::filesystem::path(path).filename().string())},
+                                                      {"labels", json::makeArray(std::move(labels))},
+                                                      {"scores", json::makeObject(std::move(top))},
+                                                      {"frames", json::makeArray(std::move(frames))}});
+            const std::filesystem::path parent = std::filesystem::path(file).parent_path();
+            if (!parent.empty()) std::filesystem::create_directories(parent);
+            std::ofstream f(file);
+            f << json::dump(doc) << "\n";
+            if (!f) throw std::runtime_error("classify: cannot write " + file);
         } else if (op == "interpolate") {
             const std::size_t passes = s.size("passes", 1), n = s.clip("in").size();
             const std::size_t made = passes > 16 ? std::numeric_limits<std::size_t>::max()

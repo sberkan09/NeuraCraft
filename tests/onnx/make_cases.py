@@ -317,6 +317,9 @@ save_model("mean_mask", [n("ReduceMean", ["x"], ["y"], axes=[1], keepdims=1)], h
 # identity, for channel order and value-range checks
 save_model("identity", [n("Identity", ["x"], ["y"])], h.make_tensor_value_info("x", T.FLOAT, [1, 3, "h", "w"]),
            h.make_tensor_value_info("y", T.FLOAT, [1, 3, "h", "w"]))
+# a "classifier": the mean of each channel as three scores (red, green, blue)
+save_model("channel_means", [n("GlobalAveragePool", ["x"], ["p"]), n("Flatten", ["p"], ["y"])],
+           h.make_tensor_value_info("x", T.FLOAT, [1, 3, "h", "w"]), h.make_tensor_value_info("y", T.FLOAT, [1, 3]))
 print("pipeline models in", PIPE)
 # hostile: an initializer whose external data points outside the model's folder (must not load)
 t = nh.from_array(np.ones(4, np.float32), "w")

@@ -3753,6 +3753,81 @@ TEST(onnx_picture_pipeline_and_workflow_step) {
     fs::remove_all(dir);
 }
 
+// Image classifiers ("classify" step): the picture squeezed to the model's size, the outputs through
+// the manifest's activation, one score per label; the step writes them to a .json file.
+TEST(onnx_classifier_step_writes_scores_per_label) {
+    namespace fs = std::filesystem;
+    const std::string dir = tempPath("onnx_classify");
+    fs::create_directories(dir + "/models");
+    fs::copy_file(fs::path(NEURACRAFT_SOURCE_DIR) / "tests" / "onnx" / "pipeline" / "channel_means.onnx", dir + "/models/means.onnx",
+                  fs::copy_options::overwrite_existing);
+    auto flat = [](std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+        Image im;
+        im.width = 6;
+        im.height = 4;
+        for (int k = 0; k < 24; ++k) im.pixels.insert(im.pixels.end(), {r, g, b});
+        return im;
+    };
+    const onnx::Model m = onnx::Model::load(dir + "/models/means.onnx");
+    auto manifest = [&](const std::string& text) {
+        std::ofstream(dir + "/models/means.json") << text;
+        return onnx::OnnxPipeline::fromModel(m, onnx::onnxManifest(dir + "/models/means.onnx"));
+    };
+    // No size: the model takes any, so a classifier cannot know what to squeeze to.
+    CHECK_THROWS(manifest("{}").classify(m, flat(1, 2, 3)), std::runtime_error);
+    // Raw values: the channel means in 0..1.
+    onnx::OnnxPipeline p = manifest(R"({"input": {"size": [2, 2]}, "output": {"labels": ["red", "green", "blue"], "activation": "none"}})");
+    CHECK(p.labels.size() == 3 && p.activation == "none");
+    std::vector<float> v = p.classify(m, flat(204, 102, 51));
+    CHECK(v.size() == 3 && std::fabs(v[0] - 0.8f) < 1e-5f && std::fabs(v[1] - 0.4f) < 1e-5f && std::fabs(v[2] - 0.2f) < 1e-5f);
+    // Softmax (the default): sums to one, the order kept; sigmoid: each on its own.
+    p.activation = "softmax";
+    v = p.classify(m, flat(204, 102, 51));
+    CHECK(std::fabs(v[0] + v[1] + v[2] - 1.0f) < 1e-5f && v[0] > v[1] && v[1] > v[2]);
+    CHECK(std::fabs(v[0] - std::exp(0.8f) / (std::exp(0.8f) + std::exp(0.4f) + std::exp(0.2f))) < 1e-5f);
+    p.activation = "sigmoid";
+    CHECK(std::fabs(p.classify(m, flat(0, 0, 0))[1] - 0.5f) < 1e-6f);
+    // Mean / std apply as for picture models; labels that do not match the outputs, or a bad activation, fail.
+    CHECK(std::fabs(manifest(R"({"input": {"size": [2, 2], "mean": [0.5], "std": [0.5]}, "output": {"activation": "none"}})").classify(m, flat(255, 0, 0))[0] - 1.0f) < 1e-5f);
+    CHECK_THROWS(manifest(R"({"input": {"size": [2, 2]}, "output": {"labels": ["a", "b"]}})").classify(m, flat(1, 2, 3)), std::runtime_error);
+    CHECK_THROWS(manifest(R"({"output": {"activation": "relu"}})"), std::runtime_error);
+
+    // The step: the highest score per label over the frames, and every frame's; the clip goes on.
+    manifest(R"({"input": {"size": [2, 2]}, "output": {"labels": ["red", "green", "blue"], "activation": "none"}})");
+    savePng(dir + "/a.png", flat(255, 0, 0));
+    savePng(dir + "/b.png", flat(0, 0, 255));
+    const auto clips = runWorkflow(R"({"steps": [
+        {"op": "load", "path": "a.png", "out": "a"}, {"op": "load", "path": "b.png", "out": "b"},
+        {"op": "concat", "in": ["a", "b"], "out": "ab"},
+        {"op": "classify", "model": "models/means.onnx", "in": "ab", "path": "out/scores.json"}]})", dir);
+    CHECK(clips.at("ab").size() == 2);
+    std::ifstream in(dir + "/out/scores.json");
+    std::stringstream text;
+    text << in.rdbuf();
+    const json::Value doc = json::parse(text.str());
+    CHECK(doc.at("model").string == "means.onnx" && doc.at("labels").array.size() == 3 && doc.at("labels").array[2].string == "blue");
+    CHECK(std::fabs(doc.at("scores").at("red").number - 1.0) < 1e-5 && std::fabs(doc.at("scores").at("blue").number - 1.0) < 1e-5 &&
+          std::fabs(doc.at("scores").at("green").number) < 1e-5);
+    CHECK(doc.at("frames").array.size() == 2 && std::fabs(doc.at("frames").array[1].array[2].number - 1.0) < 1e-5 &&
+          std::fabs(doc.at("frames").array[1].array[0].number) < 1e-5);
+    CHECK_THROWS(runWorkflow(R"({"steps": [{"op": "load", "path": "a.png", "out": "a"},
+        {"op": "classify", "model": "models/means.onnx", "in": "a", "path": "scores.txt"}]})", dir), std::invalid_argument);
+    // Sandboxed, the scores file is a write: inside the write folder only.
+    WorkflowLimits limits;
+    limits.readRoots = {dir};
+    limits.writeRoot = dir + "/out";
+    const std::string wf = R"({"steps": [{"op": "load", "path": "a.png", "out": "a"}, {"op": "classify", "model": "models/means.onnx", "in": "a", "path": "%s"}]})";
+    auto with = [&](const char* path) {
+        std::string t = wf;
+        t.replace(t.find("%s"), 2, path);
+        return checkWorkflowLimits(t, dir, limits);
+    };
+    CHECK(with("out/s.json").empty());
+    CHECK(!with("s.json").empty());
+    CHECK(checkWorkflow(R"({"steps": [{"op": "classify", "model": "m.onnx", "in": "x"}]})").size() >= 1);  // path is required
+    fs::remove_all(dir);
+}
+
 // Running other people's workflows: files only inside the allowed folders, bounded sizes and time,
 // files renamed for a service, and the readers' guards against hostile files.
 TEST(model_cache_keeps_recent_models_when_asked) {

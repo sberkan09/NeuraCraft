@@ -656,7 +656,7 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
         const std::string& stepOp = v.at("op").string;
         const std::string key = results ? stepKey(v, base, clipKeys) : std::string();
         const std::string outField = v.find("out") && v.at("out").isString() ? v.at("out").string : std::string();
-        const bool makesMesh = stepOp == "depth_mesh" || stepOp == "image_to_3d" || (stepOp == "load" && v.find("path") && v.at("path").isString() && isMeshFile(v.at("path").string));
+        const bool makesMesh = stepOp == "depth_mesh" || stepOp == "image_to_3d" || stepOp == "rig" || (stepOp == "load" && v.find("path") && v.at("path").isString() && isMeshFile(v.at("path").string));
         if (results && makesMesh) {
             if (std::shared_ptr<const Mesh> hit = results->findMesh(key)) {
                 progress.stage("cached");
@@ -876,6 +876,12 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
             io.faces = s.size("faces", io.faces);
             progress.stage("3d service");
             made = std::make_shared<const Mesh>(imageTo3D(s.image("in"), io));
+        } else if (op == "rig") {
+            RigOptions ro;
+            ro.seed = static_cast<long>(s.num("seed", static_cast<double>(ro.seed)));
+            ro.postprocess = s.flag("postprocess", true);
+            progress.stage("rigging service");
+            made = std::make_shared<const Mesh>(rigMesh(s.mesh("in"), ro));
         } else if (op == "render") {
             const Mesh& m = s.mesh("in");
             MeshRenderOptions ro;

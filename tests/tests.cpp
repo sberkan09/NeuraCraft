@@ -4582,6 +4582,22 @@ TEST(image_to_3d_goes_through_the_3d_service) {
         told = std::string(e.what()).find("out of memory") != std::string::npos;
     }
     CHECK(told);
+    // Rigging: a model read from a glTF goes to the rigging service as it was read; one from another
+    // format goes as a glTF the engine writes. The answer is kept as it came.
+    CHECK_THROWS(runWorkflow(R"({"steps":[{"op":"load","path":"model.glb","out":"m"},{"op":"rig","in":"m"}]})", dir), std::runtime_error);
+    setRigService(service.url());
+    CHECK(rigAvailable());
+    const std::size_t before = service.paths.size();
+    runWorkflow(R"({"steps":[{"op":"load","path":"model.glb","out":"m"},{"op":"rig","in":"m","seed":5,"postprocess":false,"out":"r"},)"
+                R"({"op":"save","in":"r","path":"rigged.glb"},{"op":"load","path":"model.ply","out":"p"},{"op":"rig","in":"p"}]})",
+                dir);
+    CHECK(service.paths.size() == before + 2);
+    CHECK(service.paths[before] == "/v1/rig?seed=5&postprocess=0" && service.bodies[before] == answer.size());
+    CHECK(service.paths[before + 1] == "/v1/rig?seed=42&postprocess=1" && service.bodies[before + 1] > 100);
+    std::ifstream rf(dir + "/rigged.glb", std::ios::binary);
+    CHECK(std::vector<std::uint8_t>((std::istreambuf_iterator<char>(rf)), std::istreambuf_iterator<char>()) == answer);
+    setRigService("");
+    CHECK(!rigAvailable());
     setImageTo3DService("");
     CHECK(!imageTo3DAvailable());
     CHECK_THROWS(runWorkflow(R"({"steps":[{"op":"load","path":"in.png","out":"pic"},{"op":"image_to_3d","in":"pic"}]})", dir), std::runtime_error);

@@ -9,6 +9,10 @@
 // Protocol: POST <url>/v1/image-to-3d?quality=fast|standard|high&seed=N&texture=N&faces=N with a PNG
 // body (RGBA: the alpha is the object's mask; RGB: the service removes the background) answers 200
 // with a glTF binary, or an error status with {"error": "..."}. GET <url>/health answers 200.
+//
+// Rigging works the same way with its own service (services/rigging: SkinTokens / TokenRig on a GPU),
+// at NEURACRAFT_RIG_URL or setRigService: POST <url>/v1/rig?seed=N&postprocess=0|1 with a glTF binary
+// body answers the same model with a skeleton and skin weights, as a glTF binary.
 
 #include "Image.h"
 #include "Mesh.h"
@@ -34,6 +38,19 @@ bool imageTo3DAvailable();
 // The model, its glTF kept as the service sent it (Mesh::glb; saved as is to .glb). Throws
 // std::runtime_error without a service, or with the service's message when it fails.
 Mesh imageTo3D(const Image& picture, const ImageTo3DOptions& options = {});
+
+struct RigOptions {
+    long seed = 42;            // the skeleton is sampled: another seed, another skeleton
+    bool postprocess = true;   // smooth the skin weights over the model's volume
+    double timeoutSeconds = 600;
+};
+std::string rigService();  // setRigService's, else NEURACRAFT_RIG_URL, else ""
+void setRigService(const std::string& url);
+bool rigAvailable();
+// The model with a skeleton and skin weights (Mesh::glb holds the rigged glTF; the mesh itself is
+// the model in its rest pose). A mesh read from a glTF goes to the service as it was read, so its
+// materials survive. Throws like imageTo3D.
+Mesh rigMesh(const Mesh& mesh, const RigOptions& options = {});
 
 } // namespace nc
 

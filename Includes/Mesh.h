@@ -20,6 +20,9 @@ struct Mesh {
     std::vector<std::uint8_t> colors;     // r, g, b per vertex, or empty
     std::vector<std::uint32_t> indices;   // three per triangle
     Image texture;                        // base colour (RGB or RGBA) sampled through uvs; empty = none
+    // The glTF binary this mesh was read from, when it came from one: saveMesh(.glb) writes it as it is,
+    // so materials this struct does not hold (metallic / roughness / normal maps) survive.
+    std::vector<std::uint8_t> glb;
 
     std::size_t vertexCount() const { return positions.size() / 3; }
     std::size_t triangleCount() const { return indices.size() / 3; }

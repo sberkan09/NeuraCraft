@@ -44,7 +44,8 @@ using Clip = std::vector<Image>;
 //   - upscale {model, in} - interpolate {model, in, passes, loop} - concat {in: [clips]}
 //   - blend {in: [a, b], mode: mix | add | multiply | difference, weight (0.5), mask (clip)}: b over a frame by
 //   frame (b resized to a; a one-frame clip is used for every frame), e.g. a skip connection from an earlier step.
-//   - depth_mesh {model, in, grid, depth, edges, size}: a 3D relief mesh of a picture (Mesh.h) - render {in (mesh),
+//   - depth_mesh {model, in, grid, depth, edges, size}: a 3D relief mesh of a picture (Mesh.h) - image_to_3d {in,
+//   quality, seed, texture, faces}: a whole model from a picture, by the 3D service (ImageTo3D.h) - render {in (mesh),
 //   width, height, frames, turn, yaw, pitch, fov, background, lighting}: a still or a turntable clip of a mesh. load
 //   reads a mesh from .glb / .obj / .ply, save writes one to those; meshes and clips share one namespace.
 // Any step can read any clip made before it, so a workflow is a graph run in the listed order.

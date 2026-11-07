@@ -3,6 +3,7 @@
 #include "Onnx.h"
 #include "Depth.h"
 #include "Mesh.h"
+#include "ImageTo3D.h"
 #include "Diffusion.h"
 #include "Interpolate.h"
 #include "Json.h"
@@ -654,7 +655,7 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
         const std::string& stepOp = v.at("op").string;
         const std::string key = results ? stepKey(v, base, clipKeys) : std::string();
         const std::string outField = v.find("out") && v.at("out").isString() ? v.at("out").string : std::string();
-        const bool makesMesh = stepOp == "depth_mesh" || (stepOp == "load" && v.find("path") && v.at("path").isString() && isMeshFile(v.at("path").string));
+        const bool makesMesh = stepOp == "depth_mesh" || stepOp == "image_to_3d" || (stepOp == "load" && v.find("path") && v.at("path").isString() && isMeshFile(v.at("path").string));
         if (results && makesMesh) {
             if (std::shared_ptr<const Mesh> hit = results->findMesh(key)) {
                 progress.stage("cached");
@@ -848,6 +849,14 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
             mo.edges = static_cast<float>(s.num("edges", mo.edges));
             const std::vector<float> depth = depthHold->estimate(picture, s.size("size", 518));
             made = std::make_shared<const Mesh>(meshFromDepth(picture, depth, mo));
+        } else if (op == "image_to_3d") {
+            ImageTo3DOptions io;
+            io.quality = s.str("quality", io.quality);
+            io.seed = static_cast<long>(s.num("seed", static_cast<double>(io.seed)));
+            io.texture = s.size("texture", io.texture);
+            io.faces = s.size("faces", io.faces);
+            progress.stage("3d service");
+            made = std::make_shared<const Mesh>(imageTo3D(s.image("in"), io));
         } else if (op == "render") {
             const Mesh& m = s.mesh("in");
             MeshRenderOptions ro;

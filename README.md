@@ -809,6 +809,30 @@ On the 2-core machine the depth map and the 130,000-triangle mesh take 6.4 s, a 
 fraction of a second. The readers check every count, offset and index against the file (and are
 fuzzed: `fuzz/fuzz_mesh.cpp`), so meshes from users are safe to open.
 
+**Whole models from one picture.** `image_to_3d` sends a picture to a 3D service and gets back a
+complete, textured model (PBR materials, every side): `services/trellis2` runs Microsoft's TRELLIS.2
+(MIT) on an NVIDIA GPU, and the engine finds it through `NEURACRAFT_3D_URL` only (a workflow cannot
+point the engine at other hosts). A transparent background is taken as the object's outline;
+pictures without one go through background removal first. The model is saved as it came (`.glb`
+keeps the service's materials) and renders, turns and converts like any other mesh.
+
+```json
+{"steps": [
+  {"op": "load", "path": "witch.png", "out": "pic"},
+  {"op": "image_to_3d", "in": "pic", "quality": "standard", "faces": 300000, "out": "model"},
+  {"op": "render", "in": "model", "frames": 24, "out": "turn"},
+  {"op": "save", "in": "model", "path": "witch.glb"},
+  {"op": "save", "in": "turn", "path": "witch_turn.gif", "fps": 12}]}
+```
+
+<p><img src="docs/images/image_to_3d.jpg" width="640"></p>
+
+TRELLIS.2's example pictures (left) and the models, drawn by the engine's renderer: the crown at
+`fast`, `standard` and `high`, then turntables. On an A40: 54 s (`fast`, 3 GiB of GPU memory), 130-180
+s (`standard`, 6-8 GiB) and 260 s (`high`, 14 GiB) per model, about 300,000 triangles and a 2048²
+texture each. Transparent or glowing parts (the bottles) come out opaque: the renderer draws base
+colour only.
+
 ### Image prompts: IP-Adapter
 
 ```

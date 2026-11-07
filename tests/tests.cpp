@@ -5929,6 +5929,23 @@ TEST(gpu_graphs_match_layer_by_layer_passes) {
     setDevice(Device::CPU);
     CHECK(both.size() == 2 && close(both[0], epsCpu) && close(both[1], negCpu));
     CHECK(close(framesGpu, framesCpu));
+
+    // A ControlNet's residuals: one device pass against the CPU's layers.
+    writeTinyControlNet(dir + "/cn", false);
+    UNet2DCondition cn = loadUNet(dir + "/cn", 4, 6);
+    const Matrix hint = Matrix::uniform(1, 3 * 32 * 48, 0.0f, 1.0f);
+    const Matrix emb = cn.controlEmbedding(hint);
+    const ControlResiduals rCpu = cn.control(z, 500.0f, ctx, emb, 0.8f);
+    setDevice(Device::GPU);
+    ControlResiduals rGpu;
+    {
+        GpuWeightScope scope;
+        rGpu = cn.control(z, 500.0f, ctx, emb, 0.8f);
+    }
+    setDevice(Device::CPU);
+    CHECK(rGpu.down.size() == rCpu.down.size());
+    for (std::size_t k = 0; k < rCpu.down.size() && k < rGpu.down.size(); ++k) CHECK(close(rGpu.down[k], rCpu.down[k]));
+    CHECK(close(rGpu.mid, rCpu.mid));
 }
 
 TEST(gpu_resident_weights_follow_their_memory) {

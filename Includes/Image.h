@@ -204,6 +204,10 @@ Image fitImage(const Image& image, std::size_t width, std::size_t height);
 // non-maximum suppression, hysteresis between the two thresholds. Returns a
 // 3-channel image, edges white on black.
 Image cannyEdges(const Image& image, float low = 100.0f, float high = 200.0f);
+// A drawing as a scribble ControlNet input (white strokes on black, 3 channels, 0 / 255): pixels
+// darker than `threshold` (or lighter, with darkStrokes false) are strokes, thickened by `thickness`
+// pixels on every side (the scribble model saw thick hand-drawn lines; tablet strokes are thin).
+Image scribbleImage(const Image& drawing, bool darkStrokes = true, int threshold = 128, int thickness = 2);
 // Affine resampling about the image centre: scale > 1 zooms in, (dx, dy)
 // shifts the content by that many pixels, angle rotates it (degrees,
 // counter-clockwise). Bilinear, edges clamped. Same size as the input.

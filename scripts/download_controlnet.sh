@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Downloads a ControlNet 1.1 model for Stable Diffusion 1.5 in diffusers layout
 # (lllyasviel/control_v11p_sd15_<kind>, OpenRAIL; fp16, ~720 MB). Default: canny.
-#   scripts/download_controlnet.sh [dir] [kind]     e.g. kind = canny, lineart, softedge, depth (f1p for depth)
+#   scripts/download_controlnet.sh [dir] [kind]     e.g. kind = canny, scribble, lineart, softedge, depth (f1p for depth)
 set -euo pipefail
 KIND="${2:-canny}"
 DIR="${1:-data/controlnet-$KIND}"

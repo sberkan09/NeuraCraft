@@ -4034,6 +4034,78 @@ void writeTinyControlNet(const std::string& dir, bool zeroOutputs) {
     saveAll(dir + "/diffusion_pytorch_model.safetensors", w);
 }
 
+TEST(scribble_drawings_for_the_scribble_controlnet) {
+    // A black line on white paper, 1 pixel wide -> a white line on black, 2 * thickness + 1 wide.
+    Image d;
+    d.width = 20;
+    d.height = 10;
+    d.pixels.assign(20 * 10 * 3, 250);
+    for (std::size_t y = 0; y < 10; ++y)
+        for (int c = 0; c < 3; ++c) d.pixels[(y * 20 + 10) * 3 + c] = 20;
+    const Image s = scribbleImage(d);
+    CHECK(s.width == 20 && s.height == 10 && s.channels == 3);
+    for (std::size_t x = 0; x < 20; ++x) CHECK(s.pixels[(5 * 20 + x) * 3] == (x >= 8 && x <= 12 ? 255 : 0));
+    const Image thin = scribbleImage(d, true, 128, 0);
+    CHECK(thin.pixels[(5 * 20 + 10) * 3] == 255 && thin.pixels[(5 * 20 + 9) * 3] == 0);
+    const Image light = scribbleImage(d, false, 128, 0);  // light strokes: here the paper is the stroke
+    CHECK(light.pixels[(5 * 20 + 2) * 3] == 255 && light.pixels[(5 * 20 + 10) * 3] == 0);
+    CHECK_THROWS(scribbleImage(d, true, 128, 99), std::invalid_argument);
+    const std::string dir = tempPath("scribble");
+    std::filesystem::create_directories(dir);
+    savePng(dir + "/d.png", d);
+    const auto clips = runWorkflow(R"({"steps":[{"op":"load","path":"d.png","out":"d"},{"op":"scribble","in":"d","thickness":1,"out":"s"}]})", dir);
+    CHECK(clips.at("s")[0].pixels[(5 * 20 + 11) * 3] == 255 && clips.at("s")[0].pixels[(5 * 20 + 12) * 3] == 0);
+    std::filesystem::remove_all(dir);
+}
+
+// With NEURACRAFT_CONTROLNET_DIR set to a ControlNet 1.1 folder (canny, scribble, ...) and python3 with
+// NumPy, the residuals match scripts/controlnet_reference.py (diffusers' ControlNetModel in NumPy).
+TEST(controlnet_matches_the_reference_on_real_weights) {
+    const char* dirEnv = std::getenv("NEURACRAFT_CONTROLNET_DIR");
+    if (!dirEnv || !*dirEnv) return;  // skipped without real weights
+    const std::size_t H = 16, W = 16;
+    UNet2DCondition cn = loadUNet(dirEnv, W, H);
+    std::mt19937 gen(7);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    Matrix lat(1, 4 * H * W), ctx(77, cn.contextDim()), cond(1, 3 * 128 * 128, 0.0f);
+    for (std::size_t i = 0; i < lat.cols(); ++i) lat.data()[i] = normal(gen);
+    for (std::size_t i = 0; i < ctx.rows() * ctx.cols(); ++i) ctx.data()[i] = 0.5f * normal(gen);
+    for (int y = 0; y < 128; ++y)
+        for (int x = 0; x < 128; ++x) {  // scribble-like strokes: a wavy line, a bar and a ring
+            const int r2 = (x - 30) * (x - 30) + (y - 30) * (y - 30);
+            const bool on = std::abs(x - 64 - static_cast<int>(20 * std::sin(y / 12.0))) < 2 || std::abs(y - 90) < 2 || (r2 < 120 && r2 > 70);
+            for (int c = 0; c < 3; ++c) cond.data()[c * 128 * 128 + y * 128 + x] = on ? 1.0f : 0.0f;
+        }
+    const std::string dir = tempPath("controlnet_ref");
+    std::filesystem::create_directories(dir);
+    auto dump = [&](const std::string& name, const float* p, std::size_t n) {
+        std::ofstream(dir + "/" + name, std::ios::binary).write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n * 4));
+    };
+    dump("latent.f32", lat.data(), lat.cols());
+    dump("context.f32", ctx.data(), ctx.rows() * ctx.cols());
+    dump("cond.f32", cond.data(), cond.cols());
+    const ControlResiduals r = cn.control(lat, 500.0f, ctx, cn.controlEmbedding(cond));
+    std::vector<float> mine;
+    for (const Matrix& m : r.down) mine.insert(mine.end(), m.data(), m.data() + m.rows() * m.cols());
+    mine.insert(mine.end(), r.mid.data(), r.mid.data() + r.mid.rows() * r.mid.cols());
+    const std::string script = std::string(NEURACRAFT_SOURCE_DIR) + "/scripts/controlnet_reference.py";
+    const std::string cmd = "python3 '" + script + "' '" + dirEnv + "' '" + dir + "/latent.f32' '" + dir + "/context.f32' '" + dir + "/cond.f32' 500 16 16 '" +
+                            dir + "/ref.f32'";
+    CHECK(std::system(cmd.c_str()) == 0);
+    std::ifstream f(dir + "/ref.f32", std::ios::binary);
+    std::vector<float> ref(mine.size());
+    f.read(reinterpret_cast<char*>(ref.data()), static_cast<std::streamsize>(ref.size() * 4));
+    CHECK(static_cast<std::size_t>(f.gcount()) == ref.size() * 4);
+    float diff = 0, big = 0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        diff = std::max(diff, std::fabs(mine[i] - ref[i]));
+        big = std::max(big, std::fabs(ref[i]));
+    }
+    std::cerr << "    controlnet " << dirEnv << ": max difference " << diff << " (largest value " << big << ")\n";
+    CHECK(diff <= 1e-5f * std::max(1.0f, big));  // the canny bar: a few 1e-6 relative
+    std::filesystem::remove_all(dir);
+}
+
 TEST(controlnet_and_canny_edges) {
     // Canny: a bright square on black has edges on its border only; a flat picture has none.
     Image sq;

@@ -817,6 +817,13 @@ std::map<std::string, Clip> runWorkflow(const std::string& text, const std::stri
                 oz.strength = static_cast<float>(s.num("strength", 0.9));
                 out = outpaintZoom(sd, prompts, oz, s.has("in") ? &s.image("in") : nullptr);
             }
+        } else if (op == "scribble") {
+            const Clip& in = s.clip("in");
+            for (const Image& im : in) {
+                progress.frame(static_cast<std::size_t>(&im - in.data()), in.size());
+                out.push_back(scribbleImage(im, s.flag("dark_strokes", true), static_cast<int>(s.num("threshold", 128)),
+                                            static_cast<int>(s.num("thickness", 2))));
+            }
         } else if (op == "canny") {
             const Clip& in = s.clip("in");
             for (const Image& im : in) {

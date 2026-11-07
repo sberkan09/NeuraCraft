@@ -34,6 +34,7 @@ try:  # TRELLIS.2's sparse attention needs FlashAttention or xFormers (install.s
 except ImportError:
     os.environ.setdefault("ATTN_BACKEND", "xformers")
 
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
@@ -92,6 +93,14 @@ def generate(png: bytes, quality: str, seed: int, texture: int, faces: int) -> b
         )
         del mesh
         torch.cuda.empty_cache()
+    # Vertices of degenerate triangles get zero normals, which glTF forbids (the validator's errors):
+    # give them a unit normal.
+    normals = np.asarray(model.vertex_normals, dtype=np.float64).copy()
+    length = np.linalg.norm(normals, axis=1)
+    bad = ~(length > 1e-6)
+    normals[bad] = (0.0, 1.0, 0.0)
+    normals[~bad] /= length[~bad, None]
+    model.vertex_normals = normals
     data = model.export(file_type="glb")  # PNG textures (the engine reads PNG, not WebP)
     print(f"[3d] {quality} seed {seed}: {len(model.faces)} faces, {len(data) / 1e6:.1f} MB in {time.time() - start:.1f} s, "
           f"peak VRAM {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)

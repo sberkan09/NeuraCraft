@@ -60,26 +60,38 @@ def load():
         print(f"[rig] could not load TokenRig: {load_error}", flush=True)
 
 
+ATTEMPTS = 3  # the rig is sampled; now and then a sample ends without skin weights, and the next seed works
+
+
 def rig(glb: bytes, seed: int, postprocess: bool) -> bytes:
     import numpy as np
     import torch
 
     start = time.time()
     with gpu, tempfile.TemporaryDirectory(prefix="rig_") as tmp:
-        src, dst = Path(tmp) / "in.glb", Path(tmp) / "out.glb"
+        src = Path(tmp) / "in.glb"
         src.write_bytes(glb)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
         torch.cuda.reset_peak_memory_stats()
-        demo.run_rig([src], top_k=5, top_p=0.95, temperature=1.0, repetition_penalty=2.0, num_beams=10,
-                     use_skeleton=False, use_transfer=True, use_postprocess=postprocess, output_paths=[dst],
-                     model_ckpt=ckpt, hf_path=None)
-        if not dst.is_file():
-            raise RuntimeError("the rigged model was not written (see the service log)")
+        for attempt in range(ATTEMPTS):
+            s = (seed + attempt * 1_000_003) % 2**31
+            dst = Path(tmp) / f"out{attempt}.glb"
+            random.seed(s)
+            np.random.seed(s)
+            torch.manual_seed(s)
+            try:
+                demo.run_rig([src], top_k=5, top_p=0.95, temperature=1.0, repetition_penalty=2.0, num_beams=10,
+                             use_skeleton=False, use_transfer=True, use_postprocess=postprocess, output_paths=[dst],
+                             model_ckpt=ckpt, hf_path=None)
+            except AssertionError:  # TokenRig's check that the sample has skin weights
+                print(f"[rig] seed {s}: no complete rig, trying another seed", flush=True)
+                continue
+            if dst.is_file():
+                break
+        else:
+            raise RuntimeError(f"no complete rig in {ATTEMPTS} samples (try another seed)")
         data = dst.read_bytes()
-    print(f"[rig] seed {seed}: {len(glb) / 1e6:.1f} MB -> {len(data) / 1e6:.1f} MB in {time.time() - start:.1f} s, "
-          f"peak VRAM {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+    print(f"[rig] seed {seed} (sample {attempt + 1}): {len(glb) / 1e6:.1f} MB -> {len(data) / 1e6:.1f} MB in "
+          f"{time.time() - start:.1f} s, peak VRAM {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
     return data
 
 

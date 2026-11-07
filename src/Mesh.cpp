@@ -80,7 +80,7 @@ std::vector<std::uint8_t> vertexColours(const Mesh& m) {
 } // namespace
 
 std::size_t Mesh::bytes() const {
-    return positions.size() * 4 + normals.size() * 4 + uvs.size() * 4 + colors.size() + indices.size() * 4 + texture.pixels.size();
+    return positions.size() * 4 + normals.size() * 4 + uvs.size() * 4 + colors.size() + indices.size() * 4 + texture.pixels.size() + glb.size();
 }
 
 void setMaxMeshElements(std::size_t elements) { gMaxElements = elements ? elements : std::size_t(1) << 24; }
@@ -723,7 +723,11 @@ Mesh decodePly(const std::vector<std::uint8_t>& d, const std::string& name) {
 Mesh loadMesh(const std::string& path) {
     const std::string e = extension(path);
     const std::vector<std::uint8_t> data = readBytes(path);
-    if (e == ".glb") return decodeGlb(data, path);
+    if (e == ".glb") {
+        Mesh m = decodeGlb(data, path);
+        m.glb = data;
+        return m;
+    }
     if (e == ".obj") return parseObj(std::string(data.begin(), data.end()), path);
     if (e == ".ply") return decodePly(data, path);
     throw std::runtime_error("loadMesh: unknown mesh file type " + path);
@@ -734,6 +738,7 @@ void saveMesh(const std::string& path, const Mesh& m) {
     if (m.empty()) throw std::invalid_argument("saveMesh: the mesh has no triangles");
     const std::string e = extension(path);
     if (e == ".glb") {
+        if (!m.glb.empty()) return writeBytes(path, m.glb.data(), m.glb.size());
         const std::vector<std::uint8_t> b = encodeGlb(m);
         writeBytes(path, b.data(), b.size());
     } else if (e == ".ply") {

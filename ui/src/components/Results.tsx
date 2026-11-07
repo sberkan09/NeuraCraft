@@ -5,7 +5,7 @@ import type { Engine, LiveJob } from "../engine";
 const opNames: Record<string, string> = {
   txt2img: "resim", img2img: "yeniden çizim", inpaint: "inpaint", t2v: "video", morph: "morph", zoom: "zoom", outpaint: "outpaint",
   canny: "kenarlar", depth: "derinlik", parallax: "3D", upscale: "büyütme", interpolate: "akıcılaştırma", load: "yükleme",
-  resize: "boyut", crop: "kırpma", concat: "birleştirme", blend: "harmanlama", save: "kaydet", depth_mesh: "3D model", render: "3D görüntü",
+  resize: "boyut", crop: "kırpma", concat: "birleştirme", blend: "harmanlama", save: "kaydet", depth_mesh: "3D model", image_to_3d: "3D model", render: "3D görüntü",
 };
 const stateNames: Record<string, string> = { queued: "sırada", running: "çalışıyor", done: "bitti", failed: "hata", cancelled: "iptal" };
 

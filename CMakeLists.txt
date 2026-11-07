@@ -44,6 +44,8 @@ add_library(neuracraft_lib STATIC
     src/Loss.cpp
     src/Matrix.cpp
     src/Mesh.cpp
+    src/HttpClient.cpp
+    src/ImageTo3D.cpp
     src/ModelCache.cpp
     src/Network.cpp
     src/Optimizer.cpp

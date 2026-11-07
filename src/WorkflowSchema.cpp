@@ -172,6 +172,13 @@ std::vector<WorkflowOp> buildOps() {
          number("edges", "float", "0.08", "Largest depth step inside a triangle (0..1; 0 keeps all, joining foreground and background)", 0, 1),
          number("size", "int", "518", "Depth network input size", 14, 2044)});
     ops.back().makes = "mesh";
+    add("image_to_3d", "Image to 3D", "3d",
+        "A whole 3D model from one picture, made by a 3D service (TRELLIS.2 on a GPU); a transparent background is the object's outline", true,
+        {field("in", "clip", "", "Picture (with a transparent background: its alpha is the object)", true),
+         choice("quality", {"fast", "standard", "high"}, "\"standard\"", "fast: 512^3 voxels, standard: 1024^3, high: 1536^3"),
+         number("seed", "int", "42", "Seed", 0, 2147483647), number("texture", "int", "2048", "Texture size", 512, 4096),
+         number("faces", "int", "500000", "Triangle budget", 10000, 2000000)});
+    ops.back().makes = "mesh";
     add("render", "Render 3D", "3d", "Pictures of a 3D model: a still, or a turntable clip", true,
         {field("in", "mesh", "", "3D model", true), number("width", "int", "512", "Width", 16, 4096), number("height", "int", "512", "Height", 16, 4096),
          number("frames", "int", "1", "Frames (more than 1: a turntable)", 1, 720), number("turn", "float", "360", "Degrees turned over the frames", -1080, 1080),

@@ -4399,6 +4399,135 @@ TEST(depth_anything_and_parallax) {
     std::filesystem::remove_all(dir);
 }
 
+namespace {
+// A stand-in 3D service on a local port: answers /health, and /v1/image-to-3d with `glb` (or a 500
+// with a message when the seed is 13), recording what it was asked.
+struct FakeService {
+    int fd = -1;
+    int port = 0;
+    std::thread thread;
+    std::vector<std::uint8_t> glb;
+    std::vector<std::string> paths;
+    std::vector<std::size_t> bodies;
+    std::atomic<bool> stop{false};
+    explicit FakeService(std::vector<std::uint8_t> answer) : glb(std::move(answer)) {
+        fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = 0;
+        ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+        socklen_t len = sizeof(a);
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+        port = ntohs(a.sin_port);
+        ::listen(fd, 8);
+        thread = std::thread([this] {
+            while (!stop) {
+                const int c = ::accept(fd, nullptr, nullptr);
+                if (c < 0) break;
+                std::string req;
+                char buf[65536];
+                std::size_t need = std::string::npos;
+                for (;;) {
+                    const ssize_t k = ::recv(c, buf, sizeof(buf), 0);
+                    if (k <= 0) break;
+                    req.append(buf, static_cast<std::size_t>(k));
+                    const std::size_t end = req.find("\r\n\r\n");
+                    if (end != std::string::npos && need == std::string::npos) {
+                        const std::size_t cl = req.find("Content-Length: ");
+                        need = end + 4 + (cl != std::string::npos && cl < end ? std::stoul(req.substr(cl + 16)) : 0);
+                    }
+                    if (need != std::string::npos && req.size() >= need) break;
+                }
+                const std::string path = req.substr(req.find(' ') + 1, req.find(" HTTP/") - req.find(' ') - 1);
+                paths.push_back(path);
+                bodies.push_back(need == std::string::npos ? 0 : req.size() - req.find("\r\n\r\n") - 4);
+                std::string head;
+                std::string body;
+                if (path == "/health") {
+                    head = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n";
+                    body = "{\"ok\":true}";
+                } else if (path.find("seed=13") != std::string::npos) {
+                    head = "HTTP/1.0 500 Internal Server Error\r\nContent-Type: application/json\r\n";
+                    body = "{\"error\":\"out of memory\"}";
+                } else {
+                    head = "HTTP/1.1 200 OK\r\nContent-Type: model/gltf-binary\r\nTransfer-Encoding: chunked\r\n";
+                    // chunked, in two pieces, as servers stream large answers
+                    const std::string g(glb.begin(), glb.end());
+                    const std::size_t half = g.size() / 2;
+                    auto hex = [](std::size_t n) { std::ostringstream o; o << std::hex << n; return o.str(); };
+                    body = hex(half) + "\r\n" + g.substr(0, half) + "\r\n" + hex(g.size() - half) + "\r\n" + g.substr(half) + "\r\n0\r\n\r\n";
+                    head += "\r\n";
+                    const std::string all = head + body;
+                    ::send(c, all.data(), all.size(), MSG_NOSIGNAL);
+                    ::close(c);
+                    continue;
+                }
+                const std::string all = head + "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+                ::send(c, all.data(), all.size(), MSG_NOSIGNAL);
+                ::close(c);
+            }
+        });
+    }
+    ~FakeService() {
+        stop = true;
+        ::shutdown(fd, SHUT_RDWR);
+        ::close(fd);
+        thread.join();
+    }
+    std::string url() const { return "http://127.0.0.1:" + std::to_string(port); }
+};
+} // namespace
+
+TEST(image_to_3d_goes_through_the_3d_service) {
+    Mesh q;
+    q.positions = {-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0};
+    q.uvs = {0, 1, 1, 1, 1, 0, 0, 0};
+    q.indices = {0, 1, 2, 0, 2, 3};
+    q.texture.width = q.texture.height = 2;
+    q.texture.pixels = {255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0};
+    const std::vector<std::uint8_t> answer = encodeGlb(q);
+    FakeService service(answer);
+    setImageTo3DService(service.url());
+    CHECK(imageTo3DAvailable());
+
+    const std::string dir = tempPath("image_to_3d");
+    std::filesystem::create_directories(dir);
+    Image pic;
+    pic.width = pic.height = 8;
+    pic.channels = 4;
+    pic.pixels.assign(8 * 8 * 4, 200);
+    savePng(dir + "/in.png", pic);
+    const std::string wf = R"({"steps":[{"op":"load","path":"in.png","out":"pic"},)"
+                           R"({"op":"image_to_3d","in":"pic","quality":"fast","seed":7,"faces":20000,"out":"model"},)"
+                           R"({"op":"render","in":"model","width":32,"height":32,"out":"view"},)"
+                           R"({"op":"save","in":"model","path":"model.glb"},{"op":"save","in":"model","path":"model.ply"}]})";
+    const auto clips = runWorkflow(wf, dir);
+    CHECK(clips.count("view") && clips.at("view")[0].width == 32);
+    // The service's glTF is kept byte for byte; other formats are written from the mesh.
+    std::ifstream f(dir + "/model.glb", std::ios::binary);
+    const std::vector<std::uint8_t> saved((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    CHECK(saved == answer);
+    CHECK(loadMesh(dir + "/model.ply").triangleCount() == 2);
+    const std::string asked = service.paths.size() >= 2 ? service.paths[1] : "";
+    CHECK(asked.find("/v1/image-to-3d?quality=fast&seed=7&texture=2048&faces=20000") == 0);
+    CHECK(service.bodies.size() >= 2 && service.bodies[1] > 50);  // the PNG went with it
+    // The service's own message comes back; without a service the step says what is missing.
+    bool told = false;
+    try {
+        runWorkflow(R"({"steps":[{"op":"load","path":"in.png","out":"pic"},{"op":"image_to_3d","in":"pic","seed":13}]})", dir);
+    } catch (const std::runtime_error& e) {
+        told = std::string(e.what()).find("out of memory") != std::string::npos;
+    }
+    CHECK(told);
+    setImageTo3DService("");
+    CHECK(!imageTo3DAvailable());
+    CHECK_THROWS(runWorkflow(R"({"steps":[{"op":"load","path":"in.png","out":"pic"},{"op":"image_to_3d","in":"pic"}]})", dir), std::runtime_error);
+    setImageTo3DService("http://127.0.0.1:1");  // nothing listens there
+    CHECK_THROWS(imageTo3D(pic), std::runtime_error);
+    std::filesystem::remove_all(dir);
+}
+
 TEST(meshes_round_trip_render_and_come_from_depth) {
     // A textured quad leaning back, and a coloured triangle.
     Mesh q;

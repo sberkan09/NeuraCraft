@@ -34,6 +34,7 @@
 #include "VectorMath.h"
 #include "Mesh.h"
 #include "ImageTo3D.h"
+#include "Stereo.h"
 #include "Workflow.h"
 
 #define NEURACRAFT_VERSION "1.11.0"

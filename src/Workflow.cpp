@@ -28,6 +28,22 @@
 namespace nc {
 
 namespace {
+
+// "file:0.8" -> file and its scale. The suffix must be a whole number ("0.8", "1", ".5"): a path or a
+// service's name ("asset:045a45db-...") keeps its colons.
+bool splitLoraScale(std::string& name, std::string* suffix = nullptr, float* scale = nullptr) {
+    const std::size_t colon = name.rfind(':');
+    if (colon == std::string::npos || colon + 1 >= name.size()) return false;
+    const std::string tail = name.substr(colon + 1);
+    if (tail.find_first_not_of("0123456789.") != std::string::npos || tail.find_first_of("0123456789") == std::string::npos ||
+        std::count(tail.begin(), tail.end(), '.') > 1)
+        return false;
+    if (scale) *scale = std::stof(tail);
+    if (suffix) *suffix = name.substr(colon);
+    name = name.substr(0, colon);
+    return true;
+}
+
 // Progress of the running step, with cancellation checks.
 struct StepProgress {
     const WorkflowEvents* events = nullptr;
@@ -168,11 +184,7 @@ struct Step {
         std::vector<Lora> out;
         for (std::string s : strings("lora")) {
             float scale = 1.0f;
-            const std::size_t colon = s.rfind(':');
-            if (colon != std::string::npos && colon + 1 < s.size() && (std::isdigit(static_cast<unsigned char>(s[colon + 1])) || s[colon + 1] == '.')) {
-                scale = std::stof(s.substr(colon + 1));
-                s = s.substr(0, colon);
-            }
+            splitLoraScale(s, nullptr, &scale);
             const std::filesystem::path p(s);
             out.push_back({p.is_absolute() ? s : (std::filesystem::path(base) / p).string(), scale});
             allowRead(limits, out.back().file);
@@ -455,10 +467,7 @@ std::string stepKey(const json::Value& v, const std::string& base, const std::ma
             }
         } else if (f->type == "file" || f->type == "dir" || f->type == "model" || f->type == "loras") {
             for (std::string n : names()) {
-                if (f->type == "loras") {
-                    const std::size_t colon = n.rfind(':');
-                    if (colon != std::string::npos && colon > 1) n = n.substr(0, colon);
-                }
+                if (f->type == "loras") splitLoraScale(n);
                 const std::filesystem::path p(n);
                 sig += "  @" + fileStamp(p.is_absolute() ? n : (std::filesystem::path(base) / p).string()) + "\n";
             }
@@ -491,11 +500,7 @@ void stepFiles(const json::Value& v, const std::function<void(const WorkflowFiel
         if (!x) continue;
         auto one = [&](const std::string& value) {
             std::string name = value;
-            if (field.type == "loras") {
-                const std::size_t colon = name.rfind(':');
-                if (colon != std::string::npos && colon + 1 < name.size() && (std::isdigit(static_cast<unsigned char>(name[colon + 1])) || name[colon + 1] == '.'))
-                    name = name.substr(0, colon);
-            }
+            if (field.type == "loras") splitLoraScale(name);
             if (!name.empty()) f(field, name);
         };
         if (x->isString()) one(x->string);
@@ -592,13 +597,7 @@ std::string mapWorkflowFiles(const std::string& text, const std::function<std::s
             auto one = [&](json::Value& e) {
                 if (!e.isString() || e.string.empty()) return;
                 std::string name = e.string, suffix;
-                if (field->type == "loras") {
-                    const std::size_t colon = name.rfind(':');
-                    if (colon != std::string::npos && colon + 1 < name.size() && (std::isdigit(static_cast<unsigned char>(name[colon + 1])) || name[colon + 1] == '.')) {
-                        suffix = name.substr(colon);
-                        name = name.substr(0, colon);
-                    }
-                }
+                if (field->type == "loras") splitLoraScale(name, &suffix);
                 e.string = map(*field, name) + suffix;
             };
             if (x.isString()) one(x);

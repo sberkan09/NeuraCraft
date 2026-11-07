@@ -4155,6 +4155,45 @@ TEST(scribble_drawings_for_the_scribble_controlnet) {
     std::filesystem::remove_all(dir);
 }
 
+// With NEURACRAFT_TINY_MODELS_OUT set: writes the tiny models these tests use, in diffusers layout,
+// for other projects' end-to-end tests (neuracraft-cloud runs its sketch_to_scene preset on them):
+// sd (tokenizer, text encoder, UNet, VAE, scheduler), controlnet (fits sd's UNet), lcm-lora.safetensors
+// (matches sd's UNet) and taesd. Seeded: the same files every time.
+TEST(tiny_model_fixtures_on_request) {
+    const char* out = std::getenv("NEURACRAFT_TINY_MODELS_OUT");
+    if (!out || !*out) return;
+    namespace fs = std::filesystem;
+    std::string tok;
+    const std::string sd = writeTinyStableDiffusion("tiny_fixture_sd", tok);
+    fs::create_directories(out);
+    fs::remove_all(fs::path(out) / "sd");
+    fs::copy(sd, fs::path(out) / "sd", fs::copy_options::recursive);
+    setSeed(7);
+    writeTinyControlNet((fs::path(out) / "controlnet").string(), false);
+    writeTinyTaesd((fs::path(out) / "taesd").string(), false);
+    std::map<std::string, Matrix> w;
+    w["lora_unet_down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_q.lora_down.weight"] = Matrix::uniform(2, 8, -0.1f, 0.1f);
+    w["lora_unet_down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_q.lora_up.weight"] = Matrix::uniform(8, 2, -0.1f, 0.1f);
+    w["lora_unet_down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_q.alpha"] = Matrix(1, 1, std::vector<float>{1.0f});
+    saveAll((fs::path(out) / "lcm-lora.safetensors").string(), w);
+    // The whole preset workflow runs on them (scribble ControlNet, LoRA, LCM, TAESD).
+    Image sketch;
+    sketch.width = sketch.height = 64;
+    sketch.pixels.assign(64 * 64 * 3, 240);
+    for (std::size_t y = 10; y < 54; ++y)
+        for (int c = 0; c < 3; ++c) sketch.pixels[(y * 64 + 32) * 3 + c] = 10;
+    savePng(std::string(out) + "/sketch.png", sketch);
+    const std::string wf = std::string(R"({"steps": [{"op": "load", "path": "sketch.png", "out": "s"},
+        {"op": "resize", "in": "s", "width": 64, "height": 64, "out": "sized"}, {"op": "scribble", "in": "sized", "out": "lines"},
+        {"op": "txt2img", "model": "sd", "prompt": "a bridge", "seed": 1, "width": 64, "height": 64, "controlnet": "controlnet",
+         "control": "lines", "control_scale": 0.9, "tiny_vae": "taesd", "steps": 4, "sampler": "lcm", "guidance": 1.5,
+         "lora": ["lcm-lora.safetensors:1"], "out": "scene"}]})");
+    const auto clips = runWorkflow(wf, out);
+    CHECK(clips.at("scene").front().width == 64);
+    fs::remove(std::string(out) + "/sketch.png");
+    fs::remove_all(sd);
+}
+
 // With NEURACRAFT_CONTROLNET_DIR set to a ControlNet 1.1 folder (canny, scribble, ...) and python3 with
 // NumPy, the residuals match scripts/controlnet_reference.py (diffusers' ControlNetModel in NumPy).
 TEST(controlnet_matches_the_reference_on_real_weights) {

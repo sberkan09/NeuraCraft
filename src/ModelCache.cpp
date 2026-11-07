@@ -17,6 +17,8 @@ struct Entry {
     std::uint64_t used = 0;  // last use (gClock)
 };
 std::atomic<bool> gEnabled{false};
+std::atomic<std::int64_t> gLoadMicros{0};
+thread_local int tLoadDepth = 0;
 std::atomic<std::size_t> gKeep{0};
 std::uint64_t gClock = 0;  // under gMutex
 std::mutex gMutex;
@@ -31,6 +33,14 @@ void setModelCaching(bool enabled) {
     if (!enabled) clearModelCache();
 }
 bool modelCaching() { return gEnabled.load(); }
+
+double modelLoadSeconds() { return static_cast<double>(gLoadMicros.load()) / 1e6; }
+
+detail::LoadTimer::LoadTimer() : start_(std::chrono::steady_clock::now()), outer_(tLoadDepth++ == 0) {}
+detail::LoadTimer::~LoadTimer() {
+    --tLoadDepth;
+    if (outer_) gLoadMicros += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start_).count();
+}
 
 void clearModelCache() {
     std::map<std::string, Entry> dropped;  // freed outside the lock

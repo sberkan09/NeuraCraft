@@ -179,6 +179,13 @@ std::vector<WorkflowOp> buildOps() {
          number("seed", "int", "42", "Seed", 0, 2147483647), number("texture", "int", "2048", "Texture size", 512, 4096),
          number("faces", "int", "500000", "Triangle budget", 10000, 2000000)});
     ops.back().makes = "mesh";
+    add("rig", "Auto-rig", "3d",
+        "A skeleton and skin weights for a 3D model, ready to pose and animate (SkinTokens on a GPU, by a rigging service); "
+        "saved as .glb",
+        true,
+        {field("in", "mesh", "", "3D model", true), number("seed", "int", "42", "Seed (another seed, another skeleton)", 0, 2147483647),
+         field("postprocess", "bool", "true", "Smooth the skin weights over the model's volume")});
+    ops.back().makes = "mesh";
     add("render", "Render 3D", "3d", "Pictures of a 3D model: a still, or a turntable clip", true,
         {field("in", "mesh", "", "3D model", true), number("width", "int", "512", "Width", 16, 4096), number("height", "int", "512", "Height", 16, 4096),
          number("frames", "int", "1", "Frames (more than 1: a turntable)", 1, 720), number("turn", "float", "360", "Degrees turned over the frames", -1080, 1080),
